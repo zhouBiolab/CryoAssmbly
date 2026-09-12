@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-12 **v2**（取代 v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-12 **v2.1**（实施期间同步；取代 v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -42,7 +42,17 @@
 
 ---
 
-## 修订记录（v1 → v2）
+## 修订记录
+
+### v2 → v2.1（S3 实施期间同步）
+
+| # | 位置 | v2 的说法 | v2.1 的更正 |
+|---|---|---|---|
+| 11 | §1.1 #4 | 点云解析重复记为 **5 处** | 实施中新发现 2 处同类实现（`fitting/masker.py:_read_points_with_lines`、`assembly/orchestrator.py:_target_has_points`），已一并统一，共 **7 处**；`fitting/demo_mask.py:load_mask_points` 契约不同（容忍 `#` 注释头、返回体素坐标），**保留不合并**并在架构文档记录原因 |
+| 12 | 附录 A【待验证 V1】 | 头部第 1 行轴序待实测 | 已销项：轴序**不可观测**（见附录 A）——`Sample` 会把盒子裁剪成立方并重设 origin，line1 恒为三数相等；契约改为 line1/2/4 原样保留、不解析 |
+
+### v1 → v2
+
 
 | # | 位置 | v1 的问题 | v2 的处理 |
 |---|---|---|---|
@@ -68,7 +78,7 @@
 | 1 | `main.py` 手写参数解析；缺文件/参数抛 IndexError/ValueError；未知选项静默忽略 | 属实 | `main.py:44-50` 未知 `--x` 直接跳过（带值时其值会落进 positional 造成错位）；`main.py:108` `find_files(dir,".mrc")[0]` 无 .mrc → IndexError；`main.py:110-111` + `core/io.py:123` 缺 `resolution.txt`/`contour_level.txt` → FileNotFoundError；`main.py:119` `float(positional[2])` → ValueError；`main.py:19-32` `_parse_float_opt` 缺值静默回默认 | S1 |
 | 2 | `run_pipeline()` 进入体素化前不校验输入 | 属实 | `pipeline.py:47-231` 直接 `os.makedirs` + `setup_logging`；不检查 mrc 存在与后缀、结构列表非空、分辨率有效、contour 有限 | S2 |
 | 3 | `sample_density_map()` 用 `os.system()` 字符串拼接 | 工作树已修，HEAD 未修 | HEAD：`cmd = f"{SAMPLE_BINARY} -a {mrc_path} ... > {sample_file}"` + `os.system`；工作树：`subprocess.run([...])` + 返回码 + 空输出检查。遗留：`sampling/extract_points/Sample_based_VoxEM.py:22`、`assembly/domain_parser/DomainParser.py:184,229,278`（`shell=True`） | S0 / S6 |
-| 4 | `load_sample_points()` 依赖固定行号与奇偶行 | 属实且更严重 | `core/io.py:67-94` 用 `i % 2` 分奇偶；某行字段 <4 时**只跳过该侧**，points 与 normals 静默错位。同一格式 5 处重复：`core/io.py:67`、`fitting/demo_mask.py:92`、`fitting/sw_mask.py:65`、`sampling/extract_points/Supporting.py:69`、`assembly/domain_parser/domain_pdb_txt.py:47`（后在库函数里 `sys.exit(1)`） | S3 |
+| 4 | `load_sample_points()` 依赖固定行号与奇偶行 | 属实且更严重 | `core/io.py:67-94` 用 `i % 2` 分奇偶；某行字段 <4 时**只跳过该侧**，points 与 normals 静默错位。同一格式在 **7 处**重复：`core/io.py:67`、`fitting/demo_mask.py:92`、`fitting/sw_mask.py:65`、`sampling/extract_points/Supporting.py:69`、`assembly/domain_parser/domain_pdb_txt.py:47`（后在库函数里 `sys.exit(1)`），以及 S3 实施中新发现的 `fitting/masker.py:_read_points_with_lines`、`assembly/orchestrator.py:_target_has_points`；`fitting/demo_mask.py:load_mask_points` 契约不同（容忍 `#` 注释头、返回体素坐标），保留不合并 | S3 |
 | 5 | `align_by_resid()` 只用残基编号做键 | 属实 | `core/structure.py:113-144`：键 `res.get_id()[1]`，不含 chain 与 insertion code；`ref_ca` 为 dict，重复编号互相覆盖。调用点：`chain_fitter.py:172,222`、`refine_step.py:134`、`orchestrator.py:621` | S4a |
 | 6 | `cif_to_pdb_placeholders()` 占位池含数字 | 属实 | `core/structure.py:86-87` 池为 A–Z+a–z+digits，`pool[i]` 超 62 链 → IndexError；同文件 `structure.py:42` 的 `chain_id_pool()` 是 A–Z/a–z/两字母，两套规则并存。调用点 `orchestrator.py:212-215` 外层 `except Exception: continue` | S5 |
 | 7 | 硬编码服务器路径 | 属实（9 处） | `fitting/parenet/config.py:35` `/xiangyux/PARENet-main/data/demo`（目录不存在、全仓库无读取者 → 死配置）；`sw_mask.py:616,617,633`、`refine_energy.py:992` 在 `__main__`/示例内；`pareconv_src` 内 4 处为 vendored 训练路径（不动） | S6 |
@@ -587,7 +597,7 @@ git switch -c feat/engineering-hardening     # S0a 之前
 0.688412 0.688412 0.228423 160.823456
 ```
 
-【待验证 V1】第 1 行轴序：8×8×8 为立方网格，无法区分 `nz ny nx` 与 `nx ny nz`；S3 开始前用 6×8×10 重测并写入本附录。
+【已核实，V1 销项】第 1 行轴序**不可观测**：用 6×8×10 非立方输入实测，`Sample` 会按密度包围盒把盒子裁剪成**立方**（实测 8³ / 6³ / 12³）并重设 origin（例：输入 shape (nz,ny,nx)=(6,8,10)、origin (1,2,3) 时输出 line1=`6 6 6`、line3=`5 4 3`），因此 line1 三个数恒相等；点坐标只依赖 line0(sample) 与 line3(origin)，而 `index = x + y*nx + z*nx*ny` 的 nx 取 line1 首项（立方时与轴序无关）。契约据此定为：line1/2/4 原样保留、不解析。
 
 ## 附录 B　服务器命令模板
 

@@ -19,6 +19,7 @@
 | S0b | `core/performance.py` 重写为可读版（行为不变：`performance.jsonl` + `performance_summary.json`）；`fitting/pipeline.py` 拆行、删除未用的 `nullcontext` 导入 | `core/performance.py`、`fitting/pipeline.py` | `tests/test_metrics.py` 5 项 |
 | S0c | 两份方案文档入库（`ENGINEERING_HARDENING_PLAN.md` v2、`INFERENCE_ENGINEERING_PLAN.md` v1.1） | 仅文档 | — |
 | S1 | `main.py` 手写 argv 解析 → `argparse` + `parse_intermixed_args()`：选项可位于位置参数之前/之间/之后；未知选项、缺值、非数字、位置参数个数错误统一退出码 2 且打印原因；`core/io.read_param_file` 的格式错误带文件名与内容 | `main.py`、`core/io.py`：选项名、默认值、开关语义不变 | `tests/test_cli.py` 17 项；CLI 烟测 5 类错误退出码 2 |
+| S3 | 点云 TXT 读写统一到 `protassem/core/points_txt.py`：解析按**顺序成对**（不再用绝对行号奇偶），字段数严格 4 列，错误带 `文件:行号`；新增 `write_filtered`（按原始行回写，保文本精度）与 `write_point_cloud`（由数组生成）。替换 7 处解析与 2 处写出：`core/io.load_sample_points`、`demo_mask.load_sample_points`、`sw_mask.load_sample_points`/`_save_point_cloud_as_txt`、`Supporting.load_sample_points`、`domain_pdb_txt.load_sample_points_with_info`/`save_domain_txt`、`masker.mask_fitted_region`（删除 `_read_points_with_lines`/`_save_filtered_txt`）、`orchestrator._target_has_points`；`domain_pdb_txt` 库函数内 5 处 `sys.exit` 改为抛异常 | `core/points_txt.py`（新）、`core/io.py`、`fitting/demo_mask.py`、`fitting/sw_mask.py`、`fitting/masker.py`、`sampling/extract_points/Supporting.py`、`assembly/domain_parser/domain_pdb_txt.py`、`assembly/orchestrator.py` | `tests/test_points_txt.py` 17 项：数值/头部、错位反例（旧实现点法向量错位、新实现报错）、成对校验、头部不足、非数字、过滤写回逐字节一致 |
 | S2 | `run_pipeline()` 增加入口校验：密度图存在且为 `.mrc`、结构列表非空且文件都存在、`resolution > 0` 且有限、`contour` 为**有限数值**（`None` 被拒绝）、`voxel_size > 0`；校验发生在 `os.makedirs`/`setup_logging` 之前。内部函数不再重复校验 | `protassem/pipeline.py`：新增 `_validate_inputs`；`contour=None` 由采样器兜底改为入口报错 | `tests/test_pipeline_inputs.py` 11 项（含"失败时不建输出目录"） |
 
 ---
@@ -70,6 +71,7 @@ demo_reg/
     |   +-- numba_kernels.py     numba 加速核函数
     |   +-- constants.py         原子序数、范德华半径
     |   +-- io.py
+    |   +-- points_txt.py        点云 TXT 单一读写（5 行头 + 成对数据行）
     |   +-- USalign              外部二进制
     +-- voxelize/                Step 1
     |   +-- mol_to_mrc.py

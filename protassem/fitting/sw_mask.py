@@ -27,6 +27,9 @@ from typing import Tuple, List, Dict, Optional, Union
 from dataclasses import dataclass
 from scipy.spatial import cKDTree
 
+from protassem.core.points_txt import (read_point_cloud_file,
+                                       write_point_cloud)
+
 
 @dataclass
 class MaskResult:
@@ -63,68 +66,11 @@ class SphericalMaskGenerator:
 
     @staticmethod
     def load_sample_points(file_path: str) -> np.ndarray:
-        """
-        读取点云文件，返回点云的结构化数组（优化版）
+        """读取点云文件，返回结构化数组（index/point/vector/density）。
 
-        Args:
-            file_path: 点云文件路径
-
-        Returns:
-            结构化的numpy数组，包含index, point, vector, density字段
+        格式契约与解析规则见 protassem.core.points_txt（单一实现）。
         """
-        try:
-            with open(file_path, "r") as f:
-                lines = f.readlines()
-            
-            # 预先计算数据行数
-            n_data_lines = len(lines) - 5
-            n_points = n_data_lines // 2
-            
-            # 预分配数组
-            point_list = np.empty((n_points, 3), dtype=np.float32)
-            vector_list = np.empty((n_points, 3), dtype=np.float32)
-            density_list = np.empty(n_points, dtype=np.float32)
-            indices_list = np.empty(n_points, dtype=np.int32)
-            
-            # 读取元数据
-            sample = float(lines[0].strip())
-            origin = np.array([float(i) for i in lines[3].strip().split()], dtype=np.float32)
-            
-            # 批量解析数据（向量化处理）
-            point_idx = 0
-            for i in range(5, len(lines), 2):
-                # 奇数行：点坐标
-                parts = lines[i].strip().split()
-                indices_list[point_idx] = int(parts[0])
-                point_list[point_idx] = [float(parts[1]), float(parts[2]), float(parts[3])]
-                
-                # 偶数行：密度向量和密度值
-                if i + 1 < len(lines):
-                    parts = lines[i + 1].strip().split()
-                    vector_list[point_idx] = [float(parts[0]), float(parts[1]), float(parts[2])]
-                    density_list[point_idx] = float(parts[3])
-                
-                point_idx += 1
-            
-            # 向量化的坐标变换
-            point_list = point_list * sample + origin
-            
-            # 创建结构化数组
-            dtype = [('index', np.int32),
-                     ('point', np.float32, (3,)),
-                     ('vector', np.float32, (3,)),
-                     ('density', np.float32)]
-            structured_data = np.zeros(n_points, dtype=dtype)
-            structured_data['index'] = indices_list
-            structured_data['point'] = point_list
-            structured_data['vector'] = vector_list
-            structured_data['density'] = density_list
-            
-            return structured_data
-            
-        except Exception as e:
-            logging.error(f"Error reading file {file_path}: {e}")
-            raise e
+        return read_point_cloud_file(file_path)
 
     @staticmethod
     def calculate_gyration_radius(points: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -585,29 +531,12 @@ def save_masks(masks: List[MaskResult], output_dir: str,
 
 
 def _save_point_cloud_as_txt(structured_data: np.ndarray, output_path: str):
-    """内部函数：将点云数据保存为txt格式（优化版）"""
-    # 预构建所有行
-    lines = [
-        "1.0\n",
-        "# Masked point cloud data\n",
-        "# Format: alternating lines of coordinates and vectors\n",
-        "0.0 0.0 0.0\n",
-        "# Point data starts below\n"
-    ]
-    
-    # 向量化格式化（批量处理）
-    for data in structured_data:
-        point = data['point']
-        vector = data['vector']
-        density = data['density']
-        index = data['index']
-        
-        lines.append(f"{index} {point[0]:.6f} {point[1]:.6f} {point[2]:.6f}\n")
-        lines.append(f"{vector[0]:.6f} {vector[1]:.6f} {vector[2]:.6f} {density:.6f}\n")
-    
-    # 一次性写入文件
-    with open(output_path, 'w') as f:
-        f.writelines(lines)
+    """把点云结构化数组写出为 TXT（坐标按 Å 原样写出，sample=1.0）。"""
+    write_point_cloud(output_path,
+                      points=structured_data["point"],
+                      vectors=structured_data["vector"],
+                      densities=structured_data["density"],
+                      indices=structured_data["index"])
 
 
 # 使用示例

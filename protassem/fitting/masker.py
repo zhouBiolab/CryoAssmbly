@@ -1,7 +1,11 @@
 """Point cloud filtering and density map masking — direct computation."""
 
+import os
+
 import numpy as np
+
 from protassem.core.io import read_structure, read_mrc, write_mrc
+from protassem.core.points_txt import read_point_cloud, write_filtered
 from protassem.core.scoring import read_mrc_full
 from protassem.core.constants import VDW_RADII
 from protassem.core.numba_kernels import add_sphere_mask
@@ -13,8 +17,8 @@ def mask_fitted_region(target_txt, mask_pdb, density_mrc,
 
     Returns True on success.
     """
-    points, original_lines, line_mapping = _read_points_with_lines(target_txt)
-    if len(points) == 0:
+    cloud = read_point_cloud(target_txt)
+    if len(cloud.points) == 0:
         return False
 
     coords, elements = read_structure(str(mask_pdb))
@@ -25,8 +29,11 @@ def mask_fitted_region(target_txt, mask_pdb, density_mrc,
     mask = _build_atom_mask(origin, voxel_size, dims, coords, elem_list,
                             solvent_radius)
 
-    kept = _filter_points(points, mask, origin, voxel_size)
-    _save_filtered_txt(original_lines, kept, line_mapping, output_txt)
+    kept = _filter_points(cloud.points, mask, origin, voxel_size)
+    directory = os.path.dirname(output_txt)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    write_filtered(output_txt, cloud, kept)
 
     data[mask] = 0.0
     write_mrc(data, origin, voxel_size, str(output_mrc))
@@ -70,38 +77,3 @@ def _filter_points(points, mask, origin, voxel_size):
                 continue
         kept.append(i)
     return kept
-
-
-def _read_points_with_lines(file_path):
-    points, line_mapping = [], []
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-    if len(lines) < 6:
-        return np.array([]), lines, []
-    sample = float(lines[0].strip())
-    ox, oy, oz = (float(v) for v in lines[3].strip().split())
-    for i in range(5, len(lines)):
-        line = lines[i].strip()
-        if i % 2 == 1 and line:
-            parts = line.split()
-            if len(parts) >= 4:
-                _, x, y, z = parts[:4]
-                points.append([float(x) * sample + ox,
-                               float(y) * sample + oy,
-                               float(z) * sample + oz])
-                line_mapping.append((i, i + 1))
-    return np.array(points), lines, line_mapping
-
-
-def _save_filtered_txt(original_lines, kept_indices, line_mapping, output_path):
-    import os
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w") as f:
-        for i in range(min(5, len(original_lines))):
-            f.write(original_lines[i])
-        for idx in kept_indices:
-            if idx < len(line_mapping):
-                ci, vi = line_mapping[idx]
-                if ci < len(original_lines) and vi < len(original_lines):
-                    f.write(original_lines[ci])
-                    f.write(original_lines[vi])

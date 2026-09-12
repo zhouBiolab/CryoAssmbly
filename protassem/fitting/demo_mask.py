@@ -34,6 +34,7 @@ from pareconv.utils.torch import to_cuda, release_cuda
 from pareconv.modules.ops.transformation import apply_transform
 from protassem.fitting.parenet.config import make_cfg
 from protassem.fitting.parenet.model import create_model
+from protassem.core.points_txt import read_point_cloud_file
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -90,35 +91,11 @@ VOXEL_SIZE_CONFIGS_MASK = {
 # ======================================================================
 
 def load_sample_points(file_path):
-    """Load point cloud as structured array with index/point/vector/density."""
-    point_list, vector_list, density_list, indices_list = [], [], [], []
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-        sample = float(lines[0].strip())
-        ox, oy, oz = [float(i) for i in lines[3].strip().split()]
-        for i in range(5, len(lines)):
-            line = lines[i]
-            if i % 2:
-                parts = line.strip().split()
-                idx = parts[0]
-                x, y, z = parts[1:]
-                point_list.append([float(x) * sample + ox,
-                                   float(y) * sample + oy,
-                                   float(z) * sample + oz])
-                indices_list.append(int(idx))
-            else:
-                v_x, v_y, v_z, d = line.strip().split()
-                vector_list.append([float(v_x), float(v_y), float(v_z)])
-                density_list.append(float(d))
+    """读取点云文件，返回 index/point/vector/density 结构化数组。
 
-    dtype = [("index", np.int32), ("point", np.float32, (3,)),
-             ("vector", np.float32, (3,)), ("density", np.float32)]
-    data = np.zeros(len(point_list), dtype=dtype)
-    data["index"] = np.array(indices_list)
-    data["point"] = np.array(point_list)
-    data["vector"] = np.array(vector_list)
-    data["density"] = np.array(density_list)
-    return data
+    格式契约与解析规则见 protassem.core.points_txt（单一实现）。
+    """
+    return read_point_cloud_file(file_path)
 
 
 def load_mask_points(file_path):

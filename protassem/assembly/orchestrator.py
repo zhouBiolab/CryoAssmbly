@@ -16,6 +16,7 @@ import numpy as np
 from Bio.PDB import MMCIFParser, MMCIFIO, Structure, Model, Chain
 
 from protassem.core.io import load_sample_points, find_files
+from protassem.core.points_txt import read_point_cloud
 from protassem.core.structure import (
     cif_to_pdb, pdb_to_cif, calculate_gyration_radius,
     extract_chain_id, align_by_resid,
@@ -755,13 +756,12 @@ class AssemblyOrchestrator:
             shutil.copy2(self.original_density_mrc, self.current_density_mrc)
 
     def _target_has_points(self):
+        """目标点云是否仍有剩余点（沿用历史阈值：至少 2 个点）。
+
+        读取失败时按 True 处理（保守认为目标仍可用），由后续步骤决定。
+        """
         try:
-            with open(self.current_target_txt) as f:
-                lines = f.readlines()
-            if len(lines) < 10:
-                return False
-            return sum(1 for i in range(5, len(lines))
-                       if i % 2 == 1 and lines[i].strip()) > 0
+            return len(read_point_cloud(self.current_target_txt).points) >= 2
         except Exception:
             return True
 

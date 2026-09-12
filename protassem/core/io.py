@@ -7,6 +7,8 @@ import mrcfile
 from Bio.PDB import PDBParser, MMCIFParser
 from numba.typed import List as NumbaList
 
+from protassem.core.points_txt import read_point_cloud
+
 
 def read_structure(file_path, backbone_only=False):
     """Read atom coordinates and element types from PDB or CIF."""
@@ -67,33 +69,16 @@ def write_mrc(data, origin, voxel_size, file_path):
 
 
 def load_sample_points(file_path, with_density=False):
-    """Load sampled point cloud from txt file."""
-    points, normals, densities = [], [], []
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-        sample = float(lines[0].strip())
-        ox, oy, oz = (float(v) for v in lines[3].strip().split())
-        for i in range(5, len(lines)):
-            line = lines[i].strip()
-            if not line:
-                continue
-            if i % 2 == 1:
-                parts = line.split()
-                if len(parts) >= 4:
-                    _, x, y, z = parts[:4]
-                    points.append([float(x) * sample + ox,
-                                   float(y) * sample + oy,
-                                   float(z) * sample + oz])
-            else:
-                parts = line.split()
-                if len(parts) >= 4:
-                    vx, vy, vz, d = parts[:4]
-                    normals.append([float(vx), float(vy), float(vz)])
-                    densities.append([float(d)])
+    """读取点云 TXT（薄包装，保留历史签名）。
 
+    Returns:
+        (points, normals) 或 (points, normals, densities)，均为 float64 数组。
+        格式契约与解析规则见 protassem.core.points_txt。
+    """
+    cloud = read_point_cloud(file_path)
     if with_density:
-        return np.array(points), np.array(normals), np.array(densities)
-    return np.array(points), np.array(normals)
+        return cloud.points, cloud.vectors, cloud.densities
+    return cloud.points, cloud.vectors
 
 
 def save_points_as_pdb(coords, file_path, chain_id="A"):

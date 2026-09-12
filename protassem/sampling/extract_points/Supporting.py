@@ -1,5 +1,7 @@
 import numpy as np
 
+from protassem.core.points_txt import read_point_cloud
+
 # Create Directory
 def MkdirList(folderlist):
     import os
@@ -67,25 +69,11 @@ def cluster_mean_distance(X, labels):
 
 
 def load_sample_points(file_path, density=False):
-    point_list = []
-    vector_list = []
-    density_list = []
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-        sample = float(lines[0].strip())
-        origin_x, origin_y, origin_z = [float(i) for i in lines[3].strip().split()]
-        for i in range(5, len(lines)):
-            line = lines[i]
-            if i % 2:
-                _, x, y, z = line.strip().split()
-                point_list.append([float(x) * sample + origin_x, float(y) * sample + origin_y, float(z) * sample + origin_z])
-            else:
-                v_x, v_y, v_z, d = line.strip().split()
-                vector_list.append([float(v_x), float(v_y), float(v_z)])
-                density_list.append([float(d)])
+    """读取点云 TXT；格式契约与解析规则见 protassem.core.points_txt。"""
+    cloud = read_point_cloud(file_path)
     if density:
-        return np.array(point_list), np.array(vector_list), np.array(density_list)
-    return np.array(point_list), np.array(vector_list)
+        return cloud.points, cloud.vectors, cloud.densities.reshape(-1, 1)
+    return cloud.points, cloud.vectors
 
 
 def txt2pcd(pcd_points, output):

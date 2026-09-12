@@ -39,124 +39,57 @@ if _PROJECT_ROOT not in sys.path:
 from protassem.core.constants import VDW_RADII
 from protassem.core.numba_kernels import add_sphere_mask as _njit_add_sphere_mask
 from protassem.core.io import read_structure
+from protassem.core import points_txt
 
 # VDW_RADII imported from protassem.core.constants
 # _njit_add_sphere_mask imported from protassem.core.numba_kernels
 
 
 def load_sample_points_with_info(file_path):
+    """读取点云 TXT 并保留原始行信息（兼容历史 6 元组返回值）。
+
+    Returns:
+        (points, vectors, densities, original_lines, line_mapping, header_info)；
+        line_mapping[i] = (坐标行下标, 向量行下标)，用于按点过滤后原样写回。
     """
-    从txt文件中读取采样点数据，包含完整的行信息
-    返回: points, vectors, densities, original_lines, line_mapping, header_info
-    """
-    point_list = []
-    vector_list = []
-    density_list = []
-    original_lines = []
-    line_mapping = []  # 记录每个点对应的原始文件行号
-    
-    try:
-        with open(file_path, "r") as f:
-            lines = f.readlines()
-            original_lines = lines.copy()
-            
-            if len(lines) < 5:
-                raise ValueError("文件格式不正确，行数太少")
-            
-            # 读取头部信息
-            sample = float(lines[0].strip())
-            header_info = {
-                'sample': sample,
-                'line1': lines[1] if len(lines) > 1 else "",
-                'line2': lines[2] if len(lines) > 2 else "",
-                'origin_line': lines[3] if len(lines) > 3 else "",
-                'line4': lines[4] if len(lines) > 4 else ""
-            }
-            
-            # 读取原点坐标
-            origin_x, origin_y, origin_z = [float(i) for i in lines[3].strip().split()]
-            header_info['origin'] = [origin_x, origin_y, origin_z]
-            
-            # 处理采样点数据
-            for i in range(5, len(lines)):
-                line = lines[i].strip()
-                
-                if i % 2:  # 奇数行：点坐标
-                    if line:  # 只有非空行才处理
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            _, x, y, z = parts[:4]
-                            # 应用采样率和原点偏移
-                            point_list.append([
-                                float(x) * sample + origin_x, 
-                                float(y) * sample + origin_y, 
-                                float(z) * sample + origin_z
-                            ])
-                            # 记录这个点对应的坐标行和向量行
-                            line_mapping.append((i, i+1))
-                else:  # 偶数行：向量和密度
-                    if line:  # 只有非空行才处理
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            v_x, v_y, v_z, d = parts[:4]
-                            vector_list.append([float(v_x), float(v_y), float(v_z)])
-                            density_list.append(float(d))
-                            
-    except FileNotFoundError:
-        print(f"错误：找不到文件 {file_path}")
-        sys.exit(1)
-    except ValueError as e:
-        print(f"错误：读取文件时出现问题 - {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"错误：处理文件时出现未知问题 - {e}")
-        sys.exit(1)
-    
-    return (np.array(point_list), np.array(vector_list), np.array(density_list), 
+    cloud = points_txt.read_point_cloud(file_path)
+    with open(file_path, encoding="utf-8") as handle:
+        original_lines = handle.readlines()
+    line_mapping = points_txt.line_mapping(cloud)
+    header_info = {"sample": cloud.sample,
+                   "origin": [float(v) for v in cloud.origin],
+                   "line1": cloud.header_lines[1],
+                   "line2": cloud.header_lines[2],
+                   "origin_line": cloud.header_lines[3],
+                   "line4": cloud.header_lines[4]}
+    return (cloud.points, cloud.vectors, cloud.densities,
             original_lines, line_mapping, header_info)
 
+
 def save_domain_txt(original_lines, kept_indices, line_mapping, header_info, output_path):
+    """按 kept_indices 写回原始行对，头部原样复制（保留文本精度）。
+
+    header_info 仅为兼容历史签名保留；头部直接从 original_lines 复制。
     """
-    保存结构域对应的TXT文件
-    """
-    try:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        with open(output_path, 'w') as f:
-            # 写入头部信息（前5行）
-            f.write(f"{header_info['sample']}\n")
-            f.write(header_info['line1'])
-            f.write(header_info['line2'])
-            f.write(header_info['origin_line'])
-            f.write(header_info['line4'])
-            
-            # 写入过滤后的点数据
-            for point_idx in kept_indices:
-                if point_idx < len(line_mapping):
-                    coord_line_idx, vector_line_idx = line_mapping[point_idx]
-                    
-                    # 检查行号是否有效
-                    if coord_line_idx < len(original_lines) and vector_line_idx < len(original_lines):
-                        f.write(original_lines[coord_line_idx])   # 坐标行
-                        f.write(original_lines[vector_line_idx])  # 向量行
-                    
-        print(f"成功保存结构域TXT文件: {output_path}")
-        print(f"保留了 {len(kept_indices)} 个点")
-        
-    except Exception as e:
-        print(f"错误：保存结构域TXT文件时出现问题 - {e}")
-        sys.exit(1)
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for line in original_lines[:points_txt.HEADER_LINES]:
+            handle.write(line)
+        for point_idx in kept_indices:
+            coord_line_idx, vector_line_idx = line_mapping[point_idx]
+            handle.write(original_lines[coord_line_idx])
+            handle.write(original_lines[vector_line_idx])
+    print("成功保存结构域TXT文件: %s" % output_path)
+    print("保留了 %d 个点" % len(kept_indices))
+
 
 def copy_pdb_with_new_name(source_pdb, target_pdb):
-    """
-    复制PDB文件并重命名
-    """
-    try:
-        shutil.copy2(source_pdb, target_pdb)
-        print(f"成功复制PDB文件: {source_pdb} -> {target_pdb}")
-    except Exception as e:
-        print(f"错误：复制PDB文件时出现问题 - {e}")
-        sys.exit(1)
+    """复制 PDB 并改名；失败时直接抛出，由调用方处理。"""
+    shutil.copy2(source_pdb, target_pdb)
+    print("成功复制PDB文件: %s -> %s" % (source_pdb, target_pdb))
+
 
 def get_atom_list(pdb_file, backbone_only=False):
     """Wrapper around core.io.read_structure for backward compat."""
@@ -390,12 +323,10 @@ def split_txt_by_domains_unified_grid(input_txt, input_pdb, domain_parser_path,
     
     # 检查输入文件
     if not os.path.exists(input_txt):
-        print(f"错误：输入TXT文件不存在: {input_txt}")
-        sys.exit(1)
+        raise FileNotFoundError("输入TXT文件不存在: %s" % input_txt)
         
     if not os.path.exists(input_pdb):
-        print(f"错误：输入PDB文件不存在: {input_pdb}")
-        sys.exit(1)
+        raise FileNotFoundError("输入PDB文件不存在: %s" % input_pdb)
     
     # 1. 读取TXT文件
     print("\n1. 读取TXT文件...")
