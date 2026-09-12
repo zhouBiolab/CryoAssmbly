@@ -18,6 +18,7 @@ import shutil
 import logging
 import threading
 import subprocess
+from protassem.core.performance import Metrics, configure_cpu_threads
 
 from protassem.core.scoring import calculate_cc_mask
 from protassem.fitting.local_optimizer import local_optimize
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 _NUM_PROCESSES = 1
 # how many new pred files to accumulate before a monitor evaluation (set by run_fitting)
 _BATCH_SIZE = 20
+_METRICS = None
 
 
 def _cc_worker(arg):
@@ -69,19 +71,24 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
     Returns:
         dict: success (bool), final_pdb (str|None), cc_mask (float)
     """
-    global _NUM_PROCESSES, _BATCH_SIZE
-    _NUM_PROCESSES = num_processes
+    global _NUM_PROCESSES, _BATCH_SIZE, _METRICS
+    _NUM_PROCESSES = configure_cpu_threads(num_processes)
     _BATCH_SIZE = batch_size
     os.makedirs(output_dir, exist_ok=True)
     orig_mrc = original_density_mrc or density_mrc
-
-    if mode == "chain":
-        return _fit_chain(target_txt, source, density_mrc, resolution,
-                          contour, output_dir, early_stop_threshold, orig_mrc)
-    else:
-        return _fit_domain(target_txt, source, density_mrc, resolution,
-                           contour, output_dir, chain_pdb,
-                           early_stop_threshold, orig_mrc)
+    _METRICS = Metrics(os.path.join(output_dir, "metrics"))
+    context = _METRICS.stage("fit_request", mode=mode)
+    try:
+        with context:
+            if mode == "chain":
+                return _fit_chain(target_txt, source, density_mrc, resolution,
+                                  contour, output_dir, early_stop_threshold,
+                                  orig_mrc)
+            return _fit_domain(target_txt, source, density_mrc, resolution,
+                               contour, output_dir, chain_pdb,
+                               early_stop_threshold, orig_mrc)
+    finally:
+        _METRICS.write_summary()
 
 
 # ======================================================================
