@@ -1,5 +1,7 @@
 # protassem -- 蛋白质结构组装流水线
 
+English documentation: [README_EN.md](README_EN.md)
+
 输入实验密度图 + 若干链的结构文件，自动完成 **体素化 -> 点云采样 -> PARENet 配准拟合 -> 统一队列组装 -> 精修**，
 输出组装好的复合物 CIF。
 
