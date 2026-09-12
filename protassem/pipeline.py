@@ -9,6 +9,7 @@ import os
 import sys
 import shutil
 import logging
+import math
 from datetime import datetime
 
 from protassem.core.io import find_files, read_param_file
@@ -44,6 +45,31 @@ def setup_logging(output_dir, log_file=None):
         log.info("Log file: %s", log_file)
 
 
+def _validate_inputs(density_mrc, structure_files, resolution, contour, voxel_size):
+    """校验流水线输入；只在此边界检查，内部函数不再重复校验。
+
+    contour 必须是有限数值：core/scoring.calculate_cc_mask 直接执行
+    ``exp_map > contour``，None 会在评分阶段以 TypeError 暴露。采样器的
+    3*sigma 兜底只服务显式传入 None 的直接调用方，不属于本入口契约。
+    """
+    if not os.path.isfile(density_mrc):
+        raise FileNotFoundError("density map not found: %s" % density_mrc)
+    if not str(density_mrc).lower().endswith(".mrc"):
+        raise ValueError("density map must be a .mrc file: %s" % density_mrc)
+    if not structure_files:
+        raise ValueError("no structure files (.pdb/.cif) given")
+    missing = [f for f in structure_files if not os.path.isfile(f)]
+    if missing:
+        raise FileNotFoundError("structure file(s) not found: %s"
+                                % ", ".join(missing))
+    if not math.isfinite(resolution) or resolution <= 0:
+        raise ValueError("resolution must be a positive number, got %r" % (resolution,))
+    if contour is None or not math.isfinite(contour):
+        raise ValueError("contour must be a finite number, got %r" % (contour,))
+    if not math.isfinite(voxel_size) or voxel_size <= 0:
+        raise ValueError("voxel_size must be a positive number, got %r" % (voxel_size,))
+
+
 def run_pipeline(density_mrc, structure_files, resolution, contour,
                  output_dir=None, voxel_size=2.0, log_file=None,
                  assembly_kwargs=None):
@@ -63,7 +89,13 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
 
     Returns:
         dict with target_txt, source_txts, output_dir, complex_cif
+
+    Raises:
+        FileNotFoundError: density map or a structure file does not exist.
+        ValueError: no structure files, or resolution/contour/voxel_size invalid.
     """
+    _validate_inputs(density_mrc, structure_files, resolution, contour, voxel_size)
+
     if output_dir is None:
         output_dir = os.path.join(os.path.dirname(os.path.abspath(density_mrc)), "output")
     os.makedirs(output_dir, exist_ok=True)

@@ -7,12 +7,29 @@
 **体素化 - 点云采样 - PARENet 配准拟合 - 统一队列组装 - 同源域精修 - 同源链精修**，
 输出组装好的复合物 CIF。
 
+## 架构变更记录（工程化硬化，阶段一）
+
+> 只记录对**接口、边界行为、模块职责**有影响的变更；算法流程、阈值、候选顺序不变。
+> 方案与验收标准见 `ENGINEERING_HARDENING_PLAN.md`（v2）；分支 `feat/engineering-hardening`；
+> 每步一次提交，提交号见 `git log --oneline feat/engineering-hardening`。
+
+| 步骤 | 变更 | 影响面 | 验证 |
+|---|---|---|---|
+| S0a | 采样器调用外部 `Sample` 改用 `subprocess.run([...])`（不再 `os.system` 字符串拼接），检查返回码与非空输出；新建 `tests/`（`test_sampler.py`） | `sampling/sampler.py`：函数签名与返回值不变 | `tests/test_sampler.py` 5 项；真实二进制烟测（输出目录含空格）通过 |
+| S0b | `core/performance.py` 重写为可读版（行为不变：`performance.jsonl` + `performance_summary.json`）；`fitting/pipeline.py` 拆行、删除未用的 `nullcontext` 导入 | `core/performance.py`、`fitting/pipeline.py` | `tests/test_metrics.py` 5 项 |
+| S0c | 两份方案文档入库（`ENGINEERING_HARDENING_PLAN.md` v2、`INFERENCE_ENGINEERING_PLAN.md` v1.1） | 仅文档 | — |
+| S1 | `main.py` 手写 argv 解析 → `argparse` + `parse_intermixed_args()`：选项可位于位置参数之前/之间/之后；未知选项、缺值、非数字、位置参数个数错误统一退出码 2 且打印原因；`core/io.read_param_file` 的格式错误带文件名与内容 | `main.py`、`core/io.py`：选项名、默认值、开关语义不变 | `tests/test_cli.py` 17 项；CLI 烟测 5 类错误退出码 2 |
+| S2 | `run_pipeline()` 增加入口校验：密度图存在且为 `.mrc`、结构列表非空且文件都存在、`resolution > 0` 且有限、`contour` 为**有限数值**（`None` 被拒绝）、`voxel_size > 0`；校验发生在 `os.makedirs`/`setup_logging` 之前。内部函数不再重复校验 | `protassem/pipeline.py`：新增 `_validate_inputs`；`contour=None` 由采样器兜底改为入口报错 | `tests/test_pipeline_inputs.py` 11 项（含"失败时不建输出目录"） |
+
+---
+
 ## 总体流程
 
 ```
 密度图(.mrc) + 链结构(.pdb/.cif)
   |
   0. 输入标准化              读取内部 chain ID，多链文件保留为复合物；链号重复则自动去重重排（A-Z/a-z/AA..ZZ，>52 多字符走 CIF）
+  |     入口边界：main.py 用 argparse 解析并校验用法；run_pipeline 在建目录前校验 mrc/结构/分辨率/contour
   |
   1. 体素化 voxelize        每条链/复合物模板 -> 模拟密度(.mrc)
   |
@@ -371,7 +388,13 @@ calculate_overlap_ratio_numpy(pdb1, pdb2, clash_distance=3.0)
 ## 八、使用
 
 python main.py <data_dir> --log
-python main.py <density.mrc> <结构目录> <分辨率> <contour> --log
+python main.py <density.mrc> <结构目录> <分辨率> <contour> [输出目录] --log
+
+- 选项可放在位置参数之前、之间或之后（`parse_intermixed_args`）。
+- 入口校验：`run_pipeline()` 在建目录之前检查密度图存在且为 `.mrc`、结构文件列表非空且都存在、
+  `resolution > 0`、`contour` 为有限数值、`voxel_size > 0`；`contour=None` 会被拒绝
+  （`core/scoring.py` 直接执行 `exp_map > contour`）。自动目录模式仍从 `contour_level.txt` 读数值。
+- 用法错误（未知选项、选项缺值、非数字、位置参数个数不是 1/4/5）退出码为 2，并打印具体原因。
 
 ## 九、输出
 
