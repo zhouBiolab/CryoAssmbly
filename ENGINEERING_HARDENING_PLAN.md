@@ -44,6 +44,14 @@
 
 ## 修订记录
 
+### v2.1 → v2.2（S4a/S5 实施期间同步）
+
+| # | 位置 | v2.1 的说法 | v2.2 的更正 |
+|---|---|---|---|
+| 13 | §1.6 V2 | 数字占位链号是否破坏下游"待实测" | **部分销项**：`read_structure` / `calculate_cc_mask` / USalign 实测可用（`tests/test_chain_ids.py`）；DomainParser/domain split 未单独覆盖，容量按原决定保留 62 |
+| 14 | §1.2 A/B | 静默丢链与 worker 降级"待处理" | 已实施：跳过输入进 `skipped_inputs` 并写入运行摘要；两个 CC worker 失败改为带文件名抛错 |
+| 15 | §1.1 #6 | 池的命名与容量 | 已实施：`logical_chain_ids()` / `pdb_placeholder_ids()` 两个函数；超容量 `ValueError`；删除"超过 52 走 CIF"的错误论断相关表述 |
+
 ### v2 → v2.1（S3 实施期间同步）
 
 | # | 位置 | v2 的说法 | v2.1 的更正 |
@@ -164,7 +172,7 @@
 | # | 问题 | 验证方式 | 归属 |
 |---|---|---|---|
 | V1 | 采样 TXT 头部第 1 行的轴序是 `nz ny nx` 还是 `nx ny nz`（v1 的写法是**推断**） | 用 6×8×10 非立方网格跑 `Sample`，读第 1 行 | S3 前置 |
-| V2 | 数字占位链号是否真的破坏下游（`read_structure` / `calculate_cc_mask` / USalign / domain split） | 构造含数字链号的结构逐一实测 | S5 |
+| V2 | 数字占位链号是否真的破坏下游 | **部分销项**：`read_structure`/`calculate_cc_mask`/USalign 实测通过（`tests/test_chain_ids.py`）；DomainParser/domain split 未覆盖，容量保留 62 | S5 |
 | V3 | S4b 传播链中哪个出口泄漏占位链号 | 非恒等映射 + 复合物域优化测试 | S4b |
 | V4 | `test/1` 完整流水线耗时与基线结果 | S0 冻结基线后跑一次并记录 | S0/S7 |
 | V5 | 复合物域优化分支（`--complex-domain-opt`）在默认参数下的触发条件与耗时 | 显式加该参数运行 | S7 |

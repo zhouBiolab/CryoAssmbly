@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import string
 import numpy as np
 from pathlib import Path
 from Bio.PDB import PDBParser, MMCIFParser, PDBIO, MMCIFIO, Superimposer
@@ -42,15 +43,28 @@ def pdb_to_cif(pdb_file, output_cif, chain_id=None):
     io.save(str(output_cif))
 
 
-def chain_id_pool():
-    """Yield chain IDs in order: A-Z, a-z, then two-letter (uppercase first)."""
-    import string
+def logical_chain_ids():
+    """生成逻辑链号：A-Z、a-z，然后两字母 AA..ZZ。
+
+    用途是"链号去重重排"（可出现在 CIF 中，允许多字符）。
+    """
     base = list(string.ascii_uppercase) + list(string.ascii_lowercase)
     for c in base:
         yield c
     for a in base:
         for b in base:
             yield a + b
+
+
+def pdb_placeholder_ids():
+    """生成 PDB 单字符占位链号：A-Z、a-z、0-9（共 62 个）。
+
+    与 logical_chain_ids 是两个不同用途的池：PDB 的链号列只有一列，占位必须单字符，
+    因此保留数字占位、容量维持 62。数字占位对下游的影响见 tests/test_chain_ids.py
+    的实测（读取/评分/USalign 已覆盖；DomainParser 未单独覆盖）。
+    """
+    for c in list(string.ascii_uppercase) + list(string.ascii_lowercase) + list(string.digits):
+        yield c
 
 
 def write_structure_with_chain_map(input_file, chain_map, output_file):
@@ -84,13 +98,18 @@ def cif_to_pdb_placeholders(cif_file, output_pdb):
     Returns {placeholder_id: real_id} so the real (possibly multi-char) IDs
     can be restored when writing the final CIF. Reuses
     write_structure_with_chain_map as the rename primitive.
+
+    Raises:
+        ValueError: 链数超过 PDB 单字符占位容量（当前 62，见 pdb_placeholder_ids）。
+            当前没有"超容量走纯 CIF"的替代通路，因此明确报错而不是截断。
     """
-    import string
-    pool = (list(string.ascii_uppercase) + list(string.ascii_lowercase)
-            + list(string.digits))
     parser = MMCIFParser(QUIET=True)
     structure = parser.get_structure("s", str(cif_file))
     real_ids = [ch.id for ch in list(structure)[0]]
+    pool = list(pdb_placeholder_ids())
+    if len(real_ids) > len(pool):
+        raise ValueError("CIF has %d chains; PDB placeholder capacity is %d"
+                         % (len(real_ids), len(pool)))
     real2ph, ph2real = {}, {}
     for i, rid in enumerate(real_ids):
         ph = pool[i]

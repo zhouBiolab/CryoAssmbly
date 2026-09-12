@@ -98,6 +98,8 @@ class AssemblyOrchestrator:
         self.accepted_domain_groups = set()   # 已接受域的 group_id 集合（同源查表 O(1)）
         self.accepted_fitted_pdbs = []        # 已接受结构(链+域)的拟合 pose PDB（clash 检测用）
         self.excluded_domains = []
+        self.input_count = 0        # _prepare_chains 看到的输入文件数
+        self.skipped_inputs = []    # [(文件名, 原因)]，进运行摘要
         self._chain_order = 0
         self._domain_chain_order = 0
         self._chain_iter = 0
@@ -149,6 +151,11 @@ class AssemblyOrchestrator:
             "similarity_threshold": self.similarity_threshold,
             "resolution": self.resolution,
             "contour": self.contour,
+            "input_files": self.input_count,
+            "processed_chains": len(self.chain_records),
+            "skipped_inputs": len(self.skipped_inputs),
+            "skipped_detail": "; ".join("%s (%s)" % (name, reason)
+                                        for name, reason in self.skipped_inputs),
         })
 
         refined_cif = refine_step.maybe_refine(self)
@@ -183,22 +190,34 @@ class AssemblyOrchestrator:
     # Chain preparation
     # ==================================================================
 
+    def _skip_input(self, name, reason):
+        """记录被跳过的输入（进运行摘要），不静默丢弃。"""
+        self.skipped_inputs.append((name, reason))
+        log.warning("chain file skipped: %s (%s)", name, reason)
+
     def _prepare_chains(self):
-        """Find structure files, read chain IDs from content, sort by size."""
-        from protassem.core.structure import read_chain_ids
+        """Find structure files, read chain IDs from content, sort by size.
+
+        跳过的输入记录在 self.skipped_inputs 并写入运行摘要；一个可用链都没有时
+        直接失败，不再静默空跑。CIF -> PDB 占位转换失败属于边界失败，直接抛出。
+        """
+        from protassem.core.structure import cif_to_pdb_placeholders, read_chain_ids
         cif_dir = self.work_dir / "cif_conversions"
         os.makedirs(cif_dir, exist_ok=True)
 
         structure_files = (list(self.source_dir.glob("*.pdb"))
                            + list(self.source_dir.glob("*.cif")))
+        self.input_count = len(structure_files)
         for sf in structure_files:
             ext = sf.suffix.lower()
             is_complex = sf.name.startswith("complex_")
             try:
                 chain_ids = read_chain_ids(str(sf))
-            except Exception:
+            except Exception as exc:
+                self._skip_input(sf.name, "unreadable structure: %s" % exc)
                 continue
             if not chain_ids:
+                self._skip_input(sf.name, "no chains in file")
                 continue
 
             if is_complex:
@@ -209,20 +228,18 @@ class AssemblyOrchestrator:
             chain_map = None
             if ext == ".cif":
                 pdb_file = cif_dir / (sf.stem + ".pdb")
-                try:
-                    from protassem.core.structure import cif_to_pdb_placeholders
-                    chain_map = cif_to_pdb_placeholders(str(sf), str(pdb_file))
-                except Exception:
-                    continue
+                chain_map = cif_to_pdb_placeholders(str(sf), str(pdb_file))
             else:
                 pdb_file = sf
 
             txt_file = self._find_txt_for_chain(sf)
             if txt_file is None:
+                self._skip_input(sf.name, "no sampled TXT next to it")
                 continue
 
             pts, _ = load_sample_points(str(txt_file))
             if len(pts) == 0:
+                self._skip_input(sf.name, "sampled TXT has no points")
                 continue
 
             self.chain_records.append({
@@ -241,10 +258,15 @@ class AssemblyOrchestrator:
                 "is_complex": is_complex,
             })
 
+        if not self.chain_records:
+            raise RuntimeError("no usable chains in %s (skipped %d: %s)"
+                               % (self.source_dir, len(self.skipped_inputs),
+                                  self.skipped_inputs[:3]))
+
         self.chain_records.sort(key=lambda c: c["gyration_radius"],
                                 reverse=True)
-        log.info("Found %d chains (sorted by gyration radius)",
-                 len(self.chain_records))
+        log.info("Found %d chains (sorted by gyration radius); skipped %d input(s)",
+                 len(self.chain_records), len(self.skipped_inputs))
 
     def chain_record(self, chain_id):
         """按组件 ID 取原始链记录（含 chain_map）。
@@ -796,12 +818,17 @@ class AssemblyOrchestrator:
 # ==================================================================
 
 def _pre_screen_cc_worker(args):
-    """Worker for parallel cc_mask in pre-screening."""
+    """Worker for parallel cc_mask in pre-screening.
+
+    失败不再伪装成 0 分：带文件名抛 RuntimeError（Pool.map 会在父进程重新抛出）。
+    """
     density_mrc, structure_file, resolution, contour = args
     try:
         return calculate_cc_mask(density_mrc, structure_file, resolution, contour)
-    except Exception:
-        return 0.0
+    except Exception as exc:
+        raise RuntimeError("pre-screen CC_mask failed for %s: %s: %s"
+                           % (os.path.basename(str(structure_file)),
+                              type(exc).__name__, exc)) from exc
 
 
 def run_assembly(target_txt, source_dir, density_mrc, resolution, contour,

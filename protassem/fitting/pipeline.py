@@ -34,12 +34,16 @@ _METRICS = None
 
 
 def _cc_worker(arg):
-    """Compute CC_mask for one pred file (worker for parallel batch CC)."""
+    """Compute CC_mask for one pred file (worker for parallel batch CC).
+
+    失败不再伪装成低分（原实现返回 cc=None）：带文件名抛出真实错误。
+    """
     pdb_file, density_mrc, resolution, contour = arg
     try:
         cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
-    except Exception:
-        cc = None
+    except Exception as exc:
+        raise RuntimeError("CC_mask failed for %s: %s: %s"
+                           % (os.path.basename(pdb_file), type(exc).__name__, exc)) from exc
     return {"pdb_file": pdb_file, "cc_mask": cc, "overlap": _extract_overlap(pdb_file)}
 
 DEMO_MASK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_mask.py")

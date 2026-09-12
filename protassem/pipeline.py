@@ -111,7 +111,7 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     # If chain IDs collide across inputs, remap collisions to unique IDs (keep
     # first occurrence; assign next free from a-z/A-Z/aa..ZZ) and write as CIF.
     from protassem.core.structure import (
-        cif_to_pdb, chain_id_pool, write_structure_with_chain_map)
+        cif_to_pdb, logical_chain_ids, write_structure_with_chain_map)
     std_dir = os.path.join(output_dir, "standardized")
     os.makedirs(std_dir, exist_ok=True)
 
@@ -128,7 +128,7 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         dups = sorted({c for c in all_ids if all_ids.count(c) > 1})
         log.info("Duplicate chain IDs across inputs %s -> remapping to unique", dups)
         used = set()
-        _pool = chain_id_pool()
+        _pool = logical_chain_ids()
 
         def _next_free():
             for c in _pool:
