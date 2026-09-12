@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+.venv/
+venv/
+env/
+
+outputs/
+results/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.mrc
+
+.vscode/
+.idea/
+.DS_Store
+
+# compiled extensions / build artifacts (pareconv 等需各机器重编译，源码入库但产物不入库)
+*.so
+build/
+dist/
+*.egg-info/

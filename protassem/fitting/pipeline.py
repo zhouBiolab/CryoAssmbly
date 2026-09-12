@@ -1,0 +1,498 @@
+"""Unified fitting pipeline — replaces demo_main.py + demo_domain_main.py.
+
+Eliminates ~1500 lines of duplicated code. Calls demo_mask.py (GPU inference)
+via subprocess, uses core/scoring.py for CC evaluation (direct, no subprocess),
+uses local_optimizer.py for candidate optimization.
+
+Modes:
+  chain  — iterate over source files (sorted by point count), up to 8 attempts
+  domain — single source file, with optional low-resolution threshold adjustment
+"""
+
+import os
+import sys
+import re
+import glob
+import time
+import shutil
+import logging
+import threading
+import subprocess
+
+from protassem.core.scoring import calculate_cc_mask
+from protassem.fitting.local_optimizer import local_optimize
+from protassem.fitting.parenet_client import start_request
+
+log = logging.getLogger(__name__)
+
+# process count for parallel CC / local-optimize copies (set by run_fitting)
+_NUM_PROCESSES = 1
+# how many new pred files to accumulate before a monitor evaluation (set by run_fitting)
+_BATCH_SIZE = 20
+
+
+def _cc_worker(arg):
+    """Compute CC_mask for one pred file (worker for parallel batch CC)."""
+    pdb_file, density_mrc, resolution, contour = arg
+    try:
+        cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+    except Exception:
+        cc = None
+    return {"pdb_file": pdb_file, "cc_mask": cc, "overlap": _extract_overlap(pdb_file)}
+
+DEMO_MASK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_mask.py")
+DEMO_MASK_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ======================================================================
+# Public API
+# ======================================================================
+
+def run_fitting(target_txt, source, density_mrc, resolution, contour,
+                output_dir, mode="chain", chain_pdb=None,
+                early_stop_threshold=0.54, original_density_mrc=None,
+                num_processes=1, batch_size=20):
+    """Unified entry point for chain and domain fitting.
+
+    Args:
+        target_txt: target point cloud (.txt)
+        source: directory of source files (chain) or single .txt (domain)
+        density_mrc: current density map (may be masked)
+        resolution: map resolution in angstroms
+        contour: density contour level
+        output_dir: output directory
+        mode: "chain" or "domain"
+        chain_pdb: parent chain PDB (required for domain mode)
+        early_stop_threshold: optimized CC threshold for early stop
+        original_density_mrc: original unmasked density map for final eval
+
+    Returns:
+        dict: success (bool), final_pdb (str|None), cc_mask (float)
+    """
+    global _NUM_PROCESSES, _BATCH_SIZE
+    _NUM_PROCESSES = num_processes
+    _BATCH_SIZE = batch_size
+    os.makedirs(output_dir, exist_ok=True)
+    orig_mrc = original_density_mrc or density_mrc
+
+    if mode == "chain":
+        return _fit_chain(target_txt, source, density_mrc, resolution,
+                          contour, output_dir, early_stop_threshold, orig_mrc)
+    else:
+        return _fit_domain(target_txt, source, density_mrc, resolution,
+                           contour, output_dir, chain_pdb,
+                           early_stop_threshold, orig_mrc)
+
+
+# ======================================================================
+# Chain mode: iterate over source files
+# ======================================================================
+
+def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
+               output_dir, stop_threshold, orig_mrc):
+    """Chain fitting: iterate over source files sorted by point count."""
+    candidates = _analyze_source_files(source_dir)
+    if not candidates:
+        log.error("No source files found in %s", source_dir)
+        return _fail()
+
+    cc_threshold = 0.20
+    max_attempts = min(8, len(candidates))
+    log.info("Chain fitting: %d candidates, max %d attempts", len(candidates), max_attempts)
+
+    for attempt_idx in range(max_attempts):
+        cand = candidates[attempt_idx]
+        pdb_path = _find_pdb_for_txt(cand["file_path"], source_dir)
+        if not pdb_path:
+            continue
+
+        log.info("Attempt %d/%d: %s (%d points)",
+                 attempt_idx + 1, max_attempts, cand["filename"], cand["point_count"])
+
+        attempt_dir = os.path.join(output_dir, f"mask_mode_attempt_{attempt_idx + 1}")
+        result = _fit_single(
+            target_txt, cand["file_path"], pdb_path, attempt_dir,
+            density_mrc, resolution, contour, pdb_path,
+            cc_threshold, stop_threshold, orig_mrc)
+
+        if result["success"]:
+            final_pdb = _save_final_result(result, attempt_dir, pdb_path)
+            cc = _verify_cc(final_pdb, orig_mrc, resolution, contour)
+            return {"success": True, "final_pdb": final_pdb, "cc_mask": cc}
+
+    log.warning("All %d chain fitting attempts produced no result", max_attempts)
+    return _fail()
+
+
+# ======================================================================
+# Domain mode: single source file
+# ======================================================================
+
+def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
+                output_dir, chain_pdb, stop_threshold, orig_mrc):
+    """Domain fitting: single source file."""
+    pdb_path = chain_pdb or _find_pdb_for_txt(source_txt, os.path.dirname(source_txt))
+    if not pdb_path:
+        log.error("No chain PDB found for domain fitting")
+        return _fail()
+
+    # local-optimization trigger threshold (flat 0.25 for domains).
+    # The early-stop threshold (stop_threshold) is NOT resolution-adjusted.
+    cc_threshold = 0.25
+
+    result = _fit_single(
+        target_txt, source_txt, pdb_path, output_dir,
+        density_mrc, resolution, contour, pdb_path,
+        cc_threshold, stop_threshold, orig_mrc)
+
+    if result["success"]:
+        final_pdb = _save_final_result(result, output_dir, pdb_path)
+        cc = _verify_cc(final_pdb, orig_mrc, resolution, contour)
+        return {"success": True, "final_pdb": final_pdb, "cc_mask": cc}
+
+    return _fail()
+
+
+# ======================================================================
+# Core: run one PARENet session + monitor + evaluate
+# ======================================================================
+
+def _fit_single(target_txt, source_txt, chain_pdb, output_dir,
+                density_mrc, resolution, contour, pdb_for_naming,
+                cc_threshold, stop_threshold, orig_mrc):
+    """Run PARENet + monitoring + optimization for one source file."""
+    reg_dir = os.path.join(output_dir, "registration")
+    temp_dir = os.path.join(output_dir, "temp_candidates")
+    os.makedirs(reg_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    proc = _start_parenet(target_txt, source_txt, chain_pdb, reg_dir)
+
+    monitor_result = _monitor_and_evaluate(
+        reg_dir, density_mrc, resolution, contour,
+        chain_pdb, cc_threshold, stop_threshold, temp_dir, proc)
+
+    best = monitor_result.get("best_result")
+    if best and best.get("success"):
+        return best
+    return {"success": False}
+
+
+def _start_parenet(target, source, chain_pdb, output_dir):
+    """Send a fitting request to the persistent PARENet server.
+
+    Returns a request handle (poll()/terminate()) compatible with the monitor.
+    """
+    return start_request(target, source, chain_pdb, output_dir,
+                         use_mask=True, configs="all",
+                         mask_radius_factor=1.35,
+                         min_point_distance_factor=0.32)
+
+
+# ======================================================================
+# Monitoring loop
+# ======================================================================
+
+def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
+                          chain_pdb, cc_threshold, stop_threshold,
+                          temp_dir, proc, batch_size=None):
+    """Watch for pred_*.pdb files, evaluate CC, optimize candidates."""
+    if batch_size is None:
+        batch_size = _BATCH_SIZE
+    processed = set()
+    all_results = []
+    candidates = []
+    best_result = None
+    early_stop = False
+
+    while True:
+        running = proc.poll() is None
+        valid = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
+                 if _is_valid_pred(f)]
+        new_files = [f for f in valid if f not in processed]
+
+        if running and len(new_files) >= batch_size:
+            batch = new_files[:batch_size]
+            for f in batch:
+                processed.add(f)
+
+            batch_results = _batch_cc(batch, density_mrc, resolution, contour)
+            all_results.extend(batch_results)
+
+            high = sorted(
+                [r for r in batch_results if r["cc_mask"] is not None and r["cc_mask"] > cc_threshold],
+                key=lambda r: r["cc_mask"], reverse=True)
+
+            for r in high:
+                opt = _optimize_candidate(
+                    r["pdb_file"], density_mrc, resolution, contour,
+                    temp_dir, len(candidates) + 1, known_cc=r["cc_mask"])
+                if opt["success"]:
+                    candidates.append(opt)
+                    if opt["optimized_cc"] >= stop_threshold:
+                        best_result = opt
+                        early_stop = True
+                        _kill(proc)
+                        break
+            if early_stop:
+                break
+
+        if not running:
+            break
+        time.sleep(2.5)
+
+    # process remaining files
+    remaining = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
+                 if _is_valid_pred(f) and f not in processed]
+    if remaining:
+        for f in remaining:
+            processed.add(f)
+        batch_results = _batch_cc(remaining, density_mrc, resolution, contour)
+        all_results.extend(batch_results)
+
+    # final strategy selection
+    if not early_stop:
+        best_result = _select_final_result(
+            all_results, candidates, density_mrc, resolution, contour,
+            stop_threshold, temp_dir)
+
+    if best_result is None and all_results:
+        valid_r = [r for r in all_results if r["cc_mask"] is not None]
+        if valid_r:
+            raw_best = max(valid_r, key=lambda r: r["cc_mask"])
+            best_result = {
+                "success": True, "optimized_pdb": raw_best["pdb_file"],
+                "optimized_cc": raw_best["cc_mask"], "is_unoptimized": True}
+
+    return {"best_result": best_result, "all_results": all_results,
+            "candidates": candidates, "early_stop": early_stop}
+
+
+def _hybrid_score(cc, overlap):
+    """Hybrid score with a single CC_mask reliability split at 0.2.
+
+    CC_mask >= 0.2 is considered reliable enough -> full weight; below 0.2 it is
+    less reliable, so its weight is halved and the ranking leans more on overlap.
+    Overlap weight is constant.
+    """
+    cc = cc or 0.0
+    overlap = overlap or 0.0
+    cc_w = 1.0 if cc >= 0.2 else 0.5
+    overlap_w = 1.0
+    return cc_w * cc + overlap_w * overlap
+
+
+def _select_final_result(all_results, candidates, density_mrc, resolution,
+                         contour, stop_threshold, temp_dir):
+    """No early stop: among files not yet optimized, optimize the top 5 by CC
+    plus the top 5 by hybrid score (non-overlapping), then pick the best overall.
+    """
+    valid_r = [r for r in all_results if r["cc_mask"] is not None]
+    if not valid_r:
+        return None
+
+    optimized_files = {c.get("pdb_file") for c in candidates}
+    unopt = [r for r in valid_r if r["pdb_file"] not in optimized_files]
+    for r in unopt:
+        r["hybrid"] = _hybrid_score(r["cc_mask"], r.get("overlap", 0))
+
+    # 1) top 5 by CC_mask
+    by_cc = sorted(unopt, key=lambda r: r["cc_mask"], reverse=True)[:5]
+    chosen = {r["pdb_file"] for r in by_cc}
+    # 2) top 5 by hybrid score, excluding files already picked by CC
+    by_hybrid = [r for r in sorted(unopt, key=lambda r: r["hybrid"], reverse=True)
+                 if r["pdb_file"] not in chosen][:5]
+    picks = by_cc + by_hybrid
+    log.info("Final optimization: %d by CC + %d by hybrid (non-overlapping)",
+             len(by_cc), len(by_hybrid))
+
+    best, new_c = _optimize_top_n(picks, density_mrc, resolution, contour,
+                                  temp_dir, candidates, stop_threshold,
+                                  max_n=len(picks))
+    candidates.extend(new_c)
+    if best:
+        return best
+    if candidates:
+        return max(candidates, key=lambda c: c["optimized_cc"])
+    raw_best = max(valid_r, key=lambda r: r["cc_mask"])
+    return {"success": True, "optimized_pdb": raw_best["pdb_file"],
+            "optimized_cc": raw_best["cc_mask"], "is_unoptimized": True}
+
+
+# ======================================================================
+# Optimization
+# ======================================================================
+
+def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
+                        temp_dir, candidate_id, known_cc=None):
+    """Optimize a candidate via local fitting; reuse known_cc (no recompute)."""
+    work = os.path.join(temp_dir, f"candidate_{candidate_id}")
+    os.makedirs(work, exist_ok=True)
+    out_pdb = os.path.join(work, "optimized.pdb")
+
+    # original CC: reuse the value already computed in _batch_cc when available
+    if known_cc is not None:
+        orig_cc = known_cc
+    else:
+        try:
+            orig_cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+        except Exception:
+            orig_cc = 0.0
+
+    # record the exact structure that met the local-opt condition and is now
+    # being optimized (full path -> locate the source pred file when debugging)
+    log.info("Candidate #%d: local optimization on %s (cc=%.4f)",
+             candidate_id, pdb_file, orig_cc)
+
+    # local_optimize returns the final CC -> no recompute here
+    ok, opt_pdb, opt_cc = local_optimize(pdb_file, density_mrc, out_pdb,
+                                         resolution, contour,
+                                         num_processes=_NUM_PROCESSES,
+                                         initial_cc=orig_cc)
+    if not ok or not opt_pdb or not os.path.exists(opt_pdb):
+        log.warning("Candidate #%d [src: %s]: local optimization failed",
+                    candidate_id, os.path.basename(pdb_file))
+        return {"success": False, "candidate_id": candidate_id}
+
+    log.info("Candidate #%d [src: %s]: CC %.4f -> %.4f (improvement %.4f)",
+             candidate_id, os.path.basename(pdb_file),
+             orig_cc, opt_cc, opt_cc - orig_cc)
+
+    return {"success": True, "candidate_id": candidate_id,
+            "original_cc": orig_cc, "optimized_cc": opt_cc,
+            "optimized_pdb": opt_pdb, "pdb_file": pdb_file,
+            "improvement": opt_cc - orig_cc}
+
+
+def _optimize_top_n(results, density_mrc, resolution, contour,
+                    temp_dir, existing, threshold, max_n=5):
+    """Optimize top N candidates, stop early if threshold is met."""
+    best = None
+    new_candidates = []
+    for r in results[:max_n]:
+        cid = len(existing) + len(new_candidates) + 1
+        opt = _optimize_candidate(r["pdb_file"], density_mrc, resolution,
+                                  contour, temp_dir, cid, known_cc=r.get("cc_mask"))
+        if opt["success"]:
+            new_candidates.append(opt)
+            if opt["optimized_cc"] >= threshold:
+                best = opt
+                break
+    return best, new_candidates
+
+
+# ======================================================================
+# Result saving
+# ======================================================================
+
+def _save_final_result(best_result, output_dir, chain_pdb_path):
+    """Save best result PDB to results/ directory with proper naming."""
+    results_dir = os.path.join(output_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    src = best_result.get("optimized_pdb") or best_result.get("pdb_file")
+    if not src or not os.path.exists(src):
+        return None
+
+    basename = os.path.basename(chain_pdb_path)
+    if basename.startswith("chain_"):
+        out_name = "pred_" + basename[6:]
+    else:
+        out_name = "pred_" + basename
+
+    dst = os.path.join(results_dir, out_name)
+    shutil.copy2(src, dst)
+    origin = os.path.basename(best_result.get("pdb_file") or src)
+    log.info("Result saved: %s (source: %s, cc_mask=%.4f)",
+             dst, origin, best_result.get("optimized_cc", 0.0))
+    return dst
+
+
+def _verify_cc(pdb_file, density_mrc, resolution, contour):
+    """Calculate CC_mask on original density for final verification."""
+    if not pdb_file or not os.path.exists(pdb_file):
+        return 0.0
+    try:
+        cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+        log.info("Verified CC_mask (original density): %.6f", cc)
+        return cc
+    except Exception as e:
+        log.warning("CC verification failed: %s", e)
+        return 0.0
+
+
+# ======================================================================
+# Utilities
+# ======================================================================
+
+def _batch_cc(pdb_files, density_mrc, resolution, contour):
+    """Compute CC_mask for a batch of PDB files (parallel if _NUM_PROCESSES>1)."""
+    args = [(f, density_mrc, resolution, contour) for f in pdb_files]
+    if _NUM_PROCESSES and _NUM_PROCESSES > 1 and len(args) > 1:
+        import multiprocessing as mp
+        with mp.Pool(processes=min(_NUM_PROCESSES, len(args))) as pool:
+            return pool.map(_cc_worker, args)
+    return [_cc_worker(a) for a in args]
+
+
+def _is_valid_pred(pdb_file):
+    return bool(re.match(r"pred_.*\d+\.\d+\.pdb$", os.path.basename(pdb_file)))
+
+
+def _extract_overlap(pdb_file):
+    m = re.search(r"(\d+\.\d+)\.pdb$", os.path.basename(pdb_file))
+    return float(m.group(1)) if m else 0.0
+
+
+def _count_points(txt_file):
+    """Count points in a sample txt file (fast, no parsing)."""
+    try:
+        with open(txt_file) as f:
+            lines = f.readlines()
+        return max(0, (len(lines) - 5) // 2) if len(lines) > 5 else 0
+    except Exception:
+        return 0
+
+
+def _analyze_source_files(source_dir):
+    """List source txt files sorted by point count (descending)."""
+    txt_files = glob.glob(os.path.join(source_dir, "*.txt"))
+    txt_files = [f for f in txt_files
+                 if not os.path.basename(f).upper().startswith("EMD")
+                 and ("chain" in os.path.basename(f).lower()
+                      or "complex" in os.path.basename(f).lower())]
+    info = [{"file_path": f, "filename": os.path.basename(f),
+             "point_count": _count_points(f)} for f in txt_files]
+    info.sort(key=lambda x: x["point_count"], reverse=True)
+    for i, item in enumerate(info[:10], 1):
+        log.info("  %d. %s: %d points", i, item["filename"], item["point_count"])
+    return info
+
+
+def _find_pdb_for_txt(txt_file, search_dir):
+    """Find the PDB file corresponding to a source txt file."""
+    base = os.path.basename(txt_file).replace(".txt", "")
+    clean = re.sub(r"mol.*$|_\d+\.\d+$|_(sample|pred).*", "", base)
+    pdb_name = clean + ".pdb"
+
+    for d in [search_dir, os.path.dirname(txt_file)]:
+        path = os.path.join(d, pdb_name)
+        if os.path.exists(path):
+            return path
+
+    for root, _, files in os.walk(search_dir):
+        if pdb_name in files:
+            return os.path.join(root, pdb_name)
+    return None
+
+
+def _kill(proc):
+    # request handle: signal the server to stop the current request early
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+
+def _fail():
+    return {"success": False, "final_pdb": None, "cc_mask": 0.0}
