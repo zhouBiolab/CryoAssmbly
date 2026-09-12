@@ -1,5 +1,7 @@
 import os
 import glob
+from pathlib import Path
+
 import numpy as np
 import mrcfile
 from Bio.PDB import PDBParser, MMCIFParser
@@ -121,6 +123,15 @@ def find_files(directory, *extensions):
 
 
 def read_param_file(path):
-    """Read a single numeric value from a text file."""
-    with open(path) as f:
-        return float(f.read().strip())
+    """Read a single numeric value from a text file.
+
+    Raises:
+        FileNotFoundError: path does not exist.
+        ValueError: content is not a single number; the message names the file
+            and shows the offending content.
+    """
+    text = Path(path).read_text().strip()
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise ValueError("%s: expected a single number, got %r" % (path, text)) from exc
