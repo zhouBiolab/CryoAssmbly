@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-12 **v2.4**（实施期间同步；取代 v2.1–v2.3/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-12 **v2.5**（实施期间同步；取代 v2.1–v2.4/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -43,6 +43,13 @@
 ---
 
 ## 修订记录
+
+### v2.4 → v2.5（S4b 定向探针）
+
+| # | 位置 | v2.4 的状态 | v2.5 的结论 |
+|---|---|---|---|
+| 23 | §1.3 S4b / §1.6 V3 | 仅静态定位，待端到端确认 | **已执行三次定向探针**（派生 `Q/R` 复合物 CIF + `--complex-domain-opt`）：引入点确认，`final_results` 出口**无泄漏**；残留分支未证伪，按约定未改代码（报告 `tests/reports/2026-09-12_s4b_chain_space_probe.md`） |
+| 24 | 附录 C | 无空复合物相关条目 | 新增开放项 **O4**（无接受组件时写出 0 链不可解析 CIF，既有行为）与 **O5**（S4b 残留分支） |
 
 ### v2.3 → v2.4（S7 收尾）
 
@@ -152,27 +159,20 @@
 （真 `Q/R` → 占位 `A/B`：无映射返回 False 且不写文件，有映射成功）、匹配不足、只读第一个 model。
 **端到端复合物域优化验证仍属 S4b。**
 
-**【S4b 静态定位，2026-09-12；未确认、未改代码】**
+**【S4b 结论，2026-09-12/13：三次定向探针，未观测到泄漏；未改代码】**
 
-只读代码追踪的结论（`chain_map` 全仓库使用点只有 `pipeline.py` / `structure.py` / `orchestrator.py`，
-`domain_assembler` 与 `complex_builder` 都不用它）：
-
-1. 复合物域优化路径：`chain_fitter.try_improve_chain_with_domains` 里
-   `chain_id_for_cif = src_cid if (is_complex and src_cid) else cid`，随后
-   `pdb_to_cif(final, cif, chain_id=chain_id_for_cif)`（`chain_fitter.py:237-240`）。
-2. `src_cid` 来自 `_split_complex_domains` → `split_structure_to_chains(rec["pdb_file"])`
-   （`orchestrator.py:319,327`），而 CIF 输入的 `rec["pdb_file"]` 是**占位链号**空间。
-3. 域链落盘 `domain_assembler._save_domain_chain` 只做 `shutil.copy2`（无重命名），
-   `complex_builder.build_complex` 也按原链号拷贝。
-4. 因此：**CIF 复合物 + 非恒等映射**（真链号 ≠ 占位链号）时，复合物域优化路径可能把
-   占位链号写进 `final_results/domain_chains/*.cif` 与最终 `assembled_complex*.cif`。
-5. 不泄漏的路径：整链/复合物接受走 `_accept_chain`，那里对 `is_complex and chain_map`
-   调用 `write_structure_with_chain_map`（`orchestrator.py:563-569`）恢复真链号。
-
-**确认方式（尚未执行）**：从 `test/1` 或 `test_data/fiting_lg/6lu9` 派生一个真链号为 `Q/R/S/T`
-的多链 CIF 副本，用 `--complex-domain-opt` 跑一次，检查 `final_results/domain_chains/*.cif` 与
-`assembled_complex*.cif` 的链号。**确认前不改 `chain_id_for_cif`**（直接改可能造成重复映射，
-或让多字符真链号提前进入 PDB 写出）。
+- 引入点**已确认**：复合物域优化路径的逐域微调产物 `work/chain_improve_<cid>/domain_*.cif` 带占位链号
+  （真链号 `Q/R` → 占位 `A/B`），来自 `chain_fitter.py:237-240` 的 `chain_id_for_cif = src_cid`。
+- 出口**已核实无泄漏**：`final_results` 全部产物链号均为真链号（`assembled_complex.cif` /
+  `assembled_complex_all.cif` / `chains/complex_Q+R_01.cif` = `Q/R`）；`_accept_chain` 对复合物应用
+  `chain_map` 完成恢复。
+- **残留未覆盖分支（未证伪）**：`refine_step._backfill_chains_as_domains` 复制 `cr["domain_cifs"]`
+  （占位标注）后由 Step 4 合并；触发需"链被接受且记录 domain_cifs + 发生过域拟合 + 有同源链"三者同时成立，
+  本派生 case 未能构造（三次运行的 Step 4 分别因"无域拟合""无同源链"被门控）。
+- 按约定**未修改 `chain_id_for_cif`**；证据、命令与复现条件见
+  `tests/reports/2026-09-12_s4b_chain_space_probe.md`。
+- 顺带发现（既有行为，非本阶段改动）：无组件被接受时写出的复数 CIF 为 0 链、Bio.PDB 无法解析，
+  已列为开放项 O4。
 
 **v1 的错误声明**：v1 写"单链且编号唯一时结果不变"不成立。反例【已核实】：`chain_B_2.cif` 真链号 B → 占位 A（`cif_to_pdb_placeholders` 按文件内顺序分配），`fitted_cif` 为 B，域 PDB 为 A → 严格按链号匹配将无交集。旧代码能对齐，纯粹因为旧匹配忽略链号。
 
@@ -212,7 +212,7 @@
 |---|---|---|---|
 | V1 | 采样 TXT 头部第 1 行的轴序是 `nz ny nx` 还是 `nx ny nz`（v1 的写法是**推断**） | 用 6×8×10 非立方网格跑 `Sample`，读第 1 行 | S3 前置 |
 | V2 | 数字占位链号是否真的破坏下游 | **部分销项**：`read_structure`/`calculate_cc_mask`/USalign 实测通过（`tests/test_chain_ids.py`）；DomainParser/domain split 未覆盖，容量保留 62 | S5 |
-| V3 | S4b 传播链中哪个出口泄漏占位链号 | 非恒等映射 + 复合物域优化测试 | S4b |
+| V3 | S4b 传播链中哪个出口泄漏占位链号 | **已部分销项**：引入点为 `chain_improve` 域 CIF；`final_results` 三路径均未见泄漏；残留分支见 O5 | S4b |
 | V4 | `test/1` 完整流水线耗时与基线结果 | **已销项**：基线 967 s、新版 956 s，输出逐字节一致 | S7 |
 | V5 | 复合物域优化分支（`--complex-domain-opt`）在默认参数下的触发条件与耗时 | 显式加该参数运行 | S7 |
 
@@ -682,3 +682,5 @@ ssh my-server 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate 
 | O1 | 6lu9 完整端到端是否在阶段一内执行（当前定为"定向测试通过后跑一次"） | 用户可按耗时再定 |
 | O2 | 5kem 是否纳入阶段一（当前定为 S4a/S5 后各一次） | 同上 |
 | O3 | 阶段二启动时间与 P1–P11 的取舍 | 阶段一验收后 |
+| O4 | 无组件被接受时仍写出 0 链、不可解析的 `assembled_complex*.cif`（既有行为，`complex_builder.py` 阶段一未改动）：改为跳过写出或写合法空 CIF | 需你定 |
+| O5 | S4b 残留分支：链被接受且记录 `domain_cifs` + 域拟合 + 同源 Step4 三者同时成立时的链号出口 | 阶段二或专门复现 |
