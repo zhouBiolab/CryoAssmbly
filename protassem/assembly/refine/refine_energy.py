@@ -981,15 +981,15 @@ def cross_folder_tm_score_analysis(
 
 # ==================== 使用示例 ====================
 
-def example_usage():
-    """使用示例"""
+def example_usage(case_dir):
+    """使用示例：case_dir 为含已拟合结构域的目录。"""
 
     # 示例1: 计算连接能量
     print("\n" + "=" * 80)
     print("示例1: 计算连接能量（支持PDB和CIF）")
     print("-" * 80)
 
-    test_dir = "/xiangyux/test_data/shixiong/7pty/simplified_batch_domain_assembly_results——chain-domian/work/temp_fitted_domains/b"
+    test_dir = case_dir
     if os.path.exists(test_dir):
         total_energy = calculate_chain_connection_energy(test_dir)
         print(f"\n总能量: {total_energy:.6f}")
@@ -1013,4 +1013,8 @@ def example_usage():
 
 
 if __name__ == "__main__":
-    example_usage()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="连接能量/连接评分示例")
+    parser.add_argument("case_dir", help="含已拟合结构域的目录")
+    example_usage(parser.parse_args().case_dir)

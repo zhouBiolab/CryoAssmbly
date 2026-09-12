@@ -1,3 +1,4 @@
+# 推理路径只使用模型与匹配参数；数据集/训练相关配置不参与推理。
 import os
 import os.path as osp
 import argparse
@@ -30,9 +31,8 @@ _C.registration_dir = osp.join(_C.output_dir, 'registration')
 # ensure_dir(_C.feature_dir)  # disabled: not needed for inference
 # ensure_dir(_C.registration_dir)  # disabled: not needed for inference
 
-# data
+# data（推理不使用；仅保留仓库相对的元数据目录，供 vendored 数据集脚本参考）
 _C.data = edict()
-_C.data.dataset_root = '/xiangyux/PARENet-main/data/demo'
 _C.data.metadata_root = osp.join(_C.root_dir, 'data', '3DMatch', 'metadata')
 
 # train data

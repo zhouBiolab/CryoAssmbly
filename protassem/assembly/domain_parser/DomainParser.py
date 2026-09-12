@@ -172,16 +172,15 @@ def DomainParser(pdb_file,execpath="domainparser2.LINUX",
         return ''
 
     #### run DomainParser ####
-    cmd=' '.join(['cd',tmp_dir,';',
-        'export DSSP_PATH='+dssp_path,';',
-        execpath,'xxxx'+chain_id
-        ])
-    
+    env = dict(os.environ)
+    env['DSSP_PATH'] = dssp_path
+    cmd = [execpath, 'xxxx' + chain_id]
+
     if debug:
         print(f"DEBUG: Running command: {cmd}")
-    
+
     try:
-        p=subprocess.Popen(cmd,shell=True,stdout=subprocess.PIPE,
+        p=subprocess.Popen(cmd,cwd=tmp_dir,env=env,stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,universal_newlines=True)
         stdout,stderr=p.communicate()
         
@@ -221,12 +220,12 @@ def DomainParser(pdb_file,execpath="domainparser2.LINUX",
             fp.write(txt)
             fp.close()
 
-            pul_cmd=' '.join(['cd',tmp_dir,';',pulchra_path,'-epc xxxx.pdb'])
+            pul_cmd = [pulchra_path, '-epc', 'xxxx.pdb']
             if debug:
                 print(f"DEBUG: Running pulchra: {pul_cmd}")
-                
+
             try:
-                subprocess.Popen(pul_cmd, stdout=subprocess.PIPE, shell=True,
+                subprocess.Popen(pul_cmd, cwd=tmp_dir, stdout=subprocess.PIPE,
                     universal_newlines=True).communicate()
             except Exception as e:
                 print(f"ERROR: Pulchra failed: {e}")
@@ -275,7 +274,7 @@ def DomainParser(pdb_file,execpath="domainparser2.LINUX",
                 print("DEBUG: Re-running DomainParser with rebuilt structure...")
                 
             try:
-                p=subprocess.Popen(cmd,shell=True,stdout=subprocess.PIPE,
+                p=subprocess.Popen(cmd,cwd=tmp_dir,env=env,stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,universal_newlines=True)
                 stdout,stderr=p.communicate()
                 

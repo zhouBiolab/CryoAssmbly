@@ -539,24 +539,29 @@ def _save_point_cloud_as_txt(structured_data: np.ndarray, output_path: str):
                       indices=structured_data["index"])
 
 
-# 使用示例
+# 使用示例：python sw_mask.py --source chain.txt --target map.txt [--out DIR]
 if __name__ == "__main__":
-    # 示例1：使用文件路径
-    source_path = "/xiangyux/test_data/l_g/EMD-14812-7znn/chain_A_1mol_2.00.txt"
-    target_path = "/xiangyux/test_data/l_g/EMD-14812-7znn/EMD-14812_2.00.txt"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="球形掩码生成示例")
+    parser.add_argument("--source", required=True, help="源点云 TXT（链模板）")
+    parser.add_argument("--target", required=True, help="目标点云 TXT（密度图）")
+    parser.add_argument("--out", default=None, help="掩码输出目录（缺省不保存）")
+    args = parser.parse_args()
 
     masks = generate_spherical_masks(
-        source_path, target_path,
+        args.source, args.target,
         mask_radius_factor=1.45,
         min_coverage=0.3,
         min_point_distance_factor=0.45,
         verbose=True
     )
 
-    print(f"\n生成的掩码信息:")
-    print(f"masks[0] (完整数据): {masks[0].points_count} 个点, type={masks[0].type}")
+    print("\n生成的掩码信息:")
+    print("masks[0] (完整数据): %d 个点, type=%s" % (masks[0].points_count, masks[0].type))
     for i in range(1, len(masks)):
-        print(f"masks[{i}] (球形掩码): {masks[i].points_count} 个点, radius={masks[i].radius:.3f}")
+        print("masks[%d] (球形掩码): %d 个点, radius=%.3f"
+              % (i, masks[i].points_count, masks[i].radius))
 
-    # 可选：保存结果
-    save_masks(masks, "/xiangyux/test_data/l_g/EMD-14812-7znn/mask")
+    if args.out:
+        save_masks(masks, args.out)

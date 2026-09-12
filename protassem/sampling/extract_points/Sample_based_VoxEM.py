@@ -1,4 +1,6 @@
 import os
+import subprocess
+
 from .VoxEM import *
 from .Supporting import *
 
@@ -19,7 +21,15 @@ def Sample_Cluster(data_dir, map_name, threshold, VOXEL_SIZE):
     sample_file = "%s/%s_%.2f.txt" % (data_dir, map_name[:-4], VOXEL_SIZE)
     print("sample_file",sample_file)
     #sample_file = "%s/%s_%s.txt" % (data_dir, map_name[:-4], "new")
-    os.system("%s -a %s -t %.4f -s %.2f > %s" % (_SAMPLE_BIN, mrc_file, threshold, VOXEL_SIZE, sample_file))
+    with open(sample_file, "w", encoding="utf-8") as output:
+        result = subprocess.run([_SAMPLE_BIN, "-a", mrc_file,
+                                 "-t", "%.4f" % threshold,
+                                 "-s", "%.2f" % VOXEL_SIZE],
+                                stdout=output, stderr=subprocess.PIPE,
+                                text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError("Sample binary failed with code %d: %s"
+                           % (result.returncode, result.stderr.strip()[-2000:]))
 
     '''
   
