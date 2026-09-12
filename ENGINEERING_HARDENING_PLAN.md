@@ -44,6 +44,15 @@
 
 ## 修订记录
 
+### v2.3 → v2.4（S7 收尾）
+
+| # | 位置 | v2.3 的状态 | v2.4 的结论 |
+|---|---|---|---|
+| 19 | §1.6 V4 | `test/1` 完整耗时未知 | **已销项**：基线 967 s（≈16 min），新版 956 s |
+| 20 | §5.4 通过标准 | 需真实 case 等价性证据 | **已达成**：`test/1` 三个最终 CIF + 摘要与固定基线逐字节一致（报告 `tests/reports/2026-09-12_test1_baseline_vs_new.md`） |
+| 21 | §1.6 V5 / S4b | 复合物域优化待验证 | **未执行**：`6lu9` + `--complex-domain-opt` 属开放项（O1），S4b 仅完成静态定位 |
+| 22 | §1.6 V2 | 数字占位链号下游 | 维持"部分销项"（DomainParser/domain split 未覆盖） |
+
 ### v2.2 → v2.3（S6 实施期间同步）
 
 | # | 位置 | v2.2 的说法 | v2.3 的更正 |
@@ -143,6 +152,28 @@
 （真 `Q/R` → 占位 `A/B`：无映射返回 False 且不写文件，有映射成功）、匹配不足、只读第一个 model。
 **端到端复合物域优化验证仍属 S4b。**
 
+**【S4b 静态定位，2026-09-12；未确认、未改代码】**
+
+只读代码追踪的结论（`chain_map` 全仓库使用点只有 `pipeline.py` / `structure.py` / `orchestrator.py`，
+`domain_assembler` 与 `complex_builder` 都不用它）：
+
+1. 复合物域优化路径：`chain_fitter.try_improve_chain_with_domains` 里
+   `chain_id_for_cif = src_cid if (is_complex and src_cid) else cid`，随后
+   `pdb_to_cif(final, cif, chain_id=chain_id_for_cif)`（`chain_fitter.py:237-240`）。
+2. `src_cid` 来自 `_split_complex_domains` → `split_structure_to_chains(rec["pdb_file"])`
+   （`orchestrator.py:319,327`），而 CIF 输入的 `rec["pdb_file"]` 是**占位链号**空间。
+3. 域链落盘 `domain_assembler._save_domain_chain` 只做 `shutil.copy2`（无重命名），
+   `complex_builder.build_complex` 也按原链号拷贝。
+4. 因此：**CIF 复合物 + 非恒等映射**（真链号 ≠ 占位链号）时，复合物域优化路径可能把
+   占位链号写进 `final_results/domain_chains/*.cif` 与最终 `assembled_complex*.cif`。
+5. 不泄漏的路径：整链/复合物接受走 `_accept_chain`，那里对 `is_complex and chain_map`
+   调用 `write_structure_with_chain_map`（`orchestrator.py:563-569`）恢复真链号。
+
+**确认方式（尚未执行）**：从 `test/1` 或 `test_data/fiting_lg/6lu9` 派生一个真链号为 `Q/R/S/T`
+的多链 CIF 副本，用 `--complex-domain-opt` 跑一次，检查 `final_results/domain_chains/*.cif` 与
+`assembled_complex*.cif` 的链号。**确认前不改 `chain_id_for_cif`**（直接改可能造成重复映射，
+或让多字符真链号提前进入 PDB 写出）。
+
 **v1 的错误声明**：v1 写"单链且编号唯一时结果不变"不成立。反例【已核实】：`chain_B_2.cif` 真链号 B → 占位 A（`cif_to_pdb_placeholders` 按文件内顺序分配），`fitted_cif` 为 B，域 PDB 为 A → 严格按链号匹配将无交集。旧代码能对齐，纯粹因为旧匹配忽略链号。
 
 **S4b 传播链【待验证】**（不得直接改 `chain_id_for_cif`）：
@@ -182,7 +213,7 @@
 | V1 | 采样 TXT 头部第 1 行的轴序是 `nz ny nx` 还是 `nx ny nz`（v1 的写法是**推断**） | 用 6×8×10 非立方网格跑 `Sample`，读第 1 行 | S3 前置 |
 | V2 | 数字占位链号是否真的破坏下游 | **部分销项**：`read_structure`/`calculate_cc_mask`/USalign 实测通过（`tests/test_chain_ids.py`）；DomainParser/domain split 未覆盖，容量保留 62 | S5 |
 | V3 | S4b 传播链中哪个出口泄漏占位链号 | 非恒等映射 + 复合物域优化测试 | S4b |
-| V4 | `test/1` 完整流水线耗时与基线结果 | S0 冻结基线后跑一次并记录 | S0/S7 |
+| V4 | `test/1` 完整流水线耗时与基线结果 | **已销项**：基线 967 s、新版 956 s，输出逐字节一致 | S7 |
 | V5 | 复合物域优化分支（`--complex-domain-opt`）在默认参数下的触发条件与耗时 | 显式加该参数运行 | S7 |
 
 ### 1.7 实施决策清单【决策】

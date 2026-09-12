@@ -16,6 +16,10 @@ checkpoints/
 *.npz
 *.mrc
 
+# 真实测试数据与运行产物（只入库生成器、输入清单与精简报告）
+test/
+tests/data/
+
 .vscode/
 .idea/
 .DS_Store

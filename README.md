@@ -56,12 +56,15 @@ PARENet 权重 epoch-18.pth.tar（6.6MB）已放在 protassem/fitting/parenet/we
 
 ### 快速测试
 
+仓库不含示例数据（`example2` 不在仓库内），请用任意数据目录，目录内需包含
+密度图 `.mrc`、结构文件 `.pdb`/`.cif`、`resolution.txt`、`contour_level.txt`：
+
 ```bash
-cd /xiangyux/claude_c_work/demo_reg
-python main.py example2 --log
+cd <项目根目录>
+python main.py <case_dir> --log
 ```
 
-结果在 example2/output/：
+结果在 `<case_dir>/output/`（手动模式可指定独立输出目录）：
 
 ```
 example2/output/
@@ -98,6 +101,11 @@ python main.py <data_dir> --log
 ```bash
 python main.py <density.mrc> <struct_dir> <resolution> <contour> [output_dir] --log
 ```
+
+选项可以放在位置参数之前、之间或之后。用法错误（未知选项、选项缺值、非数字、位置参数
+个数不是 1/4/5）退出码为 2，并打印具体原因。入口校验在建立输出目录之前完成：密度图必须
+存在且为 `.mrc`、结构文件列表非空且文件都存在、`resolution > 0`、`contour` 为有限数值、
+`voxel_size > 0`（`contour` 不接受缺省，自动目录模式仍从 `contour_level.txt` 读取）。
 
 ### 参数说明
 
