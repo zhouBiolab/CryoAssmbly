@@ -120,6 +120,13 @@
 - `orchestrator._attach_domain_details` 需按组件 ID 从 `self.chain_records` 查找；
 - 建议在 orchestrator 上提供一个明确的查找方法（如 `chain_record(cid)`），两处共用，**不复制整套映射状态**。
 
+**【实施状态，S4a】** 已按上述实现：`AssemblyOrchestrator.chain_record(cid)` 是唯一查找入口，
+`refine_step._backfill_chains_as_domains` 与 `orchestrator._attach_domain_details` 共用它；
+`chain_fitter` 的两处调用（ref/mob 同空间）保持 `mob_chain_map=None`。
+构造测试已覆盖：单链叠合、多链同编号（含旧逻辑 RMSD > 5 Å 的取证）、占位链号映射
+（真 `Q/R` → 占位 `A/B`：无映射返回 False 且不写文件，有映射成功）、匹配不足、只读第一个 model。
+**端到端复合物域优化验证仍属 S4b。**
+
 **v1 的错误声明**：v1 写"单链且编号唯一时结果不变"不成立。反例【已核实】：`chain_B_2.cif` 真链号 B → 占位 A（`cif_to_pdb_placeholders` 按文件内顺序分配），`fitted_cif` 为 B，域 PDB 为 A → 严格按链号匹配将无交集。旧代码能对齐，纯粹因为旧匹配忽略链号。
 
 **S4b 传播链【待验证】**（不得直接改 `chain_id_for_cif`）：

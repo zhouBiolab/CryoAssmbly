@@ -84,5 +84,34 @@ def make_mrc(path, shape=(8, 8, 8), voxel_size=2.0, origin=(1.0, 2.0, 3.0),
     return path
 
 
+def make_chain_structure(path, chains, residues=10, rise=3.8):
+    """Write a CA-only structure file and return its path.
+
+    Args:
+        path: output path; ``.cif`` is written with MMCIFIO, anything else with PDBIO
+        chains: [(chain_id, (dx, dy, dz)), ...]; each chain has ``residues``
+            residues numbered 1..residues, spaced ``rise`` angstroms along x
+        residues: residues per chain
+        rise: distance between consecutive CA atoms in angstroms
+    """
+    from Bio.PDB import MMCIFIO, PDBIO, StructureBuilder
+
+    builder = StructureBuilder.StructureBuilder()
+    builder.init_structure("s")
+    builder.init_model(0)
+    for chain_id, offset in chains:
+        builder.init_chain(chain_id)
+        builder.init_seg(" ")
+        for i in range(residues):
+            builder.init_residue("ALA", " ", i + 1, " ")
+            coord = (i * rise + offset[0], offset[1], offset[2])
+            builder.init_atom("CA", coord, 1.0, 0.0, " ", "CA", element="C")
+    structure = builder.get_structure()
+    writer = MMCIFIO() if str(path).lower().endswith(".cif") else PDBIO()
+    writer.set_structure(structure)
+    writer.save(str(path))
+    return path
+
+
 def _sh_quote(text):
     return "'" + text.replace("'", "'\\''") + "'"

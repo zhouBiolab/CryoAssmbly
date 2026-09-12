@@ -246,6 +246,17 @@ class AssemblyOrchestrator:
         log.info("Found %d chains (sorted by gyration radius)",
                  len(self.chain_records))
 
+    def chain_record(self, chain_id):
+        """按组件 ID 取原始链记录（含 chain_map）。
+
+        accepted_chains 里存的是摘要记录，不带 chain_map；需要链号空间信息
+        （占位链号 -> 真链号）时必须从 chain_records 取。
+        """
+        for record in self.chain_records:
+            if record["chain_id"] == chain_id:
+                return record
+        return None
+
     def _find_txt_for_chain(self, pdb_file):
         base = Path(pdb_file).stem
         for txt in self.source_dir.glob("%s*.txt" % base):
@@ -609,6 +620,8 @@ class AssemblyOrchestrator:
                 continue
             cid = rec["chain_id"]
             chain_cif = rec.get("fitted_cif")
+            chain_record = self.chain_record(cid)
+            chain_map = chain_record.get("chain_map") if chain_record else None
             domains = self.domain_records.get(cid, [])
             if (not chain_cif or not os.path.exists(chain_cif)
                     or len(domains) <= 1):
@@ -619,7 +632,8 @@ class AssemblyOrchestrator:
             for drec in domains:
                 dnum = drec["domain_num"]
                 tpdb = str(tmp / ("d%d.pdb" % dnum))
-                if align_by_resid(chain_cif, drec["pdb_file"], tpdb):
+                if align_by_resid(chain_cif, drec["pdb_file"], tpdb,
+                                  mob_chain_map=chain_map):
                     cc = calculate_cc_mask(self.original_density_mrc, tpdb,
                                            self.resolution, self.contour)
                     details.append({"num": dnum, "cc_mask": cc})

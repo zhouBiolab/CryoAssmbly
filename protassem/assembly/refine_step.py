@@ -81,7 +81,7 @@ def _has_homologous_chains(orch):
     """True if >=2 accepted chains are mutually similar (TM >= threshold)."""
     templates = []
     for rec in orch.accepted_chains:
-        cr = _chain_record(orch, rec["chain_id"])
+        cr = orch.chain_record(rec["chain_id"])
         if cr and cr.get("pdb_file"):
             templates.append(cr["pdb_file"])
     for i, pdb in enumerate(templates):
@@ -113,9 +113,10 @@ def _backfill_chains_as_domains(orch, fitted_domains):
             continue  # already populated by real domain fitting
         os.makedirs(str(out_dir), exist_ok=True)
 
-        cr = _chain_record(orch, cid)
+        cr = orch.chain_record(cid)
         chain_cif = rec.get("fitted_cif")
         domain_cifs = cr.get("domain_cifs") if cr else None
+        chain_map = cr.get("chain_map") if cr else None
 
         if domain_cifs:
             for d in domain_cifs:
@@ -131,7 +132,8 @@ def _backfill_chains_as_domains(orch, fitted_domains):
             for drec in domains:
                 dnum = drec["domain_num"]
                 tmp_pdb = os.path.join(str(out_dir), "_tmp_d%s.pdb" % dnum)
-                if align_by_resid(chain_cif, drec["pdb_file"], tmp_pdb):
+                if align_by_resid(chain_cif, drec["pdb_file"], tmp_pdb,
+                                  mob_chain_map=chain_map):
                     pdb_to_cif(tmp_pdb, os.path.join(
                         str(out_dir), "domain_%s.cif" % dnum), chain_id=cid)
                     os.remove(tmp_pdb)
@@ -140,13 +142,6 @@ def _backfill_chains_as_domains(orch, fitted_domains):
             shutil.copy2(chain_cif, os.path.join(str(out_dir), "domain_1.cif"))
             count += 1
     return count
-
-
-def _chain_record(orch, chain_id):
-    for cr in orch.chain_records:
-        if cr.get("chain_id") == chain_id:
-            return cr
-    return None
 
 
 # ----------------------------------------------------------------------

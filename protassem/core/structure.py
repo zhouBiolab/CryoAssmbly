@@ -1,11 +1,14 @@
 ﻿"""Structure operations: format conversion, gyration radius, sequence alignment."""
 
+import logging
 import os
 import re
 import numpy as np
 from pathlib import Path
 from Bio.PDB import PDBParser, MMCIFParser, PDBIO, MMCIFIO, Superimposer
 from Bio import pairwise2
+
+log = logging.getLogger(__name__)
 
 AA_MAP = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -110,32 +113,56 @@ def extract_chain_id(filename):
     return match.group(1) if match else basename
 
 
-def align_by_resid(ref_file, mob_file, output_file):
-    """Align mob to ref by matching residue numbers (domain is subset of chain)."""
+def _ca_by_residue(structure):
+    """收集 ``(链号, 残基号, 插入码) -> CA 原子``；只取第一个 model。
+
+    与 read_chain_ids/read_structure 一致只读第一个 model，避免不同 model 的
+    同键残基互相覆盖。
+    """
+    atoms = {}
+    model = next(structure.get_models())
+    for chain in model:
+        for residue in chain:
+            if residue.get_resname() not in AA_MAP or "CA" not in residue:
+                continue
+            _, resseq, icode = residue.get_id()
+            atoms[(chain.id, resseq, icode)] = residue["CA"]
+    return atoms
+
+
+def align_by_resid(ref_file, mob_file, output_file, mob_chain_map=None,
+                   min_pairs=3):
+    """按 (链号, 残基号, 插入码) 匹配 CA，把 mob 叠合到 ref。
+
+    Args:
+        ref_file: 参考结构（PDB/CIF）
+        mob_file: 待叠合结构
+        output_file: 叠合后的 mob 输出路径（按扩展名选 PDBIO/MMCIFIO）
+        mob_chain_map: mob 链号 -> ref 链号空间的映射（如占位链号 -> 真链号）。
+            只在构造匹配键时使用，不修改结构本身；None 表示两边同一空间。
+        min_pairs: 最少匹配对数，不足则不叠合
+
+    Returns:
+        bool: 是否完成叠合；匹配不足时返回 False 且不写文件。
+    """
     ref_struct = _get_parser(ref_file).get_structure("ref", str(ref_file))
     mob_struct = _get_parser(mob_file).get_structure("mob", str(mob_file))
 
-    ref_ca = {}
-    for model in ref_struct:
-        for chain in model:
-            for res in chain:
-                if res.get_resname() in AA_MAP and "CA" in res:
-                    ref_ca[res.get_id()[1]] = res["CA"]
+    ref_ca = _ca_by_residue(ref_struct)
+    mob_ca = _ca_by_residue(mob_struct)
+    if mob_chain_map:
+        mob_ca = {(mob_chain_map.get(chain, chain), resseq, icode): atom
+                  for (chain, resseq, icode), atom in mob_ca.items()}
 
-    atoms_ref, atoms_mob = [], []
-    for model in mob_struct:
-        for chain in model:
-            for res in chain:
-                resid = res.get_id()[1]
-                if res.get_resname() in AA_MAP and "CA" in res and resid in ref_ca:
-                    atoms_ref.append(ref_ca[resid])
-                    atoms_mob.append(res["CA"])
-
-    if len(atoms_ref) < 3:
+    shared = sorted(set(ref_ca) & set(mob_ca))
+    if len(shared) < min_pairs:
+        log.warning("align_by_resid: %d matched CA (ref=%d, mob=%d, mapped=%s) for %s",
+                    len(shared), len(ref_ca), len(mob_ca), bool(mob_chain_map),
+                    os.path.basename(str(mob_file)))
         return False
 
     sup = Superimposer()
-    sup.set_atoms(atoms_ref, atoms_mob)
+    sup.set_atoms([ref_ca[key] for key in shared], [mob_ca[key] for key in shared])
     sup.apply(mob_struct.get_atoms())
 
     out_io = PDBIO() if str(output_file).endswith(".pdb") else MMCIFIO()
