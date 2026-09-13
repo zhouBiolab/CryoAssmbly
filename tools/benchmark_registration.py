@@ -132,10 +132,20 @@ def summarize_predictions(pair_dir):
     return files, overlaps
 
 
-def run_manifest(manifest_path, out_dir, repeat):
-    """按 manifest 重放固定配准（不生成掩码、不跑装配）。"""
+def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None):
+    """按 manifest 重放固定配准（不生成掩码、不跑装配）。
+
+    geometry_cache_mb：T05 单侧几何缓存容量（MiB）；0 = 关闭，None = 用运行配置默认值。
+    """
+    from protassem.fitting.cloud_encoding import GeometryCache
     from protassem.fitting.demo_mask import run_inference
+    from protassem.runtime.config import DEFAULT_GEOMETRY_CACHE_MB
     from protassem.runtime.metrics import Metrics
+
+    if geometry_cache_mb is None:
+        geometry_cache_mb = DEFAULT_GEOMETRY_CACHE_MB
+    geometry_cache = GeometryCache(int(geometry_cache_mb) * 1024 * 1024) \
+        if geometry_cache_mb else None
 
     with open(manifest_path, encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -157,7 +167,8 @@ def run_manifest(manifest_path, out_dir, repeat):
                     target=target["txt"], source=manifest["source"]["txt"],
                     chain_pdb=manifest["source"]["pdb"], output_dir=pair_dir,
                     weights=weights, use_mask=False,
-                    configs=manifest["params"]["configs"], seed=manifest["seed"])
+                    configs=manifest["params"]["configs"], seed=manifest["seed"],
+                    geometry_cache=geometry_cache)
             elapsed = time.perf_counter() - started
             pred_files, overlaps = summarize_predictions(pair_dir)
             records.append({
@@ -174,8 +185,10 @@ def run_manifest(manifest_path, out_dir, repeat):
                   % (target["order"], repeat_index + 1, elapsed, len(pred_files),
                      max(overlaps) if overlaps else None))
     summary_path = metrics.write_summary()
+    cache_stats = geometry_cache.snapshot() if geometry_cache is not None else None
     report = {"manifest": os.path.abspath(manifest_path), "out_dir": os.path.abspath(out_dir),
               "repeat": repeat, "records": records,
+              "geometry_cache_mb": geometry_cache_mb, "geometry_cache": cache_stats,
               "metrics_summary": summary_path}
     with open(os.path.join(out_dir, "t00_report.json"), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
@@ -195,6 +208,8 @@ def main(argv=None):
     run.add_argument("--manifest", required=True)
     run.add_argument("--out-dir", required=True)
     run.add_argument("--repeat", type=int, default=1)
+    run.add_argument("--geometry-cache-mb", type=int, default=None,
+                     help="单侧几何缓存容量（MiB，0 = 关闭；默认取运行配置默认值）")
 
     args = parser.parse_args(argv)
     if args.command == "manifest":
@@ -213,8 +228,10 @@ def main(argv=None):
         print("cuda ext: %s" % deps["cuda_extension_imported_from"])
         return 0
 
-    report = run_manifest(args.manifest, args.out_dir, args.repeat)
+    report = run_manifest(args.manifest, args.out_dir, args.repeat,
+                          geometry_cache_mb=args.geometry_cache_mb)
     print("report written: %s" % os.path.join(args.out_dir, "t00_report.json"))
+    print("geometry cache: %s" % (report["geometry_cache"] or "关闭"))
     for record in report["records"]:
         print("  target %d run %d: %.2f s, %d predictions, best overlap=%s"
               % (record["target_order"], record["repeat"], record["wall_s"],

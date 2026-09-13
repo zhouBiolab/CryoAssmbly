@@ -21,6 +21,8 @@ import atexit
 import logging
 import subprocess
 
+from protassem.runtime.config import DEFAULT_GEOMETRY_CACHE_MB
+
 log = logging.getLogger(__name__)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +33,26 @@ DONE_MARKER = "_PARENET_DONE"
 STOP_MARKER = "_PARENET_STOP"
 
 _SERVER = None
+# 服务端几何缓存容量（MiB，T05）；由 configure_geometry_cache() 在**启动服务前**显式设定
+_GEOMETRY_CACHE_MB = DEFAULT_GEOMETRY_CACHE_MB
+
+
+def configure_geometry_cache(geometry_cache_mb):
+    """设定服务端几何缓存容量（必须在第一次请求之前调用）。
+
+    服务进程在启动时接收该值；若服务已经在运行，则保留其现有配置并记录警告——
+    不做"悄悄重启服务"这种会打断在飞请求的事。
+    """
+    global _GEOMETRY_CACHE_MB
+    value = int(geometry_cache_mb)
+    if value < 0:
+        raise ValueError("geometry_cache_mb 不能为负：%r" % (geometry_cache_mb,))
+    if _SERVER is not None and _SERVER.poll() is None and value != _GEOMETRY_CACHE_MB:
+        log.warning("PARENet server already running with geometry_cache_mb=%s; "
+                    "keeping it (new value %s ignored)", _GEOMETRY_CACHE_MB, value)
+        return _GEOMETRY_CACHE_MB
+    _GEOMETRY_CACHE_MB = value
+    return _GEOMETRY_CACHE_MB
 
 
 def get_server():
@@ -42,11 +64,13 @@ def get_server():
     log_path = os.path.join(DEMO_MASK_CWD, "parenet_server.log")
     logf = open(log_path, "a", buffering=1)
     _SERVER = subprocess.Popen(
-        [sys.executable, DEMO_MASK_PATH, "--server"],
+        [sys.executable, DEMO_MASK_PATH, "--server",
+         "--geometry-cache-mb", str(_GEOMETRY_CACHE_MB)],
         stdin=subprocess.PIPE, stdout=logf, stderr=logf,
         text=True, cwd=DEMO_MASK_CWD)
     atexit.register(shutdown_server)
-    log.info("PARENet server started (pid=%d, log=%s)", _SERVER.pid, log_path)
+    log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, log=%s)",
+             _SERVER.pid, _GEOMETRY_CACHE_MB, log_path)
     return _SERVER
 
 

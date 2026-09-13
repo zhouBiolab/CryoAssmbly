@@ -1,4 +1,4 @@
-"""单侧点云几何：源与目标各自独立构建多尺度点、邻居与上下采样索引（任务卡 T04）。
+"""单侧点云几何：源与目标各自独立构建多尺度点、邻居与上下采样索引（任务卡 T04/T05）。
 
 设计要点
 --------
@@ -12,12 +12,16 @@
    真实点。
 4. `upsampling` 按 **stage 对齐**（stage 0 为 None）；pareconv 的紧凑列表约定（元素 j 对应
    stage j+1）由适配层负责还原，避免"不同尺度偏移错"。
+5. **几何缓存（T05）**：key 由输入点集/顺序、特征、生效采样配置与**邻居数**共同决定（构建前
+   即可计算）；只缓存确定性采样（`DETERMINISTIC_SAMPLING`），含 RNG 的采样一律不缓存
+   （见 `acquire_geometry` 的偏差处理）。缓存条目存**CPU** 张量并按字节计费，命中时搬回设备。
 
 一行一个操作、参数显式传递、不新增隐式全局状态。
 """
 
 import hashlib
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -27,9 +31,13 @@ from pareconv.extensions.pointops.functions import pointops
 from pareconv.modules.ops import grid_subsample, point_to_node_partition
 from pareconv.utils.data_mask import farthest_point_sampling_gpu
 
+from protassem.fitting.feature_cache import ByteLruCache
+
 # 单侧几何结构版本：任何影响 points/neighbors/索引语义的改动都必须 +1（缓存 key 的一部分）
 GEOMETRY_VERSION = 1
 FPS_TARGET_RATIO = 0.25     # 与 pareconv precompute_subsample 的 fps 分支一致
+# 只有确定性采样才能缓存：fps 走 pytorch3d 的 random_start_point，结果依赖全局 RNG 状态
+DETERMINISTIC_SAMPLING = ("voxel",)
 
 
 class GeometryError(ValueError):
@@ -283,3 +291,158 @@ def join_geometries(ref, src, scale, transform):
         "scale": scale,
         "batch_size": 1,
     }
+
+
+# ======================================================================
+# 几何缓存（T05）：有界 CPU 存储 + 命中搬回设备
+# ======================================================================
+
+def geometry_tensors(geometry):
+    """几何里全部张量（用于字节计费与整体搬运）。"""
+    tensors = list(geometry.points) + list(geometry.lengths) + [geometry.features]
+    tensors += list(geometry.neighbors) + list(geometry.subsampling)
+    tensors += [item for item in geometry.upsampling if item is not None]
+    if geometry.node_partition is not None:
+        tensors += [geometry.node_partition.masks, geometry.node_partition.knn_indices,
+                    geometry.node_partition.knn_masks]
+    return tensors
+
+
+def geometry_bytes(geometry):
+    """条目字节数 = 全部张量字节之和（缓存还会另加固定的条目开销）。"""
+    total = 0
+    for tensor in geometry_tensors(geometry):
+        total += tensor.numel() * tensor.element_size()
+    return total
+
+
+def geometry_to(geometry, device, copy=False):
+    """整体搬到设备，返回**新对象**（缓存条目本身不被修改）。
+
+    `copy=True` 时进一步保证返回的张量与输入**存储无关**（`Tensor.to()` 在同设备时是空操作，
+    不会复制；缓存条目必须独立存储，避免 view 把调用方的大数组一直留在内存里）。
+    """
+    def move(tensor):
+        tensor = tensor.to(device)
+        return tensor.clone() if copy else tensor
+
+    partition = None
+    if geometry.node_partition is not None:
+        partition = NodePartition(
+            masks=move(geometry.node_partition.masks),
+            knn_indices=move(geometry.node_partition.knn_indices),
+            knn_masks=move(geometry.node_partition.knn_masks))
+    return replace(
+        geometry,
+        points=[move(item) for item in geometry.points],
+        lengths=[move(item) for item in geometry.lengths],
+        features=move(geometry.features),
+        neighbors=[move(item) for item in geometry.neighbors],
+        subsampling=[move(item) for item in geometry.subsampling],
+        upsampling=[None if item is None else move(item) for item in geometry.upsampling],
+        node_partition=partition)
+
+
+def geometry_cache_key(points, features, voxel_sizes, sampling_method, num_neighbors,
+                       centroid=None):
+    """构建前即可计算的几何 key。
+
+    覆盖：结构版本、实际点集**内容与顺序**（dtype/shape 一并计入）、特征、生效体素尺寸、
+    最后一层采样方式、每阶段邻居数、质心（仅元信息，一并入 key 避免跨质心误命中）。
+    """
+    digest = hashlib.sha256()
+    digest.update(("geometry_version=%d;sampling=%s;voxels=%s;neighbors=%s;"
+                   % (GEOMETRY_VERSION, sampling_method,
+                      ",".join("%.6f" % float(value) for value in voxel_sizes),
+                      ",".join(str(int(value)) for value in num_neighbors))).encode())
+    for name, tensor in (("points", points), ("features", features)):
+        array = tensor.detach().cpu().numpy()
+        digest.update(("%s;dtype=%s;shape=%s;" % (name, array.dtype, array.shape)).encode())
+        digest.update(np.ascontiguousarray(array).tobytes())
+    if centroid is not None:
+        digest.update(np.ascontiguousarray(np.asarray(centroid, dtype=np.float32)).tobytes())
+    return digest.hexdigest()
+
+
+@dataclass
+class AcquireResult:
+    """一次几何获取的结果与分项耗时（秒）。"""
+
+    geometry: CloudGeometry
+    hit: bool
+    cacheable: bool
+    collate_seconds: float = 0.0
+    neighbors_seconds: float = 0.0
+    store_seconds: float = 0.0
+    hit_seconds: float = 0.0
+
+
+class GeometryCache:
+    """源/目标单侧几何的有界 **CPU** 缓存（T05）。
+
+    - 存储的是 CPU 张量（不占显存），按字节计费，容量为 0 时关闭；
+    - 命中时把条目搬回 `device`（默认 CUDA）后返回，跳过多尺度下采样与 k-NN；
+    - 只缓存确定性采样；`fps` 含 RNG，按任务卡偏差处理**保留采样、不缓存**；
+    - 条目只读：调用方不得原地修改 `get()` 返回的几何张量（`join_geometries` 只读拼接）。
+    """
+
+    def __init__(self, capacity_bytes, device="cuda", name="geometry"):
+        self.device = device
+        self._cache = ByteLruCache(capacity_bytes, geometry_bytes, name=name)
+
+    @property
+    def enabled(self):
+        return self._cache.enabled
+
+    @property
+    def capacity_bytes(self):
+        return self._cache.capacity_bytes
+
+    def get(self, key):
+        return self._cache.get(key)
+
+    def put(self, key, geometry):
+        """存**独立 CPU 副本**（同设备 `.to()` 不复制，因此显式 copy）；返回是否真的存下。"""
+        return self._cache.put(key, geometry_to(geometry, "cpu", copy=True))
+
+    def snapshot(self):
+        return self._cache.snapshot()
+
+
+def acquire_geometry(cache, points, features, voxel_sizes, sampling_method, num_neighbors,
+                     centroid=None, device="cuda"):
+    """取得单侧几何（缓存开启与关闭走**同一份构建代码**）。
+
+    cache=None 或采样方式不确定（`fps`）时不查也不存；命中时只做搬设备。
+    """
+    cacheable = sampling_method in DETERMINISTIC_SAMPLING
+    key = None
+    if cache is not None and cacheable:
+        key = geometry_cache_key(points, features, voxel_sizes, sampling_method,
+                                 num_neighbors, centroid)
+        started = time.perf_counter()
+        cached = cache.get(key)
+        if cached is not None:
+            geometry = geometry_to(cached, device)
+            return AcquireResult(geometry=geometry, hit=True, cacheable=cacheable,
+                                 hit_seconds=time.perf_counter() - started)
+
+    started = time.perf_counter()
+    geometry = build_stage_points(points, features, voxel_sizes, sampling_method,
+                                  centroid=centroid, device=device)
+    collate_seconds = time.perf_counter() - started
+
+    started = time.perf_counter()
+    build_neighbors(geometry, num_neighbors)
+    neighbors_seconds = time.perf_counter() - started
+
+    store_seconds = 0.0
+    if key is not None:
+        started = time.perf_counter()
+        cache.put(key, geometry)
+        store_seconds = time.perf_counter() - started
+
+    return AcquireResult(geometry=geometry, hit=False, cacheable=cacheable,
+                         collate_seconds=collate_seconds,
+                         neighbors_seconds=neighbors_seconds,
+                         store_seconds=store_seconds)

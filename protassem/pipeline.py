@@ -107,10 +107,14 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     setup_logging(output_dir, log_file)
 
     if runtime_config is not None:
-        log.info("Runtime config: blas_threads=%d seed=%d",
-                 runtime_config.blas_threads, runtime_config.seed)
+        log.info("Runtime config: blas_threads=%d seed=%d geometry_cache_mb=%d",
+                 runtime_config.blas_threads, runtime_config.seed,
+                 runtime_config.geometry_cache_mb)
         log.info("Effective threads: %s",
                  runtime_config.describe_effective_threads())
+        # T05：几何缓存容量透传给 PARENet 常驻服务进程（必须在第一次请求前设定）
+        from protassem.fitting.parenet_client import configure_geometry_cache
+        configure_geometry_cache(runtime_config.geometry_cache_mb)
 
     metrics = Metrics(os.path.join(output_dir, "metrics"))
     pipeline_started = time.perf_counter()

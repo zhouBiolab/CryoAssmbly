@@ -33,8 +33,9 @@ import pareconv.utils.data_mask as data_mask_module
 from protassem.fitting.parenet.config import make_cfg
 from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELDS
 from protassem.core.points_txt import read_point_cloud_file
-from protassem.fitting.cloud_encoding import (build_stage_points, build_neighbors,
-                                              join_geometries)
+from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
+                                              GeometryCache)
+from protassem.runtime.config import DEFAULT_GEOMETRY_CACHE_MB
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -171,10 +172,11 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                         chain_pdb_path, model, cfg, config_id, sampling_method,
                         output_dir=None, use_mask=False, masks=None,
                         masks_save_path=None, mask_suffix=None,
-                        original_target_data=None):
+                        original_target_data=None, geometry_cache=None):
     """Run PARENet inference on one source-target pair.
 
     只有本函数调用模型；@torch.no_grad() 覆盖"单侧几何构建 → 联合拼装 → 前向 → 后处理"全路径。
+    geometry_cache：T05 的单侧几何缓存（None = 关闭；由服务进程或调用方显式拥有）。
     """
     result = {
         "source_file": os.path.basename(source_path),
@@ -224,26 +226,34 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                     np.linalg.norm(src_norm, axis=1).max()).astype(np.float32)
 
         # T04：源/目标各自构建单侧几何（多尺度点 + 邻居），再由适配层拼成联合布局。
+        # T05：单侧几何走有界 CPU 缓存（cache=None 或 fps 采样时不查不存，构建代码同一份）。
         # 生效采样配置来自 pareconv 的模块级全局变量（T02 实测：标签 configs=all 实际只跑
         # config 0 + voxel），这里显式读出、传参并记录，不再依赖隐式全局。
         voxel_sizes, effective_sampling = effective_sampling_config()
+        num_neighbors = cfg.backbone.num_neighbors
         ref_features = torch.ones((ref_norm.shape[0], 1), dtype=torch.float32)
         src_features = torch.ones((src_norm.shape[0], 1), dtype=torch.float32)
 
-        _t_stage = time.perf_counter()
-        ref_geometry = build_stage_points(
-            torch.from_numpy(ref_norm.astype(np.float32)), ref_features,
-            voxel_sizes, effective_sampling, centroid=c_ref)
-        src_geometry = build_stage_points(
-            torch.from_numpy(src_norm.astype(np.float32)), src_features,
-            voxel_sizes, effective_sampling, centroid=c_src)
-        _record_timing(output_dir, "server_collate", time.perf_counter() - _t_stage,
-                       config_id=config_id, sampling=sampling_method)
+        ref_acquired = acquire_geometry(
+            geometry_cache, torch.from_numpy(ref_norm.astype(np.float32)), ref_features,
+            voxel_sizes, effective_sampling, num_neighbors, centroid=c_ref)
+        src_acquired = acquire_geometry(
+            geometry_cache, torch.from_numpy(src_norm.astype(np.float32)), src_features,
+            voxel_sizes, effective_sampling, num_neighbors, centroid=c_src)
+        ref_geometry = ref_acquired.geometry
+        src_geometry = src_acquired.geometry
 
-        _t_stage = time.perf_counter()
-        build_neighbors(ref_geometry, cfg.backbone.num_neighbors)
-        build_neighbors(src_geometry, cfg.backbone.num_neighbors)
-        _record_timing(output_dir, "server_neighbors", time.perf_counter() - _t_stage)
+        _record_timing(output_dir, "server_collate",
+                       ref_acquired.collate_seconds + src_acquired.collate_seconds,
+                       config_id=config_id, sampling=sampling_method)
+        _record_timing(output_dir, "server_neighbors",
+                       ref_acquired.neighbors_seconds + src_acquired.neighbors_seconds)
+        _record_timing(output_dir, "server_cache_hit",
+                       ref_acquired.hit_seconds + src_acquired.hit_seconds,
+                       tgt_hit=ref_acquired.hit, src_hit=src_acquired.hit,
+                       cacheable=ref_acquired.cacheable)
+        _record_timing(output_dir, "server_cache_store",
+                       ref_acquired.store_seconds + src_acquired.store_seconds)
 
         _t_stage = time.perf_counter()
         data_dict = join_geometries(
@@ -378,6 +388,9 @@ def make_parser():
     p.add_argument("--min_coverage", type=float, default=0.15)
     p.add_argument("--min_point_distance_factor", type=float, default=0.32)
     p.add_argument("--save_masks", action="store_true")
+    p.add_argument("--geometry-cache-mb", type=int, default=DEFAULT_GEOMETRY_CACHE_MB,
+                   help="单侧几何 CPU 缓存容量（MiB，0 = 关闭；默认 %d）"
+                        % DEFAULT_GEOMETRY_CACHE_MB)
     p.add_argument("--server", action="store_true",
                    help="persistent server mode: load model once, serve stdin requests")
     return p
@@ -411,12 +424,15 @@ def _get_model(weights):
 def run_inference(target, source, chain_pdb, output_dir, weights,
                   use_mask=True, configs="all", seed=100000,
                   mask_radius_factor=1.35, min_coverage=0.15,
-                  min_point_distance_factor=0.32, stop_file=None):
+                  min_point_distance_factor=0.32, stop_file=None,
+                  geometry_cache=None):
     """Run PARENet inference for one source/target pair.
 
     Algorithm identical to the original main(); only parameterized so the model
     can be reused and an optional stop_file allows early termination (the
     in-process equivalent of killing the old subprocess).
+
+    geometry_cache：T05 单侧几何缓存（None = 关闭）；由调用方显式传入并拥有。
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -491,7 +507,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             src_data, mask_data, source, mask_file,
                             chain_pdb, model_net, cfg, cid, sm,
                             output_dir, use_mask=False,
-                            mask_suffix=suffix, original_target_data=tgt_data)
+                            mask_suffix=suffix, original_target_data=tgt_data,
+                            geometry_cache=geometry_cache)
                         mask_results.append(r)
                         all_results.append(r)
                     except Exception as e:
@@ -515,7 +532,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                         src_data, tgt_data, source, target,
                         chain_pdb, model_net, cfg, cid, sm,
                         output_dir, use_mask=use_mask,
-                        masks=masks, masks_save_path=masks_save_path)
+                        masks=masks, masks_save_path=masks_save_path,
+                        geometry_cache=geometry_cache)
                     all_results.append(r)
                     if not r["error"]:
                         log.info("Config %d-%s: overlap=%.6f", cid, sm, r.get("overlap", 0))
@@ -558,7 +576,7 @@ def _record_timing(output_dir, stage, elapsed_s, **fields):
         log.warning("server timing write failed: %s", exc)
 
 
-def _server_loop(weights):
+def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB):
     """Read one JSON request per stdin line; signal completion via _DONE file.
 
     Request keys: target, source, chain_pdb, output_dir, use_mask, configs,
@@ -566,9 +584,14 @@ def _server_loop(weights):
     Completion / early-stop are communicated through files in output_dir
     (_PARENET_DONE / _PARENET_STOP) — stdout/stderr are NOT used for IPC,
     so the client never blocks on a full pipe.
+
+    T05：几何缓存由**本服务进程拥有**，跨请求复用（容量以 MiB 计，0 = 关闭）。
     """
     _get_model(weights)  # preload once
-    log.info("PARENet server ready (pid=%d)", os.getpid())
+    geometry_cache = GeometryCache(int(geometry_cache_mb) * 1024 * 1024) \
+        if geometry_cache_mb else None
+    log.info("PARENet server ready (pid=%d, geometry_cache_mb=%s)",
+             os.getpid(), geometry_cache_mb)
     _last_request_end = time.perf_counter()
     for line in sys.stdin:
         line = line.strip()
@@ -595,7 +618,7 @@ def _server_loop(weights):
                 mask_radius_factor=req.get("mask_radius_factor", 1.35),
                 min_coverage=req.get("min_coverage", 0.15),
                 min_point_distance_factor=req.get("min_point_distance_factor", 0.32),
-                stop_file=stop_file)
+                stop_file=stop_file, geometry_cache=geometry_cache)
         except Exception as e:
             log.error("request failed: %s", e)
         finally:
@@ -607,6 +630,9 @@ def _server_loop(weights):
         _last_request_end = time.perf_counter()
         _record_timing(output_dir, "server_request_total",
                        _last_request_end - _request_started)
+        if geometry_cache is not None:
+            _record_timing(output_dir, "server_cache_stats", 0.0,
+                           **geometry_cache.snapshot())
 
 
 def main():
@@ -614,7 +640,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
     if args.server:
-        _server_loop(args.weights)
+        _server_loop(args.weights, args.geometry_cache_mb)
         return
 
     # single-run CLI (backward compatible)
@@ -622,12 +648,15 @@ def main():
         log.error("--target and --source are required (or use --server)")
         return
     output_dir = args.output_dir or os.path.dirname(args.source)
+    geometry_cache = GeometryCache(args.geometry_cache_mb * 1024 * 1024) \
+        if args.geometry_cache_mb else None
     run_inference(
         target=args.target, source=args.source, chain_pdb=args.chain_pdb,
         output_dir=output_dir, weights=args.weights, use_mask=args.use_mask,
         configs=args.configs, seed=args.seed,
         mask_radius_factor=args.mask_radius_factor, min_coverage=args.min_coverage,
-        min_point_distance_factor=args.min_point_distance_factor)
+        min_point_distance_factor=args.min_point_distance_factor,
+        geometry_cache=geometry_cache)
 
 
 if __name__ == "__main__":

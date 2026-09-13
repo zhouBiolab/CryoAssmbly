@@ -14,15 +14,21 @@ from dataclasses import dataclass, fields
 THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
+# 单侧几何 CPU 缓存默认容量（MiB，0 = 关闭）。常量放在这里是为了让本模块保持"无重依赖"：
+# main.py 必须在导入 NumPy/Torch 之前导入它（两段式导入，P1）。
+DEFAULT_GEOMETRY_CACHE_MB = 512
+
 
 @dataclass
 class RuntimeConfig:
-    """运行配置；当前只有线程与随机种子，P2–P5 在此基础上扩展。"""
+    """运行配置；当前只有线程、随机种子与 T05 的几何缓存容量，P2–P5 在此基础上扩展。"""
 
     blas_threads: int = 1
     seed: int = 7351
     # 进程池启动方式：None 表示系统默认（Linux 为 fork）；"spawn" 用于单独测启动成本
     pool_start_method: str = None
+    # 单侧几何 CPU 缓存容量（MiB，0 = 关闭）；透传给 PARENet 常驻服务进程（T05）
+    geometry_cache_mb: int = DEFAULT_GEOMETRY_CACHE_MB
 
     @classmethod
     def from_json(cls, path):

@@ -84,6 +84,38 @@ def print_memory(server_rows):
           % ", ".join("%.1f" % value for value in allocated[-5:]))
 
 
+def print_cache(server_rows):
+    """几何缓存（T05）：累计统计 + 逐次配准命中。"""
+    stats = [row for row in server_rows if row["stage"] == "server_cache_stats"]
+    hits = [row for row in server_rows if row["stage"] == "server_cache_hit"]
+    if not stats and not hits:
+        print("== 几何缓存 ==\n  (无 server_cache_* 记录)")
+        return
+    print()
+    print("== 几何缓存（T05）==")
+    if hits:
+        total = len(hits)
+        source_hits = sum(1 for row in hits if row.get("src_hit"))
+        target_hits = sum(1 for row in hits if row.get("tgt_hit"))
+        print("  逐次配准 %d 次：源命中 %d（%.1f%%）、目标命中 %d（%.1f%%）"
+              % (total, source_hits, 100.0 * source_hits / total,
+                 target_hits, 100.0 * target_hits / total))
+        print("  命中搬设备合计 %.2f s；未命中构建 %.2f s；写缓存 %.2f s"
+              % (sum(row["elapsed_s"] for row in hits),
+                 sum(row["elapsed_s"] for row in server_rows
+                     if row["stage"] in ("server_collate", "server_neighbors")),
+                 sum(row["elapsed_s"] for row in server_rows
+                     if row["stage"] == "server_cache_store")))
+    if stats:
+        last = sorted(stats, key=lambda row: row.get("timestamp", 0.0))[-1]
+        print("  累计（最后一次请求后）：capacity=%d MiB entries=%d bytes=%.2f MiB "
+              "peak=%.2f MiB hits=%d misses=%d evictions=%d rejected_too_large=%d hit_rate=%s"
+              % (last["capacity_bytes"] // (1024 * 1024), last.get("entries", 0),
+                 last.get("bytes", 0) / 1048576.0, last.get("peak_bytes", 0) / 1048576.0,
+                 last.get("hits", 0), last.get("misses", 0), last.get("evictions", 0),
+                 last.get("rejected_too_large", 0), last.get("hit_rate")))
+
+
 def main():
     parser = argparse.ArgumentParser(description="汇总一次运行的客户端/服务端时间账")
     parser.add_argument("output_dir")
@@ -113,6 +145,7 @@ def main():
     print_table("进程池生命周期（包含在上层阶段内，不重复计入）",
                 totals(client_rows), only=("pool_start", "pool_close"))
     print_memory(server_rows)
+    print_cache(server_rows)
     print()
 
     fit = client.get("fit_request", {}).get("seconds", 0.0)

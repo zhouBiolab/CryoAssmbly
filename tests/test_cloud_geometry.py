@@ -1,13 +1,15 @@
-"""T04 单侧几何契约测试（CPU 可跑部分）。
+"""T04/T05 单侧几何与几何缓存契约测试（CPU 可跑部分）。
 
 覆盖：
   - `build_stage_points` 的多尺度点数与输入契约（CPU 张量、形状、非空）；
   - `offset_indices` 的哨兵规则（邻居不足时尾部槽位保持 0，不加偏移）；
   - `join_geometries` 的跨侧偏移：neighbors 按本阶段点数、subsampling 按本阶段点数、
     upsampling 按下一阶段点数（行与值的层次不同）；
-  - `CloudGeometry.fingerprint` 的稳定性与敏感性。
+  - `CloudGeometry.fingerprint` 的稳定性与敏感性；
+  - T05 缓存 key 的失效条件（内容/点序/采样/邻居数/质心）、字节计费与"关闭"语义。
 
-CUDA 相关部分（k-NN、真实拆分等价性）由 `tools/check_geometry_split.py` 在服务器上验证。
+CUDA 相关部分（k-NN、真实拆分等价性、`acquire_geometry` 命中路径）在服务器上跑
+（`torch.cuda.is_available()` 为假时自动跳过），另有 `tools/check_geometry_split.py`。
 """
 
 import unittest
@@ -15,10 +17,13 @@ import unittest
 import numpy as np
 import torch
 
-from protassem.fitting.cloud_encoding import (CloudGeometry, GeometryError, build_stage_points,
-                                              join_geometries, offset_indices)
+from protassem.fitting.cloud_encoding import (CloudGeometry, GeometryCache, GeometryError,
+                                              acquire_geometry, build_stage_points,
+                                              geometry_bytes, geometry_cache_key,
+                                              geometry_to, join_geometries, offset_indices)
 
 VOXELS = (0.5, 1.0, 2.0, 4.0)
+NEIGHBORS = (8, 8, 8, 8)
 
 
 def make_points(count, seed=3, extent=20.0):
@@ -174,6 +179,150 @@ class FingerprintTest(unittest.TestCase):
         self.assertEqual(64, len(digest))
         int(digest, 16)
         self.assertTrue(np.asarray(geometry.points[0]).dtype == np.float32)
+
+
+class GeometryCacheKeyTest(unittest.TestCase):
+    """T05：key 必须覆盖内容、点序、采样配置与邻居数。"""
+
+    def setUp(self):
+        self.points = make_points(120)
+        self.features = torch.ones((120, 1), dtype=torch.float32)
+
+    def key(self, points=None, features=None, voxels=VOXELS, sampling="voxel",
+            neighbors=NEIGHBORS, centroid=None):
+        return geometry_cache_key(points if points is not None else self.points,
+                                  features if features is not None else self.features,
+                                  voxels, sampling, neighbors, centroid=centroid)
+
+    def test_same_inputs_same_key(self):
+        self.assertEqual(self.key(), self.key())
+
+    def test_content_change_invalidates(self):
+        moved = self.points.clone()
+        moved[7, 1] += 1e-3
+        self.assertNotEqual(self.key(), self.key(points=moved))
+        other_features = self.features.clone()
+        other_features[3, 0] = 0.5
+        self.assertNotEqual(self.key(), self.key(features=other_features))
+
+    def test_point_order_invalidates(self):
+        permuted = self.points[torch.arange(120 - 1, -1, -1)]
+        self.assertNotEqual(self.key(), self.key(points=permuted))
+
+    def test_sampling_config_invalidates(self):
+        self.assertNotEqual(self.key(), self.key(sampling="fps"))
+        self.assertNotEqual(self.key(), self.key(voxels=(0.4, 1.0, 2.0, 4.0)))
+        self.assertNotEqual(self.key(), self.key(neighbors=(9, 8, 8, 8)))
+        self.assertNotEqual(self.key(), self.key(centroid=np.zeros(3, dtype=np.float32)))
+
+    def test_key_is_hex_sha256(self):
+        digest = self.key()
+        self.assertEqual(64, len(digest))
+        int(digest, 16)
+
+    def test_geometry_bytes_and_geometry_to(self):
+        geometry = build_stage_points(self.points, self.features, VOXELS, "voxel",
+                                      device="cpu")
+        expected = sum(item.numel() * item.element_size() for item in geometry.points)
+        expected += sum(item.numel() * item.element_size() for item in geometry.lengths)
+        expected += geometry.features.numel() * geometry.features.element_size()
+        self.assertEqual(expected, geometry_bytes(geometry))
+        moved = geometry_to(geometry, "cpu")
+        self.assertIsNot(moved, geometry)
+        self.assertEqual(geometry.fingerprint(), moved.fingerprint())
+
+    def test_geometry_cache_roundtrip_with_handmade_geometry(self):
+        geometry = make_geometry([10, 4, 2])
+        cache = GeometryCache(1024 * 1024, device="cpu")
+        self.assertTrue(cache.enabled)
+        self.assertTrue(cache.put("k", geometry))
+        stored = cache.get("k")
+        self.assertIsNotNone(stored)
+        self.assertEqual(geometry_bytes(geometry), geometry_bytes(stored))
+        self.assertEqual(geometry.fingerprint(), stored.fingerprint())
+        self.assertEqual(1, cache.snapshot()["hits"])
+
+    def test_stored_entry_is_storage_independent(self):
+        """缓存条目不能与调用方的（可能是 view 的）张量共享存储。"""
+        bigger = make_points(100)
+        view = bigger[10:60]                      # points[0] 是 view，base 是 100 个点
+        geometry = CloudGeometry(points=[view], lengths=[torch.tensor([50])],
+                                 features=torch.ones((50, 1)), voxel_sizes=VOXELS,
+                                 sampling_method="voxel", upsampling=[None])
+        cache = GeometryCache(1024 * 1024, device="cpu")
+        self.assertTrue(cache.put("k", geometry))
+        stored = cache.get("k")
+        self.assertNotEqual(view.data_ptr(), stored.points[0].data_ptr())
+        self.assertEqual(50 * 3 * view.element_size(), stored.points[0].storage().size()
+                         * stored.points[0].element_size())
+        self.assertEqual(geometry_bytes(geometry), geometry_bytes(stored))
+
+    def test_cache_disabled_by_zero_capacity(self):
+        cache = GeometryCache(0, device="cpu")
+        self.assertFalse(cache.enabled)
+        self.assertFalse(cache.put("k", make_geometry([10, 4, 2])))
+        self.assertIsNone(cache.get("k"))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "需要 CUDA（pointops k-NN）")
+class AcquireGeometryTest(unittest.TestCase):
+    """T05：命中跳过重建、结果逐位一致、开关等价。"""
+
+    def setUp(self):
+        self.points = make_points(400)
+        self.features = torch.ones((400, 1), dtype=torch.float32)
+        self.cache = GeometryCache(64 * 1024 * 1024, device="cuda")
+
+    def acquire(self, points=None, cache=None, sampling="voxel"):
+        return acquire_geometry(cache if cache is not None else self.cache,
+                                points if points is not None else self.points,
+                                self.features, VOXELS, sampling, NEIGHBORS,
+                                device="cuda")
+
+    def test_miss_then_hit_is_bitwise_identical(self):
+        first = self.acquire()
+        self.assertFalse(first.hit)
+        second = self.acquire()
+        self.assertTrue(second.hit)
+        self.assertGreater(second.hit_seconds, 0.0)
+        self.assertEqual(0.0, second.collate_seconds)
+        self.assertEqual(first.geometry.fingerprint(), second.geometry.fingerprint())
+        for left, right in zip(first.geometry.points, second.geometry.points):
+            self.assertTrue(torch.equal(left, right))
+        for left, right in zip(first.geometry.neighbors, second.geometry.neighbors):
+            self.assertTrue(torch.equal(left, right))
+
+    def test_cache_off_matches_cache_on(self):
+        cached = self.acquire()
+        uncached = acquire_geometry(None, self.points, self.features, VOXELS, "voxel",
+                                    NEIGHBORS, device="cuda")
+        self.assertFalse(uncached.hit)
+        self.assertEqual(cached.geometry.fingerprint(), uncached.geometry.fingerprint())
+        for left, right in zip(cached.geometry.points, uncached.geometry.points):
+            self.assertTrue(torch.equal(left, right))
+
+    def test_content_change_misses(self):
+        self.acquire()
+        moved = self.points.clone()
+        moved[5, 0] += 0.01
+        result = self.acquire(points=moved)
+        self.assertFalse(result.hit)
+
+    def test_disabled_cache_never_hits(self):
+        cache = GeometryCache(0, device="cuda")
+        self.assertFalse(self.acquire(cache=cache).hit)
+        self.assertFalse(self.acquire(cache=cache).hit)
+        self.assertEqual(0, cache.snapshot()["hits"])
+
+    def test_non_deterministic_sampling_is_bypassed(self):
+        result = self.acquire(sampling="fps")
+        self.assertFalse(result.cacheable)
+        self.assertFalse(result.hit)
+        self.assertEqual(0, cache_hits(self.cache))
+
+
+def cache_hits(cache):
+    return cache.snapshot()["hits"]
 
 
 if __name__ == "__main__":
