@@ -22,6 +22,7 @@ from tqdm import tqdm
 from typing import Union, Tuple, List
 import re
 import json
+import time
 
 # Add project root so protassem package is importable when run as subprocess
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -218,12 +219,16 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         data_dict = registration_collate_fn_stack_mode(
             [data_dict], cfg.backbone.num_stages, cfg.backbone.init_voxel_size,
             cfg.backbone.num_neighbors, cfg.backbone.subsample_ratio)
+        _t_stage = time.perf_counter()
         data_dict = to_cuda(data_dict)
+        _record_timing(output_dir, "server_to_gpu", time.perf_counter() - _t_stage)
 
+        _t_stage = time.perf_counter()
         nbr = precompute_neibors(data_dict["points"], data_dict["lengths"],
                                  cfg.backbone.num_stages, cfg.backbone.num_neighbors)
         data_dict.update(nbr)
         output_dict = model(data_dict)
+        _record_timing(output_dir, "server_forward", time.perf_counter() - _t_stage)
 
         T_est = output_dict["estimated_transform"]
         pred_R = T_est[:3, :3].cpu().numpy()
@@ -233,7 +238,10 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         _, _, corr = compute_overlap(ref_for_ov, src4, 1.5)
         # 分母用完整（未掩码）目标点云 ref_for_ov，而非源点云
         overlap = corr.shape[1] / len(ref_for_ov) if corr is not None and corr.size else 0.0
+        _record_timing(output_dir, "server_postprocess",
+                       time.perf_counter() - _t_stage)
 
+        _t_stage = time.perf_counter()
         if chain_pdb_path and os.path.exists(chain_pdb_path):
             try:
                 pred_pdb = generate_output_pdb_path(
@@ -243,6 +251,9 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                 result["pred_pdb_path"] = pred_pdb
             except Exception as e:
                 log.warning("PDB transform failed: %s", e)
+
+        _record_timing(output_dir, "server_write_pred",
+                       time.perf_counter() - _t_stage)
 
         result.update({"overlap": overlap,
                       "ref_points": len(output_dict["ref_points"]),
@@ -370,8 +381,10 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         config_ids = [int(x) for x in configs.split(",")]
 
     # preprocess
+    _t_stage = time.perf_counter()
     src_data = preprocess_point_cloud_data(source, point_limit=point_limit)
     tgt_data = preprocess_point_cloud_data(target, point_limit=point_limit)
+    _record_timing(output_dir, "server_preprocess", time.perf_counter() - _t_stage)
 
     # masks
     masks, masks_save_path, mask_data_list = None, None, []
@@ -382,14 +395,19 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
             "min_point_distance_factor": min_point_distance_factor,
             "verbose": True, "save_masks": True,
         }
+        _t_stage = time.perf_counter()
         masks, masks_save_path = generate_masks_once(
             source, target, mask_params, output_dir, source, target)
+        _record_timing(output_dir, "server_masks", time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
         for mf in find_mask_files(os.path.join(output_dir, "temp")):
             try:
                 md = preprocess_point_cloud_data(mf, point_limit=None, is_mask_file=True)
                 mask_data_list.append((mf, md))
             except Exception:
                 continue
+        _record_timing(output_dir, "server_mask_preprocess",
+                       time.perf_counter() - _t_stage)
 
     def _stopped():
         return stop_file is not None and os.path.exists(stop_file)
@@ -467,6 +485,23 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
 # Persistent server: load model once, serve stdin JSON requests
 # ======================================================================
 
+def _record_timing(output_dir, stage, elapsed_s, **fields):
+    """把服务端阶段耗时追加到请求输出目录的 server_timing.jsonl。
+
+    父进程（客户端）另有一套计时，两者覆盖的时间区间会重叠，报告中分别展示、
+    不做相加。写计时失败不影响推理本身。
+    """
+    row = {"pid": os.getpid(), "stage": stage,
+           "elapsed_s": round(float(elapsed_s), 6), "timestamp": time.time()}
+    row.update(fields)
+    try:
+        with open(os.path.join(output_dir, "server_timing.jsonl"), "a",
+                  encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+    except OSError as exc:
+        log.warning("server timing write failed: %s", exc)
+
+
 def _server_loop(weights):
     """Read one JSON request per stdin line; signal completion via _DONE file.
 
@@ -478,6 +513,7 @@ def _server_loop(weights):
     """
     _get_model(weights)  # preload once
     log.info("PARENet server ready (pid=%d)", os.getpid())
+    _last_request_end = time.perf_counter()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -490,6 +526,9 @@ def _server_loop(weights):
         output_dir = req["output_dir"]
         done_file = os.path.join(output_dir, "_PARENET_DONE")
         stop_file = os.path.join(output_dir, "_PARENET_STOP")
+        _request_started = time.perf_counter()
+        _record_timing(output_dir, "server_queue_wait",
+                       _request_started - _last_request_end)
         try:
             run_inference(
                 target=req["target"], source=req["source"],
@@ -509,6 +548,9 @@ def _server_loop(weights):
                     f.write("done\n")
             except Exception:
                 pass
+        _last_request_end = time.perf_counter()
+        _record_timing(output_dir, "server_request_total",
+                       _last_request_end - _request_started)
 
 
 def main():

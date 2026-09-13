@@ -18,6 +18,7 @@ from Bio.PDB import MMCIFParser, MMCIFIO, Structure, Model, Chain
 from protassem.core.io import load_sample_points, find_files
 from protassem.core.points_txt import read_point_cloud
 from protassem.runtime.metrics import Metrics
+from protassem.runtime.pool import timed_pool
 from protassem.core.structure import (
     cif_to_pdb, pdb_to_cif, calculate_gyration_radius,
     extract_chain_id, align_by_resid,
@@ -459,7 +460,8 @@ class AssemblyOrchestrator:
         log.info("=" * 60)
 
         if n_workers > 1:
-            with Pool(n_workers) as pool:
+            with timed_pool(self.metrics, n_workers,
+                            "prescreen_cc") as pool:
                 cc_values = pool.map(_pre_screen_cc_worker, args_list)
         else:
             cc_values = [_pre_screen_cc_worker(a) for a in args_list]
@@ -564,7 +566,8 @@ class AssemblyOrchestrator:
         log.info("=" * 60)
 
         if n_workers > 1:
-            with Pool(n_workers) as pool:
+            with timed_pool(self.metrics, n_workers,
+                            "prescreen_cc") as pool:
                 cc_values = pool.map(_pre_screen_cc_worker, args_list)
         else:
             cc_values = [_pre_screen_cc_worker(a) for a in args_list]
@@ -747,7 +750,7 @@ class AssemblyOrchestrator:
         chains = list(self.chain_records)
         cpairs = [(chains[i]["pdb_file"], chains[j]["pdb_file"])
                   for i in range(len(chains)) for j in range(i + 1, len(chains))]
-        n1 = prefill_tm_cache(cpairs, self.num_processes)
+        n1 = prefill_tm_cache(cpairs, self.num_processes, metrics=self.metrics)
         reps = []
         for c in chains:
             gid = None
@@ -773,7 +776,7 @@ class AssemblyOrchestrator:
             for i in range(len(pl)):
                 for j in range(i + 1, len(pl)):
                     dpairs.append((pl[i], pl[j]))
-        n2 = prefill_tm_cache(dpairs, self.num_processes)
+        n2 = prefill_tm_cache(dpairs, self.num_processes, metrics=self.metrics)
         log.info("[相似预计算] 链 %d 条 -> %d 同源组; 结构域 %d 同源组; "
                  "并行预填 TM 对 链%d+域%d (进程 %d)",
                  len(chains), len(reps), len(bygrp), n1, n2, self.num_processes)

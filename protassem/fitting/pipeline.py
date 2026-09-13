@@ -19,6 +19,7 @@ import logging
 import threading
 import subprocess
 from protassem.runtime.metrics import Metrics, worker_count
+from protassem.runtime.pool import timed_pool
 
 from protassem.core.scoring import calculate_cc_mask
 from protassem.fitting.local_optimizer import local_optimize
@@ -103,7 +104,8 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
 def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
                output_dir, stop_threshold, orig_mrc):
     """Chain fitting: iterate over source files sorted by point count."""
-    candidates = _analyze_source_files(source_dir)
+    with _METRICS.stage("analyze_sources"):
+        candidates = _analyze_source_files(source_dir)
     if not candidates:
         log.error("No source files found in %s", source_dir)
         return _fail()
@@ -128,7 +130,8 @@ def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
             cc_threshold, stop_threshold, orig_mrc)
 
         if result["success"]:
-            final_pdb = _save_final_result(result, attempt_dir, pdb_path)
+            with _METRICS.stage("save_result"):
+                final_pdb = _save_final_result(result, attempt_dir, pdb_path)
             cc = _verify_cc(final_pdb, orig_mrc, resolution, contour)
             return {"success": True, "final_pdb": final_pdb, "cc_mask": cc}
 
@@ -158,7 +161,8 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
         cc_threshold, stop_threshold, orig_mrc)
 
     if result["success"]:
-        final_pdb = _save_final_result(result, output_dir, pdb_path)
+        with _METRICS.stage("save_result"):
+            final_pdb = _save_final_result(result, output_dir, pdb_path)
         cc = _verify_cc(final_pdb, orig_mrc, resolution, contour)
         return {"success": True, "final_pdb": final_pdb, "cc_mask": cc}
 
@@ -195,10 +199,12 @@ def _start_parenet(target, source, chain_pdb, output_dir):
 
     Returns a request handle (poll()/terminate()) compatible with the monitor.
     """
-    return start_request(target, source, chain_pdb, output_dir,
-                         use_mask=True, configs="all",
-                         mask_radius_factor=1.35,
-                         min_point_distance_factor=0.32)
+    task_id = os.path.basename(output_dir)
+    with _METRICS.stage("request_submit", task_id=task_id):
+        return start_request(target, source, chain_pdb, output_dir,
+                             use_mask=True, configs="all",
+                             mask_radius_factor=1.35,
+                             min_point_distance_factor=0.32)
 
 
 # ======================================================================
@@ -217,11 +223,20 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     best_result = None
     early_stop = False
     gpu_wait_s = 0.0
+    scan_s = 0.0
+    first_pred_s = None
+    task_id = os.path.basename(os.path.dirname(reg_dir))
+    loop_started = time.perf_counter()
 
     while True:
         running = proc.poll() is None
+        _scan_started = time.perf_counter()
         valid = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
                  if _is_valid_pred(f)]
+        scan_s += time.perf_counter() - _scan_started
+        if first_pred_s is None and valid:
+            first_pred_s = time.perf_counter() - loop_started
+            _METRICS.record("first_pred", first_pred_s, task_id=task_id)
         new_files = [f for f in valid if f not in processed]
 
         if running and len(new_files) >= batch_size:
@@ -258,12 +273,14 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         time.sleep(2.5)
         gpu_wait_s += 2.5
 
-    _METRICS.record("gpu_wait", gpu_wait_s,
-                    task_id=os.path.basename(os.path.dirname(reg_dir)))
+    _METRICS.record("gpu_wait", gpu_wait_s, task_id=task_id)
 
     # process remaining files
+    _scan_started = time.perf_counter()
     remaining = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
                  if _is_valid_pred(f) and f not in processed]
+    scan_s += time.perf_counter() - _scan_started
+    _METRICS.record("candidate_scan", scan_s, task_id=task_id)
     if remaining:
         for f in remaining:
             processed.add(f)
@@ -273,9 +290,10 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
 
     # final strategy selection
     if not early_stop:
-        best_result = _select_final_result(
-            all_results, candidates, density_mrc, resolution, contour,
-            stop_threshold, temp_dir)
+        with _METRICS.stage("final_select", task_id=task_id):
+            best_result = _select_final_result(
+                all_results, candidates, density_mrc, resolution, contour,
+                stop_threshold, temp_dir)
 
     if best_result is None and all_results:
         valid_r = [r for r in all_results if r["cc_mask"] is not None]
@@ -356,7 +374,8 @@ def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
         orig_cc = known_cc
     else:
         try:
-            orig_cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+            with _METRICS.stage("cc_candidate_initial", task_id=str(candidate_id)):
+                orig_cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
         except Exception:
             orig_cc = 0.0
 
@@ -369,7 +388,8 @@ def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
     ok, opt_pdb, opt_cc = local_optimize(pdb_file, density_mrc, out_pdb,
                                          resolution, contour,
                                          num_processes=_NUM_PROCESSES,
-                                         initial_cc=orig_cc)
+                                         initial_cc=orig_cc,
+                                         metrics=_METRICS)
     if not ok or not opt_pdb or not os.path.exists(opt_pdb):
         log.warning("Candidate #%d [src: %s]: local optimization failed",
                     candidate_id, os.path.basename(pdb_file))
@@ -434,7 +454,8 @@ def _verify_cc(pdb_file, density_mrc, resolution, contour):
     if not pdb_file or not os.path.exists(pdb_file):
         return 0.0
     try:
-        cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+        with _METRICS.stage("cc_verify"):
+            cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
         log.info("Verified CC_mask (original density): %.6f", cc)
         return cc
     except Exception as e:
@@ -450,8 +471,8 @@ def _batch_cc(pdb_files, density_mrc, resolution, contour):
     """Compute CC_mask for a batch of PDB files (parallel if _NUM_PROCESSES>1)."""
     args = [(f, density_mrc, resolution, contour) for f in pdb_files]
     if _NUM_PROCESSES and _NUM_PROCESSES > 1 and len(args) > 1:
-        import multiprocessing as mp
-        with mp.Pool(processes=min(_NUM_PROCESSES, len(args))) as pool:
+        with timed_pool(_METRICS, min(_NUM_PROCESSES, len(args)),
+                        "batch_cc") as pool:
             return pool.map(_cc_worker, args)
     return [_cc_worker(a) for a in args]
 

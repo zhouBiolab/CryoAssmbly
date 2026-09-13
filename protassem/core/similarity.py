@@ -9,6 +9,8 @@ import re
 import subprocess
 from multiprocessing import Pool
 
+from protassem.runtime.pool import timed_pool
+
 USALIGN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "USalign")
 
 _TM_CACHE = {}
@@ -54,7 +56,7 @@ def _tm_worker(pair):
     return (_pair_key(p1, p2), _run_usalign_tm(p1, p2))
 
 
-def prefill_tm_cache(pairs, num_processes=1):
+def prefill_tm_cache(pairs, num_processes=1, metrics=None):
     """并行预填一批 (pdb1, pdb2) 的 TM-score 进缓存。返回实际计算的对数。"""
     todo, seen = [], set()
     for p1, p2 in pairs:
@@ -67,7 +69,8 @@ def prefill_tm_cache(pairs, num_processes=1):
         return 0
     if num_processes and num_processes > 1:
         try:
-            with Pool(min(int(num_processes), len(todo))) as pool:
+            with timed_pool(metrics, min(int(num_processes), len(todo)),
+                            "tm_prefill") as pool:
                 for k, v in pool.map(_tm_worker, todo):
                     _TM_CACHE[k] = v
             return len(todo)

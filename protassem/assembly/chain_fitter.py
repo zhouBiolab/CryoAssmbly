@@ -182,7 +182,8 @@ def try_domains_via_chain_pose(orch, chain_rec, fitted_chain_pdb):
         ok, opt_path, opt_cc = local_optimize(
             transformed, orch.current_density_mrc, opt_pdb,
             orch.resolution, orch.contour,
-            num_processes=orch.num_processes, initial_cc=init_cc)
+            num_processes=orch.num_processes, initial_cc=init_cc,
+            metrics=orch.metrics)
         if ok and opt_path:
             final_pdb, final_cc = opt_path, opt_cc
         else:
@@ -229,7 +230,8 @@ def try_improve_chain_with_domains(orch, chain_rec, fitted_pdb, original_cc):
         ok, opt_path, opt_cc = local_optimize(
             transformed, orch.current_density_mrc, opt_pdb,
             orch.resolution, orch.contour,
-            num_processes=orch.num_processes, initial_cc=transformed_cc)
+            num_processes=orch.num_processes, initial_cc=transformed_cc,
+            metrics=orch.metrics)
         if ok and opt_path and opt_cc > transformed_cc:
             final = opt_path
         else:

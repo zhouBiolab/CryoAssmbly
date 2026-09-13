@@ -5,6 +5,8 @@ Uses core/ modules. No duplicates. Can be imported or run as CLI.
 """
 import os, sys, copy, shutil, logging, argparse, warnings
 import numpy as np
+
+from protassem.runtime.pool import timed_pool
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 from scipy.ndimage import map_coordinates
@@ -290,7 +292,8 @@ def _density_copy_worker(arg):
 
 def local_optimize(structure_file, density_mrc, output_file,
                    resolution, contour=0.0, max_iterations=2000,
-                   initial_step_size=1.25, num_processes=1, initial_cc=None):
+                   initial_step_size=1.25, num_processes=1, initial_cc=None,
+                   metrics=None):
     """Local optimization.
 
     1. ALWAYS run multi-copy density gradient (parallel if num_processes > 1)
@@ -315,8 +318,8 @@ def local_optimize(structure_file, density_mrc, output_file,
                 for i, ss in enumerate(step_sizes)]
 
         if num_processes and num_processes > 1:
-            import multiprocessing as mp
-            with mp.Pool(processes=min(num_processes, len(args))) as pool:
+            with timed_pool(metrics, min(num_processes, len(args)),
+                            "local_optimize_copies") as pool:
                 results = pool.map(_density_copy_worker, args)
         else:
             results = [_density_copy_worker(a) for a in args]
