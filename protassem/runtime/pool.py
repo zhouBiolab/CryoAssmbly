@@ -1,7 +1,7 @@
-"""进程池辅助：记录创建/关闭耗时（P2 细化），并为 P3 的复用池提供统一入口。
+"""进程池辅助：创建/关闭计时（P2 细化）与 P3 的复用池原语。
 
-约定：池的创建与关闭都在父进程计时；worker 内不得再建池（P3 约束）。
-`start_method=None` 表示沿用系统默认（Linux 上为 fork），显式传入可测 spawn 成本。
+约定：池的创建与关闭都在父进程计时；worker 内不得再建池。
+`start_method=None` 表示系统默认（Linux 为 fork）；显式传 "spawn" 可单独测启动成本。
 """
 
 import multiprocessing
@@ -16,31 +16,30 @@ def pool_context(start_method=None):
     return multiprocessing
 
 
+def open_pool(metrics, processes, label, start_method=None):
+    """创建进程池并记录 pool_start；调用方负责用 close_pool() 释放。"""
+    started = time.perf_counter()
+    pool = pool_context(start_method).Pool(processes=processes)
+    if metrics is not None:
+        metrics.record("pool_start", time.perf_counter() - started, pool=label,
+                       workers=processes, start_method=start_method or "default")
+    return pool
+
+
+def close_pool(metrics, pool, label):
+    """关闭并回收池，只计 close()+join()；池的存活时长与上层阶段重叠，不单独记录。"""
+    started = time.perf_counter()
+    pool.close()
+    pool.join()
+    if metrics is not None:
+        metrics.record("pool_close", time.perf_counter() - started, pool=label)
+
+
 @contextmanager
 def timed_pool(metrics, processes, label, start_method=None):
-    """创建一个进程池并记录 pool_start / pool_close，退出时确保释放。
-
-    Args:
-        metrics: 运行级 Metrics（记录事件）；None 时不记录，只保证释放。
-        processes: worker 数量
-        label: 调用点标识（如 "batch_cc"、"local_optimize_copies"）
-        start_method: "fork" / "spawn" / None（默认）
-    """
-    context = pool_context(start_method)
-    started = time.perf_counter()
-    pool = context.Pool(processes=processes)
-    created = time.perf_counter()
-    if metrics is not None:
-        metrics.record("pool_start", created - started, pool=label,
-                       workers=processes,
-                       start_method=start_method or "default")
+    """创建临时池并保证释放（P2 计量用；P3 之后主路径改用 ExecutionContext）。"""
+    pool = open_pool(metrics, processes, label, start_method)
     try:
         yield pool
     finally:
-        # 只计关闭+回收的耗时；池的"存活时长"与上层阶段重叠，不单独记录，避免重复计数。
-        closing_started = time.perf_counter()
-        pool.close()
-        pool.join()
-        if metrics is not None:
-            metrics.record("pool_close", time.perf_counter() - closing_started,
-                           pool=label, workers=processes)
+        close_pool(metrics, pool, label)

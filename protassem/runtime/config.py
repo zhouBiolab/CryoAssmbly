@@ -21,6 +21,8 @@ class RuntimeConfig:
 
     blas_threads: int = 1
     seed: int = 7351
+    # 进程池启动方式：None 表示系统默认（Linux 为 fork）；"spawn" 用于单独测启动成本
+    pool_start_method: str = None
 
     @classmethod
     def from_json(cls, path):

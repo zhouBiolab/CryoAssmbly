@@ -18,7 +18,7 @@ from Bio.PDB import MMCIFParser, MMCIFIO, Structure, Model, Chain
 from protassem.core.io import load_sample_points, find_files
 from protassem.core.points_txt import read_point_cloud
 from protassem.runtime.metrics import Metrics
-from protassem.runtime.pool import timed_pool
+from protassem.runtime.execution import ExecutionContext
 from protassem.core.structure import (
     cif_to_pdb, pdb_to_cif, calculate_gyration_radius,
     extract_chain_id, align_by_resid,
@@ -48,7 +48,8 @@ class AssemblyOrchestrator:
                  batch_size=20, complex_min_cc=0.15, do_refine=True,
                  refine_tm=0.75, homo_chain_refine=False,
                  no_domain_split_chains=frozenset(),
-                 pre_screen=True, pre_screen_by_domain=False, metrics=None):
+                 pre_screen=True, pre_screen_by_domain=False, metrics=None,
+                 context=None):
         self.original_target_txt = target_txt
         self.source_dir = Path(source_dir)
         self.original_density_mrc = density_mrc
@@ -87,6 +88,9 @@ class AssemblyOrchestrator:
         self.final_dir = self.output_dir / "final_results"
         # 运行级计时（P2）：run_pipeline 传入同一个实例；独立调用 run_assembly 时自建
         self.metrics = metrics or Metrics(str(self.output_dir / "metrics"))
+        # P3：运行级共享池（run_pipeline 传入；独立调用 run_assembly 时自建）
+        self.context = context or ExecutionContext(metrics=self.metrics,
+                                                   pool_workers=num_processes)
 
         self.current_target_txt = None
         self.current_density_mrc = None
@@ -459,12 +463,7 @@ class AssemblyOrchestrator:
                  len(args_list), n_workers)
         log.info("=" * 60)
 
-        if n_workers > 1:
-            with timed_pool(self.metrics, n_workers,
-                            "prescreen_cc") as pool:
-                cc_values = pool.map(_pre_screen_cc_worker, args_list)
-        else:
-            cc_values = [_pre_screen_cc_worker(a) for a in args_list]
+        cc_values = self.context.map(_pre_screen_cc_worker, args_list)
 
         for rec, cc in zip(self.chain_records, cc_values):
             rec["pre_screen_cc"] = cc
@@ -565,12 +564,7 @@ class AssemblyOrchestrator:
                  self.initial_domain_threshold)
         log.info("=" * 60)
 
-        if n_workers > 1:
-            with timed_pool(self.metrics, n_workers,
-                            "prescreen_cc") as pool:
-                cc_values = pool.map(_pre_screen_cc_worker, args_list)
-        else:
-            cc_values = [_pre_screen_cc_worker(a) for a in args_list]
+        cc_values = self.context.map(_pre_screen_cc_worker, args_list)
 
         candidates = []
         for drec, cc in zip(domains, cc_values):
@@ -750,7 +744,7 @@ class AssemblyOrchestrator:
         chains = list(self.chain_records)
         cpairs = [(chains[i]["pdb_file"], chains[j]["pdb_file"])
                   for i in range(len(chains)) for j in range(i + 1, len(chains))]
-        n1 = prefill_tm_cache(cpairs, self.num_processes, metrics=self.metrics)
+        n1 = prefill_tm_cache(cpairs, self.context)
         reps = []
         for c in chains:
             gid = None
@@ -776,7 +770,7 @@ class AssemblyOrchestrator:
             for i in range(len(pl)):
                 for j in range(i + 1, len(pl)):
                     dpairs.append((pl[i], pl[j]))
-        n2 = prefill_tm_cache(dpairs, self.num_processes, metrics=self.metrics)
+        n2 = prefill_tm_cache(dpairs, self.context)
         log.info("[相似预计算] 链 %d 条 -> %d 同源组; 结构域 %d 同源组; "
                  "并行预填 TM 对 链%d+域%d (进程 %d)",
                  len(chains), len(reps), len(bygrp), n1, n2, self.num_processes)
@@ -880,10 +874,17 @@ def _pre_screen_cc_worker(args):
 
 
 def run_assembly(target_txt, source_dir, density_mrc, resolution, contour,
-                 output_dir=None, **kwargs):
-    """Convenience function wrapping AssemblyOrchestrator."""
+                 output_dir=None, context=None, **kwargs):
+    """Convenience function wrapping AssemblyOrchestrator.
+
+    context 为 None 时自建运行级上下文，并在返回前（含异常路径）释放。
+    """
     orch = AssemblyOrchestrator(
         target_txt=target_txt, source_dir=source_dir,
         density_mrc=density_mrc, resolution=resolution,
-        contour=contour, output_dir=output_dir, **kwargs)
-    return orch.run()
+        contour=contour, output_dir=output_dir, context=context, **kwargs)
+    try:
+        return orch.run()
+    finally:
+        if context is None:
+            orch.context.close()

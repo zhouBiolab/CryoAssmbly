@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 
 from protassem.core.io import find_files, read_param_file
+from protassem.runtime.execution import ExecutionContext
 from protassem.runtime.metrics import Metrics
 from protassem.core.structure import read_chain_ids, split_structure_to_chains
 from protassem.voxelize.mol_to_mrc import pdb2vol
@@ -259,16 +260,24 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
 
     assembly_dir = os.path.join(output_dir, "assembly")
     _t_assembly = time.perf_counter()
-    complex_cif = run_assembly(
-        target_txt=target_txt,
-        source_dir=src_dir,
-        density_mrc=os.path.abspath(density_mrc),
-        resolution=resolution,
-        contour=contour,
-        output_dir=assembly_dir,
-        metrics=metrics,
-        **kw,
-    )
+    pool_workers = int(kw.get("num_processes", 1))
+    start_method = runtime_config.pool_start_method if runtime_config else None
+    context = ExecutionContext(metrics=metrics, pool_workers=pool_workers,
+                               start_method=start_method)
+    try:
+        complex_cif = run_assembly(
+            target_txt=target_txt,
+            source_dir=src_dir,
+            density_mrc=os.path.abspath(density_mrc),
+            resolution=resolution,
+            contour=contour,
+            output_dir=assembly_dir,
+            metrics=metrics,
+            context=context,
+            **kw,
+        )
+    finally:
+        context.close()
     metrics.record("assembly_total", time.perf_counter() - _t_assembly)
     log.info("=" * 60)
     if complex_cif:

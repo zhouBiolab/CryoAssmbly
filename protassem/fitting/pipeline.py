@@ -19,7 +19,7 @@ import logging
 import threading
 import subprocess
 from protassem.runtime.metrics import Metrics, worker_count
-from protassem.runtime.pool import timed_pool
+from protassem.runtime.execution import ExecutionContext
 
 from protassem.core.scoring import calculate_cc_mask
 from protassem.fitting.local_optimizer import local_optimize
@@ -58,7 +58,7 @@ DEMO_MASK_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 def run_fitting(target_txt, source, density_mrc, resolution, contour,
                 output_dir, mode="chain", chain_pdb=None,
                 early_stop_threshold=0.54, original_density_mrc=None,
-                num_processes=1, batch_size=20, metrics=None):
+                num_processes=1, batch_size=20, metrics=None, context=None):
     """Unified entry point for chain and domain fitting.
 
     Args:
@@ -83,17 +83,23 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
     os.makedirs(output_dir, exist_ok=True)
     orig_mrc = original_density_mrc or density_mrc
     _METRICS = metrics or Metrics(os.path.join(output_dir, "metrics"))
-    context = _METRICS.stage("fit_request", mode=mode)
+    # P3：优先复用运行级共享池；独立调用 run_fitting 时自建并在返回前释放。
+    owns_context = context is None
+    exec_context = context or ExecutionContext(metrics=_METRICS,
+                                               pool_workers=_NUM_PROCESSES)
+    stage_context = _METRICS.stage("fit_request", mode=mode)
     try:
-        with context:
+        with stage_context:
             if mode == "chain":
                 return _fit_chain(target_txt, source, density_mrc, resolution,
                                   contour, output_dir, early_stop_threshold,
-                                  orig_mrc)
+                                  orig_mrc, exec_context)
             return _fit_domain(target_txt, source, density_mrc, resolution,
                                contour, output_dir, chain_pdb,
-                               early_stop_threshold, orig_mrc)
+                               early_stop_threshold, orig_mrc, exec_context)
     finally:
+        if owns_context:
+            exec_context.close()
         _METRICS.write_summary()
 
 
@@ -102,7 +108,7 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
 # ======================================================================
 
 def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
-               output_dir, stop_threshold, orig_mrc):
+               output_dir, stop_threshold, orig_mrc, context):
     """Chain fitting: iterate over source files sorted by point count."""
     with _METRICS.stage("analyze_sources"):
         candidates = _analyze_source_files(source_dir)
@@ -127,7 +133,7 @@ def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
         result = _fit_single(
             target_txt, cand["file_path"], pdb_path, attempt_dir,
             density_mrc, resolution, contour, pdb_path,
-            cc_threshold, stop_threshold, orig_mrc)
+            cc_threshold, stop_threshold, orig_mrc, context)
 
         if result["success"]:
             with _METRICS.stage("save_result"):
@@ -144,7 +150,7 @@ def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
 # ======================================================================
 
 def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
-                output_dir, chain_pdb, stop_threshold, orig_mrc):
+                output_dir, chain_pdb, stop_threshold, orig_mrc, context):
     """Domain fitting: single source file."""
     pdb_path = chain_pdb or _find_pdb_for_txt(source_txt, os.path.dirname(source_txt))
     if not pdb_path:
@@ -158,7 +164,7 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
     result = _fit_single(
         target_txt, source_txt, pdb_path, output_dir,
         density_mrc, resolution, contour, pdb_path,
-        cc_threshold, stop_threshold, orig_mrc)
+        cc_threshold, stop_threshold, orig_mrc, context)
 
     if result["success"]:
         with _METRICS.stage("save_result"):
@@ -175,7 +181,7 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
 
 def _fit_single(target_txt, source_txt, chain_pdb, output_dir,
                 density_mrc, resolution, contour, pdb_for_naming,
-                cc_threshold, stop_threshold, orig_mrc):
+                cc_threshold, stop_threshold, orig_mrc, context):
     """Run PARENet + monitoring + optimization for one source file."""
     reg_dir = os.path.join(output_dir, "registration")
     temp_dir = os.path.join(output_dir, "temp_candidates")
@@ -186,7 +192,8 @@ def _fit_single(target_txt, source_txt, chain_pdb, output_dir,
 
     monitor_result = _monitor_and_evaluate(
         reg_dir, density_mrc, resolution, contour,
-        chain_pdb, cc_threshold, stop_threshold, temp_dir, proc)
+        chain_pdb, cc_threshold, stop_threshold, temp_dir, proc,
+        context=context)
 
     best = monitor_result.get("best_result")
     if best and best.get("success"):
@@ -213,7 +220,7 @@ def _start_parenet(target, source, chain_pdb, output_dir):
 
 def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                           chain_pdb, cc_threshold, stop_threshold,
-                          temp_dir, proc, batch_size=None):
+                          temp_dir, proc, batch_size=None, context=None):
     """Watch for pred_*.pdb files, evaluate CC, optimize candidates."""
     if batch_size is None:
         batch_size = _BATCH_SIZE
@@ -245,7 +252,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                 processed.add(f)
 
             with _METRICS.stage("cc_batch", candidate_count=len(batch)):
-                batch_results = _batch_cc(batch, density_mrc, resolution, contour)
+                batch_results = _batch_cc(batch, density_mrc, resolution, contour,
+                                          context)
             all_results.extend(batch_results)
 
             high = sorted(
@@ -257,7 +265,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                                     candidate_count=len(candidates) + 1):
                     opt = _optimize_candidate(
                         r["pdb_file"], density_mrc, resolution, contour,
-                        temp_dir, len(candidates) + 1, known_cc=r["cc_mask"])
+                        temp_dir, len(candidates) + 1, known_cc=r["cc_mask"],
+                        context=context)
                 if opt["success"]:
                     candidates.append(opt)
                     if opt["optimized_cc"] >= stop_threshold:
@@ -285,7 +294,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         for f in remaining:
             processed.add(f)
         with _METRICS.stage("cc_batch", candidate_count=len(remaining)):
-            batch_results = _batch_cc(remaining, density_mrc, resolution, contour)
+            batch_results = _batch_cc(remaining, density_mrc, resolution, contour,
+                                      context)
         all_results.extend(batch_results)
 
     # final strategy selection
@@ -293,7 +303,7 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         with _METRICS.stage("final_select", task_id=task_id):
             best_result = _select_final_result(
                 all_results, candidates, density_mrc, resolution, contour,
-                stop_threshold, temp_dir)
+                stop_threshold, temp_dir, context=context)
 
     if best_result is None and all_results:
         valid_r = [r for r in all_results if r["cc_mask"] is not None]
@@ -322,7 +332,7 @@ def _hybrid_score(cc, overlap):
 
 
 def _select_final_result(all_results, candidates, density_mrc, resolution,
-                         contour, stop_threshold, temp_dir):
+                         contour, stop_threshold, temp_dir, context=None):
     """No early stop: among files not yet optimized, optimize the top 5 by CC
     plus the top 5 by hybrid score (non-overlapping), then pick the best overall.
     """
@@ -347,7 +357,7 @@ def _select_final_result(all_results, candidates, density_mrc, resolution,
 
     best, new_c = _optimize_top_n(picks, density_mrc, resolution, contour,
                                   temp_dir, candidates, stop_threshold,
-                                  max_n=len(picks))
+                                  max_n=len(picks), context=context)
     candidates.extend(new_c)
     if best:
         return best
@@ -363,7 +373,7 @@ def _select_final_result(all_results, candidates, density_mrc, resolution,
 # ======================================================================
 
 def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
-                        temp_dir, candidate_id, known_cc=None):
+                        temp_dir, candidate_id, known_cc=None, context=None):
     """Optimize a candidate via local fitting; reuse known_cc (no recompute)."""
     work = os.path.join(temp_dir, f"candidate_{candidate_id}")
     os.makedirs(work, exist_ok=True)
@@ -387,9 +397,8 @@ def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
     # local_optimize returns the final CC -> no recompute here
     ok, opt_pdb, opt_cc = local_optimize(pdb_file, density_mrc, out_pdb,
                                          resolution, contour,
-                                         num_processes=_NUM_PROCESSES,
                                          initial_cc=orig_cc,
-                                         metrics=_METRICS)
+                                         metrics=_METRICS, context=context)
     if not ok or not opt_pdb or not os.path.exists(opt_pdb):
         log.warning("Candidate #%d [src: %s]: local optimization failed",
                     candidate_id, os.path.basename(pdb_file))
@@ -406,14 +415,15 @@ def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
 
 
 def _optimize_top_n(results, density_mrc, resolution, contour,
-                    temp_dir, existing, threshold, max_n=5):
+                    temp_dir, existing, threshold, max_n=5, context=None):
     """Optimize top N candidates, stop early if threshold is met."""
     best = None
     new_candidates = []
     for r in results[:max_n]:
         cid = len(existing) + len(new_candidates) + 1
         opt = _optimize_candidate(r["pdb_file"], density_mrc, resolution,
-                                  contour, temp_dir, cid, known_cc=r.get("cc_mask"))
+                                  contour, temp_dir, cid, known_cc=r.get("cc_mask"),
+                                  context=context)
         if opt["success"]:
             new_candidates.append(opt)
             if opt["optimized_cc"] >= threshold:
@@ -467,14 +477,10 @@ def _verify_cc(pdb_file, density_mrc, resolution, contour):
 # Utilities
 # ======================================================================
 
-def _batch_cc(pdb_files, density_mrc, resolution, contour):
-    """Compute CC_mask for a batch of PDB files (parallel if _NUM_PROCESSES>1)."""
+def _batch_cc(pdb_files, density_mrc, resolution, contour, context):
+    """Compute CC_mask for a batch of PDB files（复用运行级池，按输入顺序归并）。"""
     args = [(f, density_mrc, resolution, contour) for f in pdb_files]
-    if _NUM_PROCESSES and _NUM_PROCESSES > 1 and len(args) > 1:
-        with timed_pool(_METRICS, min(_NUM_PROCESSES, len(args)),
-                        "batch_cc") as pool:
-            return pool.map(_cc_worker, args)
-    return [_cc_worker(a) for a in args]
+    return context.map(_cc_worker, args)
 
 
 def _is_valid_pred(pdb_file):

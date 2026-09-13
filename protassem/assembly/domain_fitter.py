@@ -28,7 +28,7 @@ def fit_domain_once(orch, drec, threshold, round_num):
         early_stop_threshold=threshold,
         original_density_mrc=orch.original_density_mrc,
         num_processes=orch.num_processes, batch_size=orch.batch_size,
-        metrics=orch.metrics)
+        metrics=orch.metrics, context=orch.context)
     if not fit_result["success"] or not fit_result.get("final_pdb"):
         drec["status"] = "rejected"
         orch.failed_domain_pdbs.append(drec["pdb_file"])
