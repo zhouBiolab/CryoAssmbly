@@ -1,6 +1,10 @@
 # P3 复用 CPU 池：实现与验收（实测报告）
 
-日期：2026-09-13　代码：`feat/runtime-metrics`（P3 提交 `773acf7`，父提交 `773acf7`）
+日期：2026-09-13　代码：`feat/engineering-hardening`，**P3 提交 `773acf7`，父提交 `6b6f641`**（P2-fine）。
+**基线口径**：本报告的比较基线是**老卡原始冻结基线**（T01 之前）`2497fefc2e866ad65db628fb75f1ec0a`（`assembled_complex.cif`/`_all.cif`）
+与 `dbc937efc071cd9d1d2611f3ad84743f`（`refined_complex.cif`）；T01 之后基线已重冻结为 `76638d0f…`/`bd281f40…`，本报告不引用后者。
+**口径说明（v4.11）**：报告中的"未归因 1.13 s"是**计时覆盖完善**（`final_select` 267.6 s 补埋点），**不是加速**；
+池复用只覆盖**已接入的主拟合路径**，未接入位置见第一节"仍保留自建池"。
 case：`test/1`（两条单链 PDB + `EMD-8436.mrc`，res 5.6，contour 0.04），全部运行均为 1 BLAS 线程。
 
 ## 一、实现（保持候选策略与数值计算不变）
