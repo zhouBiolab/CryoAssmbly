@@ -17,6 +17,7 @@ from Bio.PDB import MMCIFParser, MMCIFIO, Structure, Model, Chain
 
 from protassem.core.io import load_sample_points, find_files
 from protassem.core.points_txt import read_point_cloud
+from protassem.runtime.metrics import Metrics
 from protassem.core.structure import (
     cif_to_pdb, pdb_to_cif, calculate_gyration_radius,
     extract_chain_id, align_by_resid,
@@ -46,7 +47,7 @@ class AssemblyOrchestrator:
                  batch_size=20, complex_min_cc=0.15, do_refine=True,
                  refine_tm=0.75, homo_chain_refine=False,
                  no_domain_split_chains=frozenset(),
-                 pre_screen=True, pre_screen_by_domain=False):
+                 pre_screen=True, pre_screen_by_domain=False, metrics=None):
         self.original_target_txt = target_txt
         self.source_dir = Path(source_dir)
         self.original_density_mrc = density_mrc
@@ -83,6 +84,8 @@ class AssemblyOrchestrator:
         self.output_dir = Path(output_dir or (self.source_dir / "assembly_output"))
         self.work_dir = self.output_dir / "work"
         self.final_dir = self.output_dir / "final_results"
+        # 运行级计时（P2）：run_pipeline 传入同一个实例；独立调用 run_assembly 时自建
+        self.metrics = metrics or Metrics(str(self.output_dir / "metrics"))
 
         self.current_target_txt = None
         self.current_density_mrc = None
@@ -114,31 +117,39 @@ class AssemblyOrchestrator:
         """Execute the full assembly pipeline."""
         self._setup()
         self._prepare_chains()
-        self._run_domain_splitting()
-        self._reorder_chains()
-        self._precompute_similarity()
+        with self.metrics.stage("domain_split"):
+            self._run_domain_splitting()
+        with self.metrics.stage("reorder_chains"):
+            self._reorder_chains()
+        with self.metrics.stage("tm_prefill"):
+            self._precompute_similarity()
 
         if self.pre_screen:
             if self.pre_screen_by_domain:
-                self._pre_screen_domains()
+                with self.metrics.stage("prescreen_domains"):
+                    self._pre_screen_domains()
             else:
-                self._pre_screen_chains()
+                with self.metrics.stage("prescreen_chains"):
+                    self._pre_screen_chains()
 
         from protassem.assembly.unified_queue import run_unified_assembly
-        run_unified_assembly(self)
+        with self.metrics.stage("assembly_rounds"):
+            run_unified_assembly(self)
 
         from protassem.assembly.complex_builder import clear_stale_outputs
         clear_stale_outputs(str(self.final_dir))
 
         from protassem.assembly.domain_assembler import assemble_domain_chains
-        assemble_domain_chains(self)
+        with self.metrics.stage("domain_assembly"):
+            assemble_domain_chains(self)
 
-        all_cif, _ = build_complex(
-            self.accepted_chains, str(self.final_dir),
-            cif_key="fitted_cif", out_name="assembled_complex_all.cif")
-        complex_cif, remap_log = build_complex(
-            self.accepted_chains, str(self.final_dir),
-            cif_key="fitted_cif_filtered", out_name="assembled_complex.cif")
+        with self.metrics.stage("build_complex"):
+            all_cif, _ = build_complex(
+                self.accepted_chains, str(self.final_dir),
+                cif_key="fitted_cif", out_name="assembled_complex_all.cif")
+            complex_cif, remap_log = build_complex(
+                self.accepted_chains, str(self.final_dir),
+                cif_key="fitted_cif_filtered", out_name="assembled_complex.cif")
         if remap_log:
             for orig, new, comp in remap_log:
                 log.info("Chain ID remapped: %s -> %s (component %s)",
@@ -167,16 +178,21 @@ class AssemblyOrchestrator:
             "assembled_complex_filtered": bool(complex_cif),
             "final_status": ("no_result" if not (all_cif or complex_cif)
                              else "assembled"),
+            "performance_summary": str(self.metrics.output_dir
+                                        and os.path.join(self.metrics.output_dir,
+                                                         "performance_summary.json")),
             **_output_status(self),
         })
 
-        refined_cif = refine_step.maybe_refine(self)
+        with self.metrics.stage("refine_step4"):
+            refined_cif = refine_step.maybe_refine(self)
 
         from protassem.assembly import homo_chain_step
         # Step5 在 Step4（已按 complex_min_cc 过滤域集）之上做同源链精修；
         # 过滤版为空时回退到完整版，不能因为过滤版没有组件就丢掉完整版。
-        homo_cif = homo_chain_step.maybe_homo_refine(
-            self, refined_cif or complex_cif or all_cif)
+        with self.metrics.stage("refine_step5"):
+            homo_cif = homo_chain_step.maybe_homo_refine(
+                self, refined_cif or complex_cif or all_cif)
 
         self._cleanup_temp_files()
         log.info("Assembly complete. Accepted: %d components",
@@ -701,8 +717,9 @@ class AssemblyOrchestrator:
         os.makedirs(mask_dir, exist_ok=True)
         new_txt = str(mask_dir / "filtered.txt")
         new_mrc = str(mask_dir / "masked.mrc")
-        ok = mask_fitted_region(self.current_target_txt, fitted_pdb,
-                                self.current_density_mrc, new_txt, new_mrc)
+        with self.metrics.stage("mask", mask_version=self._mask_iter):
+            ok = mask_fitted_region(self.current_target_txt, fitted_pdb,
+                                    self.current_density_mrc, new_txt, new_mrc)
         if ok and os.path.exists(new_txt) and os.path.exists(new_mrc):
             shutil.copy2(new_txt, self.current_target_txt)
             shutil.copy2(new_mrc, self.current_density_mrc)

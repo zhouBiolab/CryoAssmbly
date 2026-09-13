@@ -84,7 +84,8 @@ def fit_chain_item(orch, rec, state):
         str(fit_dir), mode="chain",
         early_stop_threshold=base_threshold,
         original_density_mrc=orch.original_density_mrc,
-        num_processes=orch.num_processes, batch_size=orch.batch_size)
+        num_processes=orch.num_processes, batch_size=orch.batch_size,
+        metrics=orch.metrics)
 
     if not fit_result["success"] or not fit_result.get("final_pdb"):
         rec["status"] = "failed"

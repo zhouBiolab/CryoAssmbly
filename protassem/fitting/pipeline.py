@@ -18,7 +18,7 @@ import shutil
 import logging
 import threading
 import subprocess
-from protassem.core.performance import Metrics, configure_cpu_threads
+from protassem.runtime.metrics import Metrics, worker_count
 
 from protassem.core.scoring import calculate_cc_mask
 from protassem.fitting.local_optimizer import local_optimize
@@ -57,7 +57,7 @@ DEMO_MASK_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 def run_fitting(target_txt, source, density_mrc, resolution, contour,
                 output_dir, mode="chain", chain_pdb=None,
                 early_stop_threshold=0.54, original_density_mrc=None,
-                num_processes=1, batch_size=20):
+                num_processes=1, batch_size=20, metrics=None):
     """Unified entry point for chain and domain fitting.
 
     Args:
@@ -71,16 +71,17 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
         chain_pdb: parent chain PDB (required for domain mode)
         early_stop_threshold: optimized CC threshold for early stop
         original_density_mrc: original unmasked density map for final eval
+        metrics: 运行级 Metrics（P2）；None 时在本请求输出目录下自建
 
     Returns:
         dict: success (bool), final_pdb (str|None), cc_mask (float)
     """
     global _NUM_PROCESSES, _BATCH_SIZE, _METRICS
-    _NUM_PROCESSES = configure_cpu_threads(num_processes)
+    _NUM_PROCESSES = worker_count(num_processes)
     _BATCH_SIZE = batch_size
     os.makedirs(output_dir, exist_ok=True)
     orig_mrc = original_density_mrc or density_mrc
-    _METRICS = Metrics(os.path.join(output_dir, "metrics"))
+    _METRICS = metrics or Metrics(os.path.join(output_dir, "metrics"))
     context = _METRICS.stage("fit_request", mode=mode)
     try:
         with context:
@@ -215,6 +216,7 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     candidates = []
     best_result = None
     early_stop = False
+    gpu_wait_s = 0.0
 
     while True:
         running = proc.poll() is None
@@ -227,7 +229,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
             for f in batch:
                 processed.add(f)
 
-            batch_results = _batch_cc(batch, density_mrc, resolution, contour)
+            with _METRICS.stage("cc_batch", candidate_count=len(batch)):
+                batch_results = _batch_cc(batch, density_mrc, resolution, contour)
             all_results.extend(batch_results)
 
             high = sorted(
@@ -235,9 +238,11 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                 key=lambda r: r["cc_mask"], reverse=True)
 
             for r in high:
-                opt = _optimize_candidate(
-                    r["pdb_file"], density_mrc, resolution, contour,
-                    temp_dir, len(candidates) + 1, known_cc=r["cc_mask"])
+                with _METRICS.stage("local_optimize",
+                                    candidate_count=len(candidates) + 1):
+                    opt = _optimize_candidate(
+                        r["pdb_file"], density_mrc, resolution, contour,
+                        temp_dir, len(candidates) + 1, known_cc=r["cc_mask"])
                 if opt["success"]:
                     candidates.append(opt)
                     if opt["optimized_cc"] >= stop_threshold:
@@ -251,6 +256,10 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         if not running:
             break
         time.sleep(2.5)
+        gpu_wait_s += 2.5
+
+    _METRICS.record("gpu_wait", gpu_wait_s,
+                    task_id=os.path.basename(os.path.dirname(reg_dir)))
 
     # process remaining files
     remaining = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
@@ -258,7 +267,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     if remaining:
         for f in remaining:
             processed.add(f)
-        batch_results = _batch_cc(remaining, density_mrc, resolution, contour)
+        with _METRICS.stage("cc_batch", candidate_count=len(remaining)):
+            batch_results = _batch_cc(remaining, density_mrc, resolution, contour)
         all_results.extend(batch_results)
 
     # final strategy selection

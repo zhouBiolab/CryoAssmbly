@@ -1,11 +1,11 @@
-"""Tests for core/performance.py: event records and the per-stage summary."""
+"""Tests for runtime/metrics.py: event records, per-stage summary and totals."""
 
 import json
 import os
 import tempfile
 import unittest
 
-from protassem.core.performance import Metrics, configure_cpu_threads
+from protassem.runtime.metrics import Metrics, worker_count
 
 
 class MetricsTest(unittest.TestCase):
@@ -20,13 +20,15 @@ class MetricsTest(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
-    def test_record_appends_jsonl(self):
+    def test_record_appends_jsonl_with_optional_fields(self):
         metrics = Metrics(output_dir=self.tmp, run_id="run-1")
-        metrics.record("stage_a", 1.5, mode="chain")
-        metrics.record("stage_a", 0.5)
+        metrics.record("cc_batch", 1.5, task_id="A_d1", mask_version=3,
+                       candidate_count=4)
+        metrics.record("cc_batch", 0.5)
         rows = self._jsonl_rows()
-        self.assertEqual([row["stage"] for row in rows], ["stage_a", "stage_a"])
-        self.assertEqual(rows[0]["mode"], "chain")
+        self.assertEqual([row["stage"] for row in rows], ["cc_batch", "cc_batch"])
+        self.assertEqual(rows[0]["task_id"], "A_d1")
+        self.assertEqual(rows[0]["mask_version"], 3)
         self.assertEqual(rows[0]["run_id"], "run-1")
         self.assertEqual(metrics.records[1]["elapsed_s"], 0.5)
 
@@ -38,30 +40,37 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(metrics.records), 1)
         self.assertEqual(metrics.records[0]["stage"], "boom")
 
-    def test_summary_totals_by_stage(self):
+    def test_summary_totals_by_stage_and_wall(self):
         metrics = Metrics(output_dir=self.tmp, run_id="run-3")
-        metrics.record("a", 1.0)
-        metrics.record("a", 2.0)
-        metrics.record("b", 0.25)
-        metrics.write_summary()
-        path = os.path.join(self.tmp, "performance_summary.json")
-        with open(path, encoding="utf-8") as handle:
-            summary = json.load(handle)
+        with metrics.stage("pipeline_total"):
+            metrics.record("sampling", 1.0)
+            metrics.record("sampling", 2.0)
+        summary = metrics.summary()
         self.assertEqual(summary["run_id"], "run-3")
-        self.assertEqual(summary["stages"]["a"], {"count": 2, "seconds": 3.0})
-        self.assertEqual(summary["stages"]["b"]["count"], 1)
+        self.assertEqual(summary["stages"]["sampling"], {"count": 2, "seconds": 3.0})
+        self.assertEqual(summary["stages"]["pipeline_total"]["count"], 1)
+        self.assertGreaterEqual(summary["total_wall_s"], 0.0)
+
+    def test_write_summary_returns_path(self):
+        metrics = Metrics(output_dir=self.tmp, run_id="run-5")
+        metrics.record("mask", 0.25)
+        path = metrics.write_summary()
+        self.assertEqual(os.path.basename(path), "performance_summary.json")
+        with open(path, encoding="utf-8") as handle:
+            written = json.load(handle)
+        self.assertEqual(written["stages"]["mask"]["count"], 1)
 
     def test_without_output_dir_nothing_is_written(self):
         metrics = Metrics(output_dir=None, run_id="run-4")
         metrics.record("a", 1.0)
-        metrics.write_summary()
+        self.assertIsNone(metrics.write_summary())
         self.assertEqual(len(metrics.records), 1)
         self.assertEqual(os.listdir(self.tmp), [])
 
-    def test_configure_cpu_threads_never_returns_zero(self):
-        self.assertEqual(configure_cpu_threads(0), 1)
-        self.assertEqual(configure_cpu_threads(None), 1)
-        self.assertEqual(configure_cpu_threads(4), 4)
+    def test_worker_count_never_returns_zero(self):
+        self.assertEqual(worker_count(0), 1)
+        self.assertEqual(worker_count(None), 1)
+        self.assertEqual(worker_count(4), 4)
 
 
 if __name__ == "__main__":

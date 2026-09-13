@@ -10,9 +10,11 @@ import sys
 import shutil
 import logging
 import math
+import time
 from datetime import datetime
 
 from protassem.core.io import find_files, read_param_file
+from protassem.runtime.metrics import Metrics
 from protassem.core.structure import read_chain_ids, split_structure_to_chains
 from protassem.voxelize.mol_to_mrc import pdb2vol
 from protassem.sampling.sampler import sample_density_map
@@ -109,10 +111,14 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         log.info("Effective threads: %s",
                  runtime_config.describe_effective_threads())
 
+    metrics = Metrics(os.path.join(output_dir, "metrics"))
+    pipeline_started = time.perf_counter()
+
     log.info("Density map : %s", density_mrc)
     log.info("Structures  : %d files", len(structure_files))
     log.info("Resolution  : %s, Contour: %s, Voxel: %.2f", resolution, contour, voxel_size)
 
+    _t_standardize = time.perf_counter()
     # ---- Step 0: Standardize input structures ----
     # Read chain IDs from inside each file; keep multi-chain files as whole units.
     # If chain IDs collide across inputs, remap collisions to unique IDs (keep
@@ -199,6 +205,8 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
                      os.path.basename(std_path), new_cid)
     structure_files = standardized_files
 
+    metrics.record("standardize", time.perf_counter() - _t_standardize)
+    _t_voxelize = time.perf_counter()
     # ---- Step 1: Voxelize ----
     log.info("=" * 60)
     log.info("Step 1: Voxelization")
@@ -212,6 +220,8 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         pdb2vol(f, resolution, output_mrc=out)
         sim_mrcs.append(out)
 
+    metrics.record("voxelization", time.perf_counter() - _t_voxelize)
+    _t_sampling = time.perf_counter()
     # ---- Step 2: Sampling ----
     log.info("=" * 60)
     log.info("Step 2: Sampling")
@@ -232,6 +242,7 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         source_txts.append(txt)
         shutil.copy2(structure_files[i], src_dir)
 
+    metrics.record("sampling", time.perf_counter() - _t_sampling)
     log.info("Step 1 & 2 done.")
 
     # ---- Step 3: Assembly ----
@@ -247,6 +258,7 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
              kw.get("similarity_threshold", 0.85))
 
     assembly_dir = os.path.join(output_dir, "assembly")
+    _t_assembly = time.perf_counter()
     complex_cif = run_assembly(
         target_txt=target_txt,
         source_dir=src_dir,
@@ -254,13 +266,19 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         resolution=resolution,
         contour=contour,
         output_dir=assembly_dir,
+        metrics=metrics,
         **kw,
     )
+    metrics.record("assembly_total", time.perf_counter() - _t_assembly)
     log.info("=" * 60)
     if complex_cif:
         log.info("Assembly complete: %s", complex_cif)
     else:
         log.info("Assembly finished (no complex produced)")
+
+    metrics.record("pipeline_total", time.perf_counter() - pipeline_started)
+    summary_path = metrics.write_summary()
+    log.info("Performance summary: %s", summary_path)
 
     return {
         "target_txt": target_txt,

@@ -19,6 +19,7 @@
 | S0b | `core/performance.py` 重写为可读版（行为不变：`performance.jsonl` + `performance_summary.json`）；`fitting/pipeline.py` 拆行、删除未用的 `nullcontext` 导入 | `core/performance.py`、`fitting/pipeline.py` | `tests/test_metrics.py` 5 项 |
 | S0c | 两份方案文档入库（`ENGINEERING_HARDENING_PLAN.md` v2、`INFERENCE_ENGINEERING_PLAN.md` v1.1） | 仅文档 | — |
 | S1 | `main.py` 手写 argv 解析 → `argparse` + `parse_intermixed_args()`：选项可位于位置参数之前/之间/之后；未知选项、缺值、非数字、位置参数个数错误统一退出码 2 且打印原因；`core/io.read_param_file` 的格式错误带文件名与内容 | `main.py`、`core/io.py`：选项名、默认值、开关语义不变 | `tests/test_cli.py` 17 项；CLI 烟测 5 类错误退出码 2 |
+| P2 | **分阶段计时**：`Metrics` 迁移并扩展到 `runtime/metrics.py`（事件字段 + `summary()` + `total_wall_s`）；删除 `core/performance.py`；埋点覆盖 standardize / voxelization / sampling / domain_split / tm_prefill / prescreen / assembly_rounds / mask / domain_assembly / build_complex / refine_step4–5 / pipeline_total，拟合内部为 gpu_wait / cc_batch / local_optimize；摘要附 `performance_summary` 路径 | `protassem/runtime/metrics.py`（新）、`pipeline.py`、`assembly/orchestrator.py`、`assembly/chain_fitter.py`、`assembly/domain_fitter.py`、`fitting/pipeline.py`、`tests/test_metrics.py` | `tests/test_metrics.py` 6 项；`test/1` 实测两组（128 / 1 线程）分阶段拆解与产物等价性，见 `tests/reports/2026-09-13_p2_staged_metrics_and_thread_effect.md` |
 | P1 | **运行配置与线程控制**：新增 `protassem/runtime/config.py`（`RuntimeConfig`：JSON 加载、未知键报错、`apply_thread_env()`、`describe_effective_threads()`）；`main.py` 改为**两段式导入**（先解析参数并应用线程 env，再导入 NumPy/Torch）；新增 `--runtime-config <json>`；`run_pipeline` 记录实测生效线程数；`requirements.txt` 登记 `threadpoolctl==3.5.0` | `protassem/runtime/config.py`（新）、`main.py`、`pipeline.py`、`requirements.txt` | `tests/test_runtime_config.py` 7 项（含子进程实测 BLAS=1、main 导入不加载 numpy/torch）；实测默认 OpenBLAS 128 线程 / torch 112 → 应用配置后为设定值 |
 | R2 (O4) | **空结果输出契约**：`build_complex` 在 0 组件时删除同名旧文件、不写出、返回 `None`；新增 `clear_stale_outputs()` 清理程序管理产物；`orchestrator` 过滤版为空时保留完整版并把回退链改为 `homo or refined or complex or all`；运行摘要新增 `assembled_complex_all/_filtered`、`final_status` 与 接受域数/合并链数/过滤数量；`refine_step` 在无组装产物时明确跳过、备份日志指向实际文件 | `assembly/complex_builder.py`、`assembly/orchestrator.py`、`assembly/refine_step.py` | `tests/test_complex_output_contract.py` 6 项；真实集成验证（单链 + 0.99 阈值 + 预置旧产物）见 `tests/reports/2026-09-13_o4_empty_output_contract.md` |
 | R1 | **复合物域链合并丢链修复**：`assemble_domain_chains` 补传 `is_complex`（否则两条链的域被并进同一条链、残基 ID 重复、Biopython 报错、整链丢弃 → 空复合物）；`merge_domains` 复合物分支新增 `chain_map_of()`，按原始 `chain_records` 的 `chain_map` 把占位链号恢复为真链号（真链号原样通过，不二次映射）；`_filtered_domain_cif` 同步透传 `is_complex` | `assembly/domain_assembler.py` | `tests/test_domain_assembly.py` 4 项（含旧行为取证）；同配置真实运行 421 s：`assembled from 5 domains (cc=0.4490)`，最终产物链号 `Q`,`R`，摘要 `As domain chain: 1` |
@@ -72,7 +73,7 @@ demo_reg/
 +-- requirements.txt
 +-- protassem/                   主包
     +-- pipeline.py              三步总流程编排（含输入标准化）
-    +-- runtime/                 阶段二：RuntimeConfig + 线程控制（config.py）
+    +-- runtime/                 阶段二：RuntimeConfig + 线程控制（config.py）、分阶段计时（metrics.py）
     +-- core/                    公共底层
     |   +-- scoring.py           cc_mask 计算
     |   +-- structure.py         PDB/CIF 读写、域切片对齐
