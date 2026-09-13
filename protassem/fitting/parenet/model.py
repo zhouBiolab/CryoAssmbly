@@ -16,6 +16,7 @@ from pareconv.modules.geotransformer import (
 from pareconv.modules.registration import HypothesisProposer, combineRegisraition
 
 from protassem.fitting.parenet.backbone import PAREConvFPN
+from protassem.runtime.cuda_timing import CudaStageRecorder, cuda_stage
 
 
 def SM(corr, src_keypts, tgt_keypts, inlier_threshold=0.1, top_ratio=0.85):
@@ -116,7 +117,9 @@ class PARE_Net(nn.Module):
     )
 
 
-    def forward(self, data_dict):
+    def forward(self, data_dict, timing=None):
+        """timing: 可选的 sink(name, seconds)；用于分阶段计时（T02）。"""
+        recorder = CudaStageRecorder(timing) if timing is not None else None
         output_dict = {}
         # Downsample point clouds
         #print("data_dict keys:", data_dict.keys())
@@ -209,7 +212,8 @@ class PARE_Net(nn.Module):
         output_dict['gt_node_corr_overlaps'] = gt_node_corr_overlaps
 
         # 2. PARE-Conv Encoder
-        re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(data_dict)
+        with cuda_stage(recorder, "model_backbone"):
+            re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(data_dict)
         #print("re_feats_f", re_feats_f.shape, feats_f.shape, re_feats_c.shape, feats_c.shape)
         #points1 = data_dict['points'][0][:, :3].detach()
         #print("points1",points1)
@@ -252,13 +256,13 @@ class PARE_Net(nn.Module):
         #ref_pc = ref_points_centered /scale
         #src_pc = src_points_centered /scale
 
-        ref_feats_c, src_feats_c, scores_list = self.transformer(
-            ref_pc.unsqueeze(0),
-            src_pc.unsqueeze(0),
-            ref_feats_c.unsqueeze(0),
-            src_feats_c.unsqueeze(0),
-
-        )
+        with cuda_stage(recorder, "model_transformer"):
+            ref_feats_c, src_feats_c, scores_list = self.transformer(
+                ref_pc.unsqueeze(0),
+                src_pc.unsqueeze(0),
+                ref_feats_c.unsqueeze(0),
+                src_feats_c.unsqueeze(0),
+            )
         #print("ref_feats_c",ref_feats_c.shape)
         #print("src_feats_c",src_feats_c.shape)
         #print("ref_feats_css", ref_feats_c.squeeze(0).shape)
@@ -452,20 +456,21 @@ class PARE_Net(nn.Module):
 
      
         with torch.no_grad():
-            ref_corr_points, src_corr_points, corr_scores, estimated_transform, hypotheses, re_ref_corr_feats, re_src_corr_feats, =  self.combienrefistration(
-                ref_node_corr_knn_points,
-                src_node_corr_knn_points,
-                re_ref_node_corr_knn_feats,
-                re_src_node_corr_knn_feats,
-                ref_node_corr_knn_masks,
-                src_node_corr_knn_masks,
-                matching_scores,
-                node_corr_scores,
-                ref_feats_f,
-                src_feats_f,
-                ref_points_f,
-                src_points_f,
-            )
+            with cuda_stage(recorder, "model_lgr"):
+                ref_corr_points, src_corr_points, corr_scores, estimated_transform, hypotheses, re_ref_corr_feats, re_src_corr_feats, =  self.combienrefistration(
+                    ref_node_corr_knn_points,
+                    src_node_corr_knn_points,
+                    re_ref_node_corr_knn_feats,
+                    re_src_node_corr_knn_feats,
+                    ref_node_corr_knn_masks,
+                    src_node_corr_knn_masks,
+                    matching_scores,
+                    node_corr_scores,
+                    ref_feats_f,
+                    src_feats_f,
+                    ref_points_f,
+                    src_points_f,
+                )
 
 
         output_dict['re_ref_corr_feats'] = re_ref_corr_feats
@@ -476,7 +481,8 @@ class PARE_Net(nn.Module):
         output_dict['corr_scores'] = corr_scores
         output_dict['estimated_transform'] = estimated_transform
         output_dict['transform'] = transform
-        #print("output_dict['ref_corr_points']",ref_corr_points.shape)
+        if recorder is not None:
+            recorder.flush()   # 同步一次后回放各阶段耗时
         return output_dict
 
 

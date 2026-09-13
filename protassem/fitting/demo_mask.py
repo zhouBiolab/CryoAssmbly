@@ -216,9 +216,13 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
             "scale": scale,
         }
 
+        _t_stage = time.perf_counter()
         data_dict = registration_collate_fn_stack_mode(
             [data_dict], cfg.backbone.num_stages, cfg.backbone.init_voxel_size,
             cfg.backbone.num_neighbors, cfg.backbone.subsample_ratio)
+        _record_timing(output_dir, "server_collate", time.perf_counter() - _t_stage,
+                       config_id=config_id, sampling=sampling_method)
+
         _t_stage = time.perf_counter()
         data_dict = to_cuda(data_dict)
         _record_timing(output_dir, "server_to_gpu", time.perf_counter() - _t_stage)
@@ -227,8 +231,33 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         nbr = precompute_neibors(data_dict["points"], data_dict["lengths"],
                                  cfg.backbone.num_stages, cfg.backbone.num_neighbors)
         data_dict.update(nbr)
-        output_dict = model(data_dict)
+        _record_timing(output_dir, "server_neighbors", time.perf_counter() - _t_stage)
+
+        # T02：输入指纹与有效参数（用于判断缓存可复用比例）
+        import struct
+        _record_timing(output_dir, "server_pair_info", 0.0,
+                       config_id=config_id, sampling=sampling_method,
+                       src_points=int(src_data.points.shape[0]),
+                       tgt_points=int(tgt_data.points.shape[0]),
+                       ref_radius=float(np.linalg.norm(ref_norm, axis=1).max()),
+                       src_radius=float(np.linalg.norm(src_norm, axis=1).max()),
+                       scale=float(scale),
+                       scale_bits=struct.pack(">f", float(scale)).hex(),
+                       collate_stage_points=[int(item.shape[0]) for item in
+                                             data_dict["points"]])
+
+        _t_stage = time.perf_counter()
+        output_dict = model(data_dict, timing=lambda stage, seconds: _record_timing(
+            output_dir, stage, seconds, config_id=config_id, sampling=sampling_method))
         _record_timing(output_dir, "server_forward", time.perf_counter() - _t_stage)
+
+        # 后处理计时必须从模型结束处开始，否则会与 server_forward 重叠相加（T02 偏差处理）
+        _t_stage = time.perf_counter()
+        _record_timing(output_dir, "server_mem_peak", 0.0,
+                       allocated=torch.cuda.memory_allocated(),
+                       reserved=torch.cuda.memory_reserved(),
+                       max_allocated=torch.cuda.max_memory_allocated(),
+                       max_reserved=torch.cuda.max_memory_reserved())
 
         T_est = output_dict["estimated_transform"]
         pred_R = T_est[:3, :3].cpu().numpy()
