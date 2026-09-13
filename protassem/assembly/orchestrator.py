@@ -127,10 +127,13 @@ class AssemblyOrchestrator:
         from protassem.assembly.unified_queue import run_unified_assembly
         run_unified_assembly(self)
 
+        from protassem.assembly.complex_builder import clear_stale_outputs
+        clear_stale_outputs(str(self.final_dir))
+
         from protassem.assembly.domain_assembler import assemble_domain_chains
         assemble_domain_chains(self)
 
-        build_complex(
+        all_cif, _ = build_complex(
             self.accepted_chains, str(self.final_dir),
             cif_key="fitted_cif", out_name="assembled_complex_all.cif")
         complex_cif, remap_log = build_complex(
@@ -140,6 +143,10 @@ class AssemblyOrchestrator:
             for orig, new, comp in remap_log:
                 log.info("Chain ID remapped: %s -> %s (component %s)",
                          orig, new, comp)
+        if complex_cif is None:
+            log.warning("No component passed the complex_min_cc filter; "
+                        "assembled_complex.cif not written%s",
+                        " (assembled_complex_all.cif kept)" if all_cif else "")
         self._attach_domain_details()
         create_report(self.accepted_chains, str(self.final_dir),
                       excluded_domains=self.excluded_domains, config={
@@ -156,21 +163,29 @@ class AssemblyOrchestrator:
             "skipped_inputs": len(self.skipped_inputs),
             "skipped_detail": "; ".join("%s (%s)" % (name, reason)
                                         for name, reason in self.skipped_inputs),
+            "assembled_complex_all": bool(all_cif),
+            "assembled_complex_filtered": bool(complex_cif),
+            "final_status": ("no_result" if not (all_cif or complex_cif)
+                             else "assembled"),
+            **_output_status(self),
         })
 
         refined_cif = refine_step.maybe_refine(self)
 
         from protassem.assembly import homo_chain_step
-        # Step5 在 Step4（已按 complex_min_cc 过滤域集）之上做同源链精修
+        # Step5 在 Step4（已按 complex_min_cc 过滤域集）之上做同源链精修；
+        # 过滤版为空时回退到完整版，不能因为过滤版没有组件就丢掉完整版。
         homo_cif = homo_chain_step.maybe_homo_refine(
-            self, refined_cif or complex_cif)
+            self, refined_cif or complex_cif or all_cif)
 
         self._cleanup_temp_files()
         log.info("Assembly complete. Accepted: %d components",
                  len(self.accepted_chains))
-        final_cif = homo_cif or refined_cif or complex_cif
+        final_cif = homo_cif or refined_cif or complex_cif or all_cif
         if final_cif:
             log.info("Complex: %s", final_cif)
+        else:
+            log.warning("No complex CIF produced: nothing passed the thresholds")
         return final_cif
 
     # ==================================================================
@@ -816,6 +831,19 @@ class AssemblyOrchestrator:
 # ==================================================================
 # Module-level helpers
 # ==================================================================
+
+def _output_status(orch):
+    """运行摘要用的输出统计：接受域数 / 合并链数 / 过滤数量。"""
+    accepted_domains = sum(
+        1 for records in orch.domain_records.values()
+        for record in records if record.get("status") == "accepted")
+    domain_chains = [a for a in orch.accepted_chains if a["type"] == "domain_chain"]
+    filtered_out = sum(1 for a in domain_chains if not a.get("fitted_cif_filtered"))
+    return {"accepted_components": len(orch.accepted_chains),
+            "accepted_domains": accepted_domains,
+            "merged_domain_chains": len(domain_chains),
+            "filtered_out_domain_chains": filtered_out}
+
 
 def _pre_screen_cc_worker(args):
     """Worker for parallel cc_mask in pre-screening.

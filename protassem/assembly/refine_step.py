@@ -58,7 +58,10 @@ def maybe_refine(orch):
     refined = orch.final_dir / "refined_complex.cif"
     shutil.copy2(final_cif, str(refined))
     log.info("Step 4 complete. Primary: %s", refined)
-    log.info("Backup (un-refined): %s", orch.final_dir / "assembled_complex.cif")
+    unrefined = orch.final_dir / "assembled_complex.cif"
+    if not unrefined.exists():
+        unrefined = orch.final_dir / "assembled_complex_all.cif"
+    log.info("Backup (un-refined): %s", unrefined)
     return str(refined)
 
 
@@ -68,6 +71,10 @@ def maybe_refine(orch):
 
 def _skip_reason(orch):
     """Return a reason string if Step 4 should NOT run, else None."""
+    if not any((orch.final_dir / name).exists()
+               for name in ("assembled_complex.cif",
+                            "assembled_complex_all.cif")):
+        return "no assembled complex"
     if not any(orch.domain_records.values()):
         return "no domains were split"
     if not orch.accepted_domain_pdbs:

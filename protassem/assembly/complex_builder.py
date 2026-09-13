@@ -25,6 +25,24 @@ def _next_available_id(used_ids):
     raise RuntimeError("Exhausted chain ID namespace")
 
 
+PROGRAM_OUTPUTS = ("assembled_complex.cif", "assembled_complex_all.cif",
+                   "refined_complex.cif", "homo_chain_refined_complex.cif")
+
+
+def clear_stale_outputs(output_dir):
+    """删除上一轮遗留的程序管理产物，避免把旧结果误读成本次结果。"""
+    removed = []
+    for name in PROGRAM_OUTPUTS:
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(name)
+    if removed:
+        log.info("Removed stale output(s) from previous run: %s",
+                 ", ".join(removed))
+    return removed
+
+
 def build_complex(accepted_chains, output_dir, cif_key="fitted_cif",
                   out_name="assembled_complex.cif"):
     """Merge accepted chain/domain CIF files into one complex CIF.
@@ -42,7 +60,7 @@ def build_complex(accepted_chains, output_dir, cif_key="fitted_cif",
         cif_key: "fitted_cif" 或 "fitted_cif_filtered"
 
     Returns:
-        (path to complex CIF, remap_log) or (None, [])
+        (path to complex CIF, remap_log)；没有组件时不写出文件并返回 (None, remap_log)。
     """
     os.makedirs(output_dir, exist_ok=True)
     remap_log = []
@@ -74,6 +92,12 @@ def build_complex(accepted_chains, output_dir, cif_key="fitted_cif",
                 added += 1
 
         out = os.path.join(output_dir, out_name)
+        if added == 0:
+            # 空结构文件对下游没有意义：不写出，并清掉上一轮同名结果。
+            if os.path.exists(out):
+                os.remove(out)
+            log.info("No component for %s; file not written", out_name)
+            return None, remap_log
         io = MMCIFIO()
         io.set_structure(complex_struct)
         io.save(out)
