@@ -32,7 +32,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_HYPOTHESIS_CHUNK,
-                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES)
+                                      DEFAULT_INFERENCE_MODE, DEFAULT_TAIL_PIPELINE,
+                                      INFERENCE_MODES)
 
 
 def sha256(path):
@@ -139,7 +140,8 @@ def summarize_predictions(pair_dir):
 
 def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
                  inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32,
-                 encoding_cache_mb=None, hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
+                 encoding_cache_mb=None, hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK,
+                 tail_pipeline=DEFAULT_TAIL_PIPELINE):
     """按 manifest 重放固定配准（不生成掩码、不跑装配）。
 
     geometry_cache_mb：T05 单侧几何缓存容量（MiB）；0 = 关闭，None = 用运行配置默认值。
@@ -197,7 +199,8 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
                     configs=manifest["params"]["configs"], seed=manifest["seed"],
                     geometry_cache=geometry_cache, allow_tf32=resolved_tf32,
                     inference_mode=inference_mode, encoding_cache=encoding_cache,
-                    hypothesis_chunk=hypothesis_chunk)
+                    hypothesis_chunk=hypothesis_chunk,
+                    tail_pipeline_enabled=tail_pipeline)
             elapsed = time.perf_counter() - started
             pred_files, overlaps = summarize_predictions(pair_dir)
             records.append({
@@ -221,6 +224,7 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
               "inference_mode": inference_mode, "allow_tf32": resolved_tf32,
               "tf32_policy": policy, "encoding_cache_mb": encoding_cache_mb,
               "hypothesis_chunk": int(hypothesis_chunk),
+              "tail_pipeline": bool(tail_pipeline),
               "encoding_cache": encoding_cache.snapshot() if encoding_cache else None,
               "metrics_summary": summary_path}
     with open(os.path.join(out_dir, "t00_report.json"), "w", encoding="utf-8") as handle:
@@ -254,6 +258,11 @@ def main(argv=None):
                      help="源编码缓存 GPU 预算（MiB，0 = 关闭；仅 split 模式）")
     run.add_argument("--hypothesis-chunk", type=int, default=DEFAULT_HYPOTHESIS_CHUNK,
                      help="位姿假设评分分块大小（T08；0 = 原整批路径）")
+    run.add_argument("--tail-pipeline", dest="tail_pipeline", action="store_true",
+                     default=DEFAULT_TAIL_PIPELINE,
+                     help="启用 CPU 尾部流水线（T09）")
+    run.add_argument("--no-tail-pipeline", dest="tail_pipeline", action="store_false",
+                     help="关闭 CPU 尾部流水线（就地执行后处理与写盘）")
 
     args = parser.parse_args(argv)
     if args.command == "manifest":
@@ -277,7 +286,8 @@ def main(argv=None):
                           inference_mode=args.inference_mode,
                           allow_tf32=args.allow_tf32,
                           encoding_cache_mb=args.encoding_cache_mb,
-                          hypothesis_chunk=args.hypothesis_chunk)
+                          hypothesis_chunk=args.hypothesis_chunk,
+                          tail_pipeline=args.tail_pipeline)
     print("report written: %s" % os.path.join(args.out_dir, "t00_report.json"))
     print("geometry cache: %s" % (report["geometry_cache"] or "关闭"))
     print("encoding cache: %s" % (report["encoding_cache"] or "关闭/不适用"))

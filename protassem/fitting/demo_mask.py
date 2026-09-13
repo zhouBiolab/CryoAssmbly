@@ -38,8 +38,10 @@ from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
 from protassem.fitting.parenet.model import model_fingerprint
 from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
                                       DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_HYPOTHESIS_CHUNK,
-                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES,
-                                      apply_tf32_policy, effective_allow_tf32)
+                                      DEFAULT_INFERENCE_MODE, DEFAULT_TAIL_PIPELINE,
+                                      INFERENCE_MODES, apply_tf32_policy,
+                                      effective_allow_tf32)
+from protassem.runtime.tail_pipeline import TailPipeline
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -177,13 +179,15 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                         output_dir=None, use_mask=False, masks=None,
                         masks_save_path=None, mask_suffix=None,
                         original_target_data=None, geometry_cache=None,
-                        inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None):
+                        inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None,
+                        tail_pipeline=None):
     """Run PARENet inference on one source-target pair.
 
     只有本函数调用模型；@torch.no_grad() 覆盖"单侧几何构建 → 编码 → 配准 → 后处理"全路径。
     geometry_cache：T05 的单侧几何缓存（None = 关闭；由服务进程或调用方显式拥有）。
     inference_mode：joint = 联合布局 + `forward`（默认，旧数值）；split = 单侧编码 + 双侧配准。
     encoding_cache：T07 的源编码缓存（仅 split 模式使用；None = 关闭）。
+    tail_pipeline：T09 的 CPU 尾部流水线（None = 就地执行后处理与写盘）。
     """
     result = {
         "source_file": os.path.basename(source_path),
@@ -338,33 +342,43 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         T_est = output_dict["estimated_transform"]
         pred_R = T_est[:3, :3].cpu().numpy()
         pred_t = T_est[:3, 3].cpu().numpy()
+        # 只保留下游必要的 CPU 结果（GPU 张量随 output_dict 在本函数返回后释放）
+        ref_count = len(output_dict["ref_points"])
+        src_count = len(output_dict["src_points"])
 
-        src4 = apply_transformation(src_for_ov, pred_R, pred_t)
-        _, _, corr = compute_overlap(ref_for_ov, src4, 1.5)
-        # 分母用完整（未掩码）目标点云 ref_for_ov，而非源点云
-        overlap = corr.shape[1] / len(ref_for_ov) if corr is not None and corr.size else 0.0
-        _record_timing(output_dir, "server_postprocess",
-                       time.perf_counter() - _t_stage)
+        def finish_pair():
+            """T09 尾部任务：后处理 + 写盘（确定性，不消耗随机数）。"""
+            _t_tail = time.perf_counter()
+            src4 = apply_transformation(src_for_ov, pred_R, pred_t)
+            _, _, corr = compute_overlap(ref_for_ov, src4, 1.5)
+            # 分母用完整（未掩码）目标点云 ref_for_ov，而非源点云
+            overlap_value = corr.shape[1] / len(ref_for_ov) \
+                if corr is not None and corr.size else 0.0
+            _record_timing(output_dir, "server_postprocess",
+                           time.perf_counter() - _t_tail)
 
-        _t_stage = time.perf_counter()
-        if chain_pdb_path and os.path.exists(chain_pdb_path):
-            try:
-                pred_pdb = generate_output_pdb_path(
-                    source_path, config_id, sampling_method, output_dir, mask_suffix)
-                # 位姿在点云质心系求解：写出时以 c_src 为旋转中心、并把平移补到 c_ref
-                t_corrected = pred_t + (c_ref.astype(np.float32) - c_src.astype(np.float32))
-                transform_pdb(chain_pdb_path, pred_R, t_corrected, pred_pdb,
-                              center=c_src.astype(np.float32))
-                result["pred_pdb_path"] = pred_pdb
-            except Exception as e:
-                log.warning("PDB transform failed: %s", e)
+            _t_tail = time.perf_counter()
+            if chain_pdb_path and os.path.exists(chain_pdb_path):
+                try:
+                    pred_pdb = generate_output_pdb_path(
+                        source_path, config_id, sampling_method, output_dir, mask_suffix)
+                    # 位姿在点云质心系求解：写出时以 c_src 为旋转中心、并把平移补到 c_ref
+                    t_corrected = pred_t + (c_ref.astype(np.float32) - c_src.astype(np.float32))
+                    transform_pdb(chain_pdb_path, pred_R, t_corrected, pred_pdb,
+                                  center=c_src.astype(np.float32))
+                    result["pred_pdb_path"] = pred_pdb
+                except Exception as e:
+                    log.warning("PDB transform failed: %s", e)
+            _record_timing(output_dir, "server_write_pred",
+                           time.perf_counter() - _t_tail)
+            result.update({"overlap": overlap_value,
+                           "ref_points": ref_count, "src_points": src_count})
 
-        _record_timing(output_dir, "server_write_pred",
-                       time.perf_counter() - _t_stage)
-
-        result.update({"overlap": overlap,
-                      "ref_points": len(output_dict["ref_points"]),
-                      "src_points": len(output_dict["src_points"])})
+        # T09：尾部交给预取 worker 与下一次配准的 GPU 工作重叠；tail_pipeline=None 时就地执行
+        if tail_pipeline is not None:
+            tail_pipeline.submit(finish_pair)
+        else:
+            finish_pair()
 
         # T03：不再递归 release_cuda（把每个张量都拷成 numpy）也不再逐对 empty_cache——
         # data_dict/output_dict 是本函数局部变量，返回即结束引用，显存由缓存分配器复用。
@@ -434,6 +448,11 @@ def make_parser():
     p.add_argument("--geometry-cache-mb", type=int, default=DEFAULT_GEOMETRY_CACHE_MB,
                    help="单侧几何 CPU 缓存容量（MiB，0 = 关闭；默认 %d）"
                         % DEFAULT_GEOMETRY_CACHE_MB)
+    p.add_argument("--tail-pipeline", dest="tail_pipeline", action="store_true",
+                   default=DEFAULT_TAIL_PIPELINE,
+                   help="启用 CPU 尾部流水线（T09；后处理/写盘与下一次配准的 GPU 工作重叠）")
+    p.add_argument("--no-tail-pipeline", dest="tail_pipeline", action="store_false",
+                   help="关闭 CPU 尾部流水线（就地执行后处理与写盘）")
     p.add_argument("--hypothesis-chunk", type=int, default=DEFAULT_HYPOTHESIS_CHUNK,
                    help="位姿假设评分分块大小（T08；0 = 原整批路径，默认 %d）"
                         % DEFAULT_HYPOTHESIS_CHUNK)
@@ -489,7 +508,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                   min_point_distance_factor=0.32, stop_file=None,
                   geometry_cache=None, allow_tf32=DEFAULT_ALLOW_TF32,
                   inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None,
-                  hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
+                  hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK,
+                  tail_pipeline_enabled=DEFAULT_TAIL_PIPELINE):
     """Run PARENet inference for one source/target pair.
 
     Algorithm identical to the original main(); only parameterized so the model
@@ -501,6 +521,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     inference_mode："joint"（联合布局 + forward，默认）或 "split"（单侧编码 + 双侧配准）。
     encoding_cache：T07 源编码缓存（None = 关闭；仅 split 模式使用）。
     hypothesis_chunk：T08 假设评分分块（0 = 原路径；模型构造前应用，需在首次加载时给出）。
+    tail_pipeline_enabled：T09 CPU 尾部流水线开关（默认关闭；结果与顺序必须一致）。
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -555,69 +576,104 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
 
     # inference
     all_results = []
+    # T09：尾部流水线（深度 1）。所有"消费结果"的位置必须先 wait()，见下面各点
+    tail_pipeline = TailPipeline(enabled=tail_pipeline_enabled, name="parenet-tail")
+    tail_wait_seconds = 0.0
 
-    if use_mask and mask_data_list:
-        optimal_results = []
-        for mask_file, mask_data in mask_data_list:
-            if _stopped():
-                break
-            mask_name = os.path.basename(mask_file)
-            mask_results = []
+    def _drain_tail(stage):
+        nonlocal tail_wait_seconds
+        _t_wait = time.perf_counter()
+        tail_pipeline.wait()
+        waited = time.perf_counter() - _t_wait
+        tail_wait_seconds += waited
+        if waited > 0.001:
+            _record_timing(output_dir, "server_tail_wait", waited, where=stage)
+
+    try:
+        if use_mask and mask_data_list:
+            optimal_results = []
+            for mask_file, mask_data in mask_data_list:
+                if _stopped():
+                    break
+                mask_name = os.path.basename(mask_file)
+                mask_results = []
+                for cid in config_ids:
+                    if _stopped():
+                        break
+                    for sm in ["voxel", "fps"]:
+                        try:
+                            suffix = os.path.splitext(mask_name)[0]
+                            if suffix.startswith("mask"):
+                                suffix = suffix[4:]
+                            suffix = suffix[:10]
+                            r = process_single_pair(
+                                src_data, mask_data, source, mask_file,
+                                chain_pdb, model_net, cfg, cid, sm,
+                                output_dir, use_mask=False,
+                                mask_suffix=suffix, original_target_data=tgt_data,
+                                geometry_cache=geometry_cache,
+                                inference_mode=inference_mode,
+                                encoding_cache=encoding_cache,
+                                tail_pipeline=tail_pipeline)
+                            mask_results.append(r)
+                            all_results.append(r)
+                        except Exception as e:
+                            log.error("Config %d-%s crashed: %s", cid, sm, e)
+                _drain_tail("mask_best")      # 消费本掩码结果前必须等尾部完成
+                best = process_single_mask_optimally(mask_results)
+                if best:
+                    optimal_results.append(best)
+
+            _drain_tail("sort")
+            optimal_results.sort(key=lambda x: x.get("overlap") or 0, reverse=True)
+            log.info("Optimal results per mask:")
+            for i, r in enumerate(optimal_results, 1):
+                pdb = os.path.basename(r.get("pred_pdb_path", "N/A"))
+                log.info("  %d. %s overlap=%.6f", i, pdb, r.get("overlap", 0))
+        else:
+            logged = 0
             for cid in config_ids:
                 if _stopped():
                     break
                 for sm in ["voxel", "fps"]:
                     try:
-                        suffix = os.path.splitext(mask_name)[0]
-                        if suffix.startswith("mask"):
-                            suffix = suffix[4:]
-                        suffix = suffix[:10]
                         r = process_single_pair(
-                            src_data, mask_data, source, mask_file,
+                            src_data, tgt_data, source, target,
                             chain_pdb, model_net, cfg, cid, sm,
-                            output_dir, use_mask=False,
-                            mask_suffix=suffix, original_target_data=tgt_data,
+                            output_dir, use_mask=use_mask,
+                            masks=masks, masks_save_path=masks_save_path,
                             geometry_cache=geometry_cache,
                             inference_mode=inference_mode,
-                            encoding_cache=encoding_cache)
-                        mask_results.append(r)
+                            encoding_cache=encoding_cache,
+                            tail_pipeline=tail_pipeline)
                         all_results.append(r)
                     except Exception as e:
                         log.error("Config %d-%s crashed: %s", cid, sm, e)
-            best = process_single_mask_optimally(mask_results)
-            if best:
-                optimal_results.append(best)
+                _drain_tail("ranking")        # 排名与日志都要读结果
+                while logged < len(all_results):
+                    done = all_results[logged]
+                    logged += 1
+                    if not done.get("error") and done.get("overlap") is not None:
+                        log.info("Config %s-%s: overlap=%.6f", done.get("config_id"),
+                                 done.get("sampling_method"), done["overlap"])
 
-        optimal_results.sort(key=lambda x: x.get("overlap") or 0, reverse=True)
-        log.info("Optimal results per mask:")
-        for i, r in enumerate(optimal_results, 1):
-            pdb = os.path.basename(r.get("pred_pdb_path", "N/A"))
-            log.info("  %d. %s overlap=%.6f", i, pdb, r.get("overlap", 0))
-    else:
-        for cid in config_ids:
-            if _stopped():
-                break
-            for sm in ["voxel", "fps"]:
-                try:
-                    r = process_single_pair(
-                        src_data, tgt_data, source, target,
-                        chain_pdb, model_net, cfg, cid, sm,
-                        output_dir, use_mask=use_mask,
-                        masks=masks, masks_save_path=masks_save_path,
-                        geometry_cache=geometry_cache,
-                        inference_mode=inference_mode,
-                        encoding_cache=encoding_cache)
-                    all_results.append(r)
-                    if not r["error"]:
-                        log.info("Config %d-%s: overlap=%.6f", cid, sm, r.get("overlap", 0))
-                except Exception as e:
-                    log.error("Config %d-%s crashed: %s", cid, sm, e)
+            _drain_tail("rename")
+            successful = [r for r in all_results if not r.get("error")
+                          and r.get("overlap") is not None]
+            if successful:
+                rename_pdb_files_by_ranking(successful)
 
-        successful = [r for r in all_results if not r.get("error") and r.get("overlap") is not None]
-        if successful:
-            rename_pdb_files_by_ranking(successful)
-
-    # summary
+        # summary（读结果前必须等尾部完成）
+        _drain_tail("summary")
+    finally:
+        try:
+            tail_pipeline.close()
+        except Exception as e:
+            log.error("尾部流水线关闭失败：%s", e)
+    if tail_pipeline.enabled:
+        _record_timing(output_dir, "server_tail_stats", 0.0,
+                       submitted=tail_pipeline.submitted, completed=tail_pipeline.completed,
+                       waited_seconds=round(tail_wait_seconds, 6))
     ok = [r for r in all_results if not r.get("error") and r.get("overlap") is not None]
     fail = [r for r in all_results if r.get("error")]
     log.info("Total: %d, Success: %d, Failed: %d", len(all_results), len(ok), len(fail))
@@ -652,7 +708,8 @@ def _record_timing(output_dir, stage, elapsed_s, **fields):
 def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                  inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32,
                  encoding_cache_mb=DEFAULT_ENCODING_CACHE_MB,
-                 hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
+                 hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK,
+                 tail_pipeline=DEFAULT_TAIL_PIPELINE):
     """Read one JSON request per stdin line; signal completion via _DONE file.
 
     Request keys: target, source, chain_pdb, output_dir, use_mask, configs,
@@ -708,7 +765,8 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                 stop_file=stop_file, geometry_cache=geometry_cache,
                 allow_tf32=resolved_tf32,
                 inference_mode=req.get("inference_mode") or inference_mode,
-                encoding_cache=encoding_cache, hypothesis_chunk=hypothesis_chunk)
+                encoding_cache=encoding_cache, hypothesis_chunk=hypothesis_chunk,
+                tail_pipeline_enabled=tail_pipeline)
         except Exception as e:
             log.error("request failed: %s", e)
         finally:
@@ -734,7 +792,8 @@ def main():
 
     if args.server:
         _server_loop(args.weights, args.geometry_cache_mb, args.inference_mode,
-                     args.allow_tf32, args.encoding_cache_mb, args.hypothesis_chunk)
+                     args.allow_tf32, args.encoding_cache_mb, args.hypothesis_chunk,
+                     args.tail_pipeline)
         return
 
     # single-run CLI (backward compatible)
@@ -758,7 +817,8 @@ def main():
         min_point_distance_factor=args.min_point_distance_factor,
         geometry_cache=geometry_cache, allow_tf32=args.allow_tf32,
         inference_mode=args.inference_mode, encoding_cache=encoding_cache,
-        hypothesis_chunk=args.hypothesis_chunk)
+        hypothesis_chunk=args.hypothesis_chunk,
+        tail_pipeline_enabled=args.tail_pipeline)
 
 
 if __name__ == "__main__":

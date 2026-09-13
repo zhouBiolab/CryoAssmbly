@@ -23,7 +23,8 @@ import subprocess
 
 from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
                                       DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_HYPOTHESIS_CHUNK,
-                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES)
+                                      DEFAULT_INFERENCE_MODE, DEFAULT_TAIL_PIPELINE,
+                                      INFERENCE_MODES)
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ _INFERENCE_MODE = DEFAULT_INFERENCE_MODE
 _ALLOW_TF32 = DEFAULT_ALLOW_TF32
 _ENCODING_CACHE_MB = DEFAULT_ENCODING_CACHE_MB
 _HYPOTHESIS_CHUNK = DEFAULT_HYPOTHESIS_CHUNK
+_TAIL_PIPELINE = DEFAULT_TAIL_PIPELINE
 
 
 def configure_geometry_cache(geometry_cache_mb):
@@ -88,6 +90,18 @@ def configure_encoding_cache(encoding_cache_mb):
     return _ENCODING_CACHE_MB
 
 
+def configure_tail_pipeline(tail_pipeline):
+    """设定服务端 CPU 尾部流水线开关（T09；必须在服务启动前调用）。"""
+    global _TAIL_PIPELINE
+    value = bool(tail_pipeline)
+    if _SERVER is not None and _SERVER.poll() is None and value != _TAIL_PIPELINE:
+        log.warning("PARENet server already running with tail_pipeline=%s; "
+                    "keeping it (new value %s ignored)", _TAIL_PIPELINE, value)
+        return _TAIL_PIPELINE
+    _TAIL_PIPELINE = value
+    return _TAIL_PIPELINE
+
+
 def configure_hypothesis_chunk(hypothesis_chunk):
     """设定服务端假设评分分块（T08；0 = 原整批路径；必须在服务启动前调用）。"""
     global _HYPOTHESIS_CHUNK
@@ -128,6 +142,8 @@ def get_server():
                "--encoding-cache-mb", str(_ENCODING_CACHE_MB),
                "--inference-mode", _INFERENCE_MODE,
                "--hypothesis-chunk", str(_HYPOTHESIS_CHUNK)]
+    if _TAIL_PIPELINE:
+        command.append("--tail-pipeline")
     if _ALLOW_TF32 is True:
         command.append("--allow-tf32")
     elif _ALLOW_TF32 is False:
@@ -137,9 +153,9 @@ def get_server():
         text=True, cwd=DEMO_MASK_CWD)
     atexit.register(shutdown_server)
     log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, encoding_cache_mb=%s, "
-             "inference_mode=%s, allow_tf32=%s, hypothesis_chunk=%s, log=%s)",
+             "inference_mode=%s, allow_tf32=%s, hypothesis_chunk=%s, tail_pipeline=%s, log=%s)",
              _SERVER.pid, _GEOMETRY_CACHE_MB, _ENCODING_CACHE_MB, _INFERENCE_MODE,
-             _ALLOW_TF32, _HYPOTHESIS_CHUNK, log_path)
+             _ALLOW_TF32, _HYPOTHESIS_CHUNK, _TAIL_PIPELINE, log_path)
     return _SERVER
 
 

@@ -34,6 +34,12 @@ DEFAULT_ENCODING_CACHE_MB = 256
 # 位姿假设评分分块（T08）：0 = 原整批路径（默认）；>0 时按该大小分块（任务卡建议先测 64）
 DEFAULT_HYPOTHESIS_CHUNK = 0
 
+# CPU 尾部流水线（T09）：默认**关闭**（原路径）。真实运行 A/B（test/1，同配置）实测
+# 1082.95 → 985.19 s（−9.0%）且三个 CIF md5 与冻结基线完全一致；但同一份代码在单客户端
+# 微基准里反而慢 9.5%（尾部线程与主线程争 CPU/GIL）——收益依赖"多 worker 把 GPU 压满"，
+# 尚无重复测量，故不提升默认；用 tail_pipeline=true 开启（T10 复测后决定）。
+DEFAULT_TAIL_PIPELINE = False
+
 
 def effective_allow_tf32(inference_mode, allow_tf32=None):
     """解析 TF32 策略：显式值优先；未给定时跟随推理模式。
@@ -83,6 +89,8 @@ class RuntimeConfig:
     encoding_cache_mb: int = DEFAULT_ENCODING_CACHE_MB
     # 位姿假设评分分块（T08；0 = 原整批路径，>0 = 按假设分块）
     hypothesis_chunk: int = DEFAULT_HYPOTHESIS_CHUNK
+    # CPU 尾部流水线（T09；False = 就地执行后处理与写盘）
+    tail_pipeline: bool = DEFAULT_TAIL_PIPELINE
 
     def __post_init__(self):
         # 早失败：非法模式、不安全的精度组合或负的分块在构造配置时就报错
