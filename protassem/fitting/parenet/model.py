@@ -18,6 +18,24 @@ from pareconv.modules.registration import HypothesisProposer, combineRegisraitio
 from protassem.fitting.parenet.backbone import PAREConvFPN
 from protassem.runtime.cuda_timing import CudaStageRecorder, cuda_stage
 
+# 推理链路（demo_mask.process_single_pair）只消费最终位姿与两侧点数；
+# 训练/诊断路径传 output_fields=None，保持返回全部字段的旧行为。
+INFERENCE_OUTPUT_FIELDS = ("estimated_transform", "ref_points", "src_points")
+
+
+def select_output_fields(output_dict, output_fields):
+    """按白名单裁剪 forward 的返回值；output_fields=None 表示全部保留。
+
+    白名单里出现 forward 未写入的字段时直接抛 KeyError：字段契约要显式失败，
+    不允许静默兜底（漏字段会让调用方拿到不完整的输出）。
+    """
+    if output_fields is None:
+        return output_dict
+    missing = [name for name in output_fields if name not in output_dict]
+    if missing:
+        raise KeyError("output_fields 在 forward 输出中不存在: %s" % missing)
+    return {name: output_dict[name] for name in output_fields}
+
 
 def SM(corr, src_keypts, tgt_keypts, inlier_threshold=0.1, top_ratio=0.85):
     diff = corr - corr.permute(1, 0, 2)
@@ -117,8 +135,12 @@ class PARE_Net(nn.Module):
     )
 
 
-    def forward(self, data_dict, timing=None):
-        """timing: 可选的 sink(name, seconds)；用于分阶段计时（T02）。"""
+    def forward(self, data_dict, timing=None, output_fields=None):
+        """timing: 可选的 sink(name, seconds)；用于分阶段计时（T02）。
+
+        output_fields: 需要回传的字段名（None = 全部）。只影响返回内容，
+        不改变任何计算；传入 INFERENCE_OUTPUT_FIELDS 时中间张量在返回后即可释放。
+        """
         recorder = CudaStageRecorder(timing) if timing is not None else None
         output_dict = {}
         # Downsample point clouds
@@ -160,12 +182,13 @@ class PARE_Net(nn.Module):
         output_dict['src_points'] = src_points
 
         # 1. Generate ground truth node correspondences
-        _, ref_node_masks, ref_node_knn_indices, ref_node_knn_masks = point_to_node_partition(
-            ref_points_f, ref_points_c, self.num_points_in_patch
-        )  # ref_N_c,  [ref_N_c, 64],  [ref_N_c, 64],
-        _, src_node_masks, src_node_knn_indices, src_node_knn_masks = point_to_node_partition(
-            src_points_f, src_points_c, self.num_points_in_patch
-        )
+        with cuda_stage(recorder, "model_node_partition"):
+            _, ref_node_masks, ref_node_knn_indices, ref_node_knn_masks = point_to_node_partition(
+                ref_points_f, ref_points_c, self.num_points_in_patch
+            )  # ref_N_c,  [ref_N_c, 64],  [ref_N_c, 64],
+            _, src_node_masks, src_node_knn_indices, src_node_knn_masks = point_to_node_partition(
+                src_points_f, src_points_c, self.num_points_in_patch
+            )
         '''
         # 1.1 Generate ground truth node correspondences
         _, ref_node_masks_shot, ref_node_knn_indices_shot, ref_node_knn_masks_shot = point_to_node_partition(
@@ -194,22 +217,25 @@ class PARE_Net(nn.Module):
         ref_node_knn_points = index_select(ref_padded_points_f, ref_node_knn_indices, dim=0) #[ref_N_c, 64, 3]
         src_node_knn_points = index_select(src_padded_points_f, src_node_knn_indices, dim=0)
 
-        gt_node_corr_indices, gt_node_corr_overlaps = get_node_correspondences(
-            ref_points_c,
-            src_points_c,
-            ref_node_knn_points,
-            src_node_knn_points,
-            transform,
-            self.matching_radius,
-            ref_masks=ref_node_masks,
-            src_masks=src_node_masks,
-            ref_knn_masks=ref_node_knn_masks,
-            src_knn_masks=src_node_knn_masks,
-        )  # coarse correspondences  gt_node_corr_indices: [N, 2]  gt_node_corr_overlaps : N
+        # 1.2 审计结论（T03）：GT 对应只被下面的 `if self.training:` 分支（coarse_target）消费，
+        # 推理时是纯浪费——它会构造 (M,N) 距离矩阵与 (B,K,K) 重叠矩阵。
+        # get_node_correspondences 无随机、无副作用、不写任何全局状态，跳过不改变其余计算。
+        if self.training:
+            gt_node_corr_indices, gt_node_corr_overlaps = get_node_correspondences(
+                ref_points_c,
+                src_points_c,
+                ref_node_knn_points,
+                src_node_knn_points,
+                transform,
+                self.matching_radius,
+                ref_masks=ref_node_masks,
+                src_masks=src_node_masks,
+                ref_knn_masks=ref_node_knn_masks,
+                src_knn_masks=src_node_knn_masks,
+            )  # coarse correspondences  gt_node_corr_indices: [N, 2]  gt_node_corr_overlaps : N
 
-
-        output_dict['gt_node_corr_indices'] = gt_node_corr_indices
-        output_dict['gt_node_corr_overlaps'] = gt_node_corr_overlaps
+            output_dict['gt_node_corr_indices'] = gt_node_corr_indices
+            output_dict['gt_node_corr_overlaps'] = gt_node_corr_overlaps
 
         # 2. PARE-Conv Encoder
         with cuda_stage(recorder, "model_backbone"):
@@ -483,7 +509,7 @@ class PARE_Net(nn.Module):
         output_dict['transform'] = transform
         if recorder is not None:
             recorder.flush()   # 同步一次后回放各阶段耗时
-        return output_dict
+        return select_output_fields(output_dict, output_fields)
 
 
 def create_model(config):

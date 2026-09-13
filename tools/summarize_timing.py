@@ -56,6 +56,34 @@ def print_table(title, table, only=None):
         print("  %-24s count=%-4d seconds=%9.2f" % (stage, item["count"], item["seconds"]))
 
 
+def print_memory(server_rows):
+    """服务端显存轨迹（T03）：按时间戳排序，检查 allocated 是否随请求数增长。"""
+    rows = [row for row in server_rows
+            if row["stage"] in ("server_mem_after", "server_mem_peak")]
+    if not rows:
+        print("== 服务端显存 ==\n  (无 server_mem_* 记录)")
+        return
+    rows.sort(key=lambda row: row.get("timestamp", 0.0))
+    after = [row for row in rows if row["stage"] == "server_mem_after"] or rows
+    allocated = [row.get("allocated", 0) / 1048576.0 for row in after]
+    reserved = [row.get("reserved", 0) / 1048576.0 for row in after]
+    peak_allocated = max(row.get("max_allocated", 0) for row in rows) / 1048576.0
+    peak_reserved = max(row.get("max_reserved", 0) for row in rows) / 1048576.0
+    print()
+    print("== 服务端显存（按时间戳顺序；来源 %s，%d 条）=="
+          % (after[0]["stage"], len(after)))
+    print("  allocated 首/最小/最大/末  %8.1f /%8.1f /%8.1f /%8.1f MiB"
+          % (allocated[0], min(allocated), max(allocated), allocated[-1]))
+    print("  reserved  首/最小/最大/末  %8.1f /%8.1f /%8.1f /%8.1f MiB"
+          % (reserved[0], min(reserved), max(reserved), reserved[-1]))
+    print("  进程高水位 max_allocated  %8.1f MiB" % peak_allocated)
+    print("  进程高水位 max_reserved   %8.1f MiB" % peak_reserved)
+    print("  allocated 前 5 次：%s"
+          % ", ".join("%.1f" % value for value in allocated[:5]))
+    print("  allocated 末 5 次：%s"
+          % ", ".join("%.1f" % value for value in allocated[-5:]))
+
+
 def main():
     parser = argparse.ArgumentParser(description="汇总一次运行的客户端/服务端时间账")
     parser.add_argument("output_dir")
@@ -84,6 +112,7 @@ def main():
     print()
     print_table("进程池生命周期（包含在上层阶段内，不重复计入）",
                 totals(client_rows), only=("pool_start", "pool_close"))
+    print_memory(server_rows)
     print()
 
     fit = client.get("fit_request", {}).get("seconds", 0.0)

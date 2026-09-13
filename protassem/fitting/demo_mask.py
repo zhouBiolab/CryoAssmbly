@@ -31,10 +31,10 @@ if _PROJECT_ROOT not in sys.path:
 
 from pareconv.utils.data_mask import registration_collate_fn_stack_mode, precompute_neibors
 import pareconv.utils.data_mask as data_mask_module
-from pareconv.utils.torch import to_cuda, release_cuda
+from pareconv.utils.torch import to_cuda
 from pareconv.modules.ops.transformation import apply_transform
 from protassem.fitting.parenet.config import make_cfg
-from protassem.fitting.parenet.model import create_model
+from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELDS
 from protassem.core.points_txt import read_point_cloud_file
 
 from protassem.fitting.utils import (
@@ -154,12 +154,16 @@ def preprocess_point_cloud_data(file_path, point_limit=65000, is_mask_file=False
 # Core inference
 # ======================================================================
 
+@torch.no_grad()   # T03：推理全程关闭梯度，不建计算图（权重/数值路径不变）
 def process_single_pair(src_data, tgt_data, source_path, target_path,
                         chain_pdb_path, model, cfg, config_id, sampling_method,
                         output_dir=None, use_mask=False, masks=None,
                         masks_save_path=None, mask_suffix=None,
                         original_target_data=None):
-    """Run PARENet inference on one source-target pair."""
+    """Run PARENet inference on one source-target pair.
+
+    只有本函数调用模型；@torch.no_grad() 覆盖 collate/上卡/前向/后处理全路径。
+    """
     result = {
         "source_file": os.path.basename(source_path),
         "target_file": os.path.basename(target_path),
@@ -247,8 +251,11 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                                              data_dict["points"]])
 
         _t_stage = time.perf_counter()
-        output_dict = model(data_dict, timing=lambda stage, seconds: _record_timing(
-            output_dir, stage, seconds, config_id=config_id, sampling=sampling_method))
+        output_dict = model(
+            data_dict, output_fields=INFERENCE_OUTPUT_FIELDS,
+            timing=lambda stage, seconds: _record_timing(
+                output_dir, stage, seconds, config_id=config_id,
+                sampling=sampling_method))
         _record_timing(output_dir, "server_forward", time.perf_counter() - _t_stage)
 
         # 后处理计时必须从模型结束处开始，否则会与 server_forward 重叠相加（T02 偏差处理）
@@ -290,14 +297,16 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                       "ref_points": len(output_dict["ref_points"]),
                       "src_points": len(output_dict["src_points"])})
 
-        data_dict = release_cuda(data_dict)
-        output_dict = release_cuda(output_dict)
-        torch.cuda.empty_cache()
+        # T03：不再递归 release_cuda（把每个张量都拷成 numpy）也不再逐对 empty_cache——
+        # data_dict/output_dict 是本函数局部变量，返回即结束引用，显存由缓存分配器复用。
+        _record_timing(output_dir, "server_mem_after", 0.0,
+                       allocated=torch.cuda.memory_allocated(),
+                       reserved=torch.cuda.memory_reserved(),
+                       config_id=config_id, sampling=sampling_method)
 
     except Exception as e:
         result["error"] = str(e)
         log.error("process_single_pair error: %s", e)
-        torch.cuda.empty_cache()
 
     return result
 

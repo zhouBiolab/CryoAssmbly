@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-13 **v4.2**（T00–T02 完成；取代 v2.1–v4.1/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-13 **v4.3**（T00–T03 完成；取代 v2.1–v4.2/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -43,6 +43,15 @@
 ---
 
 ## 修订记录
+
+### v4.2 → v4.3（T03 推理内存与中间回传）
+
+| # | 位置 | v4.2 的状态 | v4.3 的结论 |
+|---|---|---|---|
+| 52 | 任务卡 T03 | 待实施 | **已完成**：`@torch.no_grad()` 覆盖推理全路径、输出白名单（`INFERENCE_OUTPUT_FIELDS`）、删除递归 `release_cuda` 与逐对 `empty_cache`、GT 对应仅训练分支计算；A/B（`00a97e8`+探针树 vs 本卡，冷/暖各 36 对）72/72 预测哈希与全部 overlap 一致；`max_allocated` **4.85 GiB → 1.15 GiB**、前向返回瞬间 `allocated` 3.75 GiB → 23.5 MiB、`server_forward` −3.82 s（冷）；报告 `tests/reports/2026-09-13_t03_inference_memory.md` |
+| 53 | T02 遗留判断 | "forward 内约 19% 主机侧开销 + 4.85 GiB 峰值值得整理" | **已定位并处理**：峰值主要来自 autograd 计算图与全量 `output_dict` 驻留（非算子本身）；删除的显式工作实测 2.38 s/36 对（`empty_cache` 1.43 + `release_cuda` 0.75 + GT 对应 0.20），`no_grad` 另使模型内 CUDA 阶段合计下降 2.74 s/36 对 |
+| 54 | 显存口径 | T07 GPU 缓存预算 256 MiB ≈ 峰值 5% | 峰值降到 1.15 GiB 后该预算约占 22%；`reserved` 因不再 `empty_cache` 停留在高水位（示例 1.5–3.0 GiB），属可复用块而非泄漏（`allocated` 平在 ~12 MiB） |
+| 55 | 后续卡 | T04 单侧几何拆分 | 不变，仍为下一项；`no_grad`/白名单不影响 T04 的几何与索引契约 |
 
 ### v4.1 → v4.2（T02 热点与可复用比例）
 
