@@ -166,38 +166,71 @@ class DensityMapContext:
         self.fingerprint = fingerprint
 
 
+def _entry_bytes(value):
+    """共享 LRU 的计费函数：密度上下文与结构坐标都走这里。"""
+    if isinstance(value, DensityMapContext):
+        return (object_bytes(value.data) + object_bytes(value.voxel_size)
+                + object_bytes(value.origin) + 512)
+    coords, elements = value
+    return object_bytes(coords) + object_bytes(elements) + 256
+
+
 class _ScoreCache:
-    """进程本地缓存：密度上下文 + 结构坐标共享一个字节预算。"""
+    """进程本地缓存：密度上下文与结构坐标**共享同一个字节预算**。
+
+    一个 LRU、两类键前缀（`d:` / `s:`）—— 两条独立 LRU 各自按上限计费的话，
+    实际占用会到 2×预算（第 7 步实测到 113 MB + 44 MB > 128 MiB 才暴露）。
+    命中/未命中按类别计数，占用与峰值按共享预算计。
+    """
+
+    KIND_PREFIX = {"density": "d:", "structure": "s:"}
 
     def __init__(self, capacity_mb):
         self.capacity_mb = int(capacity_mb)
         capacity_bytes = max(0, self.capacity_mb) * 1024 * 1024
-        self.density = ByteLruCache(capacity_bytes, self._density_bytes, "density")
-        self.structure = ByteLruCache(capacity_bytes, self._structure_bytes,
-                                      "structure")
-
-    @staticmethod
-    def _density_bytes(context):
-        return object_bytes(context.data) + object_bytes(context.voxel_size) \
-            + object_bytes(context.origin) + 512
-
-    @staticmethod
-    def _structure_bytes(value):
-        coords, elements = value
-        return object_bytes(coords) + object_bytes(elements) + 256
+        self.cache = ByteLruCache(capacity_bytes, _entry_bytes, "score")
+        self.counters = {kind: {"hits": 0, "misses": 0, "puts": 0, "rejects": 0}
+                         for kind in self.KIND_PREFIX}
 
     @property
     def enabled(self):
-        return self.density.enabled or self.structure.enabled
+        return self.cache.enabled
+
+    def get(self, kind, key):
+        value = self.cache.get(self.KIND_PREFIX[kind] + key)
+        counter = self.counters[kind]
+        if value is None:
+            counter["misses"] += 1
+        else:
+            counter["hits"] += 1
+        return value
+
+    def put(self, kind, key, value):
+        stored = self.cache.put(self.KIND_PREFIX[kind] + key, value)
+        self.counters[kind]["puts" if stored else "rejects"] += 1
+        return stored
 
     def clear(self):
-        self.density.clear()
-        self.structure.clear()
+        """清空条目并重置统计（"配置变化即重设"的口径：统计跟着配置走）。"""
+        self.cache.clear()
+        for counter in self.counters.values():
+            for key in counter:
+                counter[key] = 0
 
     def snapshot(self):
-        return {"score_cache_mb": self.capacity_mb,
-                "density": self.density.snapshot(),
-                "structure": self.structure.snapshot()}
+        shared = self.cache.snapshot()
+        result = {"score_cache_mb": self.capacity_mb,
+                  "capacity_bytes": shared["capacity_bytes"],
+                  "entries": shared["entries"], "bytes": shared["bytes"],
+                  "peak_bytes": shared["peak_bytes"],
+                  "evictions": shared["evictions"]}
+        for kind, counter in self.counters.items():
+            total = counter["hits"] + counter["misses"]
+            result[kind] = dict(counter)
+            result[kind]["hit_rate"] = round(float(counter["hits"]) / total, 6) \
+                if total else None
+            result[kind]["capacity_bytes"] = shared["capacity_bytes"]
+        return result
 
 
 def _env_capacity_mb():
@@ -240,8 +273,8 @@ def invalidate_density():
     同名覆盖的动态密度有两种正确做法：给 `density_version`（精确、按 key 失效），
     或在这里整体失效。这里不做"按路径删除"—— 半吊子的部分失效比整体失效更危险。
     """
-    entries = _CACHE.density.stats.entries
-    _CACHE.density.clear()
+    entries = _CACHE.snapshot()["entries"]
+    _CACHE.clear()
     return entries
 
 
@@ -271,11 +304,11 @@ def load_density_context(density_mrc, contour, density_version=None):
 def density_context(density_mrc, contour, density_version=None):
     """取（可能命中缓存的）密度上下文；返回的数组视为**只读**。"""
     key = density_fingerprint(density_mrc, contour, density_version)
-    cached = _CACHE.density.get(key)
+    cached = _CACHE.get("density", key)
     if cached is not None:
         return cached
     context = load_density_context(density_mrc, contour, density_version)
-    _CACHE.density.put(key, context)
+    _CACHE.put("density", key, context)
     return context
 
 
@@ -288,12 +321,13 @@ def structure_coords(structure_file):
                         str(stat.st_mtime_ns)])
     except OSError:
         key = None
-    cached = _CACHE.structure.get(key)
+    cached = _CACHE.get("structure", key) if key is not None else None
     if cached is not None:
         return cached
     coords, elements = read_structure(str(structure_file))
     value = (list(coords), list(elements))
-    _CACHE.structure.put(key, value)
+    if key is not None:
+        _CACHE.put("structure", key, value)
     return value
 
 

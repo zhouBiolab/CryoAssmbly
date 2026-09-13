@@ -106,38 +106,57 @@ class ScoringCacheTest(unittest.TestCase):
         key1 = density_fingerprint(self.mrc, 0.04, "v1")
         key2 = density_fingerprint(self.mrc, 0.04, "v2")
         self.assertNotEqual(key1, key2)
+        snapshot = score_cache_snapshot()
+        self.assertEqual(snapshot["density"]["misses"], 1)
         calculate_cc_mask(self.mrc, self.structure, 6.0, 0.04, density_version="v2")
-        self.assertEqual(score_cache_snapshot()["density"]["entries"], 2)
+        snapshot = score_cache_snapshot()
+        self.assertEqual(snapshot["density"]["misses"], 2)   # 两个版本各读一次
+        # 共享 LRU：2 个密度上下文 + 1 份结构坐标
+        self.assertEqual(snapshot["entries"], 3)
 
     def test_explicit_invalidation(self):
         scoring.configure_score_cache(128)
         calculate_cc_mask(self.mrc, self.structure, 6.0, 0.04)
-        self.assertGreaterEqual(score_cache_snapshot()["density"]["entries"], 1)
+        self.assertGreaterEqual(score_cache_snapshot()["entries"], 1)
         self.assertGreaterEqual(invalidate_density(), 1)
-        self.assertEqual(score_cache_snapshot()["density"]["entries"], 0)
+        self.assertEqual(score_cache_snapshot()["entries"], 0)
 
     def test_zero_budget_disables_and_tiny_budget_rejects(self):
         scoring.configure_score_cache(0)
         snapshot = score_cache_snapshot()
-        self.assertEqual(snapshot["density"]["capacity_bytes"], 0)
+        self.assertEqual(snapshot["capacity_bytes"], 0)
         calculate_cc_mask(self.mrc, self.structure, 6.0, 0.04)
-        self.assertEqual(score_cache_snapshot()["density"]["entries"], 0)
+        self.assertEqual(score_cache_snapshot()["entries"], 0)
 
         path = _write_map(os.path.join(self.dir, "big.mrc"), shape=(64, 64, 64),
                           value=3.0)
         scoring.configure_score_cache(1)                       # 1 MiB 预算装不下
         calculate_cc_mask(path, self.structure, 6.0, 0.04)
         snapshot = score_cache_snapshot()
-        self.assertGreaterEqual(snapshot["density"]["rejected_too_large"], 0)
-        self.assertLessEqual(snapshot["density"]["bytes"], 1024 * 1024)
+        self.assertGreaterEqual(snapshot["density"]["rejects"], 0)
+        self.assertLessEqual(snapshot["bytes"], 1024 * 1024)
+
+    def test_density_and_structure_share_one_budget(self):
+        """附录 D.2：密度与结构坐标共享同一预算（不能各按上限计费）。"""
+        scoring.configure_score_cache(1)
+        snapshot = score_cache_snapshot()
+        self.assertEqual(snapshot["density"]["capacity_bytes"], 1024 * 1024)
+        self.assertEqual(snapshot["structure"]["capacity_bytes"], 1024 * 1024)
+        self.assertEqual(snapshot["capacity_bytes"], 1024 * 1024)
+        calculate_cc_mask(self.mrc, self.structure, 6.0, 0.04)
+        after = score_cache_snapshot()
+        self.assertLessEqual(after["bytes"], after["capacity_bytes"])
+        self.assertLessEqual(after["peak_bytes"], after["capacity_bytes"])
+        self.assertEqual(set(after) & {"entries", "bytes", "peak_bytes"},
+                         {"entries", "bytes", "peak_bytes"})
 
     def test_budget_change_clears_entries(self):
         scoring.configure_score_cache(128)
         calculate_cc_mask(self.mrc, self.structure, 6.0, 0.04)
-        self.assertGreaterEqual(score_cache_snapshot()["density"]["entries"], 1)
+        self.assertGreaterEqual(score_cache_snapshot()["entries"], 1)
         scoring.configure_score_cache(64)
         snapshot = score_cache_snapshot()
-        self.assertEqual(snapshot["density"]["entries"], 0)
+        self.assertEqual(snapshot["entries"], 0)
         self.assertEqual(snapshot["score_cache_mb"], 64)
 
     def test_structure_change_is_not_served_from_cache(self):
