@@ -1,0 +1,114 @@
+"""候选消费（O6）：批次成员由**固定 ID 区间**决定，与文件出现时机无关。
+
+规则（`ENGINEERING_HARDENING_PLAN.md` 附录 D.1.2）：
+
+1. 批次 = `[0, batch_size)`、`[batch_size, 2·batch_size)`…（`batch_size` 取 `--batch-size`）；
+   **不得**用"本次轮询发现的文件集合"当批次；
+2. 批内保持原有候选排序与逐个优化策略，第一个达标候选即触发早停（不要求整批优化完）；
+3. 即使 `end` 已到、全部候选已生成，仍按固定批次依次消费（不得改成"剩余一起 final_select"）；
+4. `final_select` 只在"全部批次消费完 且 未早停"时执行（由调用方判断，本模块只如实返回）；
+5. 未见 `end` 而请求已结束 → 抛错；`end.status="error"` → 抛错；`cancelled` → 正常返回；
+6. 早停后：确认请求已结束后才返回。
+"""
+
+import time
+
+POLL_INTERVAL_S = 2.5
+END_GRACE_POLLS = 2
+
+
+class CandidateConsumer:
+    """按固定 ID 区间消费台账；`on_batch(records)` 返回 `(results, hit_threshold)`。"""
+
+    def __init__(self, reader, batch_size, on_batch, request_finished,
+                 on_cancel=None, sleep=time.sleep, poll_interval=POLL_INTERVAL_S):
+        self.reader = reader
+        self.batch_size = max(1, int(batch_size))
+        self.on_batch = on_batch
+        self.request_finished = request_finished
+        self.on_cancel = on_cancel or (lambda: None)
+        self.sleep = sleep
+        self.poll_interval = poll_interval
+
+    def run(self):
+        """消费全部候选；返回批次摘要（调用方据此决定是否 final_select）。"""
+        batches = []
+        results = []
+        next_id = 0
+        early_stop = False
+        missing_end_polls = 0
+        waited_s = 0.0
+
+        while True:
+            self.reader.poll()
+            end = self.reader.end
+            total = end["count"] if end else None
+            progressed = False
+
+            # 1) 消费所有"区间成员已齐"的批次（含 end 到达后的末尾不足额批）
+            while True:
+                window = list(range(next_id, next_id + self.batch_size))
+                if total is not None:
+                    window = [cid for cid in window if cid < total]
+                if not window:
+                    break
+                if len(self.reader.ready_ids(window[0], window[-1] + 1)) < len(window):
+                    break
+                records = [self.reader.candidates[cid] for cid in window]
+                batch_results, hit = self.on_batch(records)
+                results.extend(batch_results)
+                batches.append({"start": window[0], "stop": window[-1] + 1,
+                                "skipped": sum(1 for r in records
+                                               if r["state"] != "ok")})
+                next_id = window[-1] + 1
+                progressed = True
+                if hit:
+                    early_stop = True
+                    break
+
+            # 2) 退出与错误判定
+            if early_stop:
+                self.on_cancel()
+                self._await_request_end()
+                break
+            if end is not None:
+                if end["status"] == "error":
+                    raise RuntimeError("请求失败（台账 end.status=error）：%s"
+                                       % end.get("error"))
+                if next_id >= total:
+                    break
+                if not progressed:
+                    raise RuntimeError("台账不完整：流已结束但 [%d, %d) 缺少候选记录"
+                                       % (next_id, next_id + self.batch_size))
+                continue
+            if self.request_finished():
+                missing_end_polls += 1
+                if missing_end_polls > END_GRACE_POLLS:
+                    raise RuntimeError("请求已结束但没有台账 end 记录（不完整请求）")
+            else:
+                missing_end_polls = 0
+            self.sleep(self.poll_interval)
+            waited_s += self.poll_interval
+
+        return {"batches": batches, "results": results, "early_stop": early_stop,
+                "skipped": list(self.reader.skipped), "consumed": next_id,
+                "waited_s": waited_s}
+
+    def _await_request_end(self):
+        """客户端主动早停后：确认请求真的结束了，才允许复用/改写目录或输入。"""
+        while True:
+            self.reader.poll()
+            if self.reader.end is not None:
+                if self.reader.end["status"] == "error":
+                    raise RuntimeError("请求失败（台账 end.status=error）：%s"
+                                       % self.reader.end.get("error"))
+                if self.request_finished():
+                    return
+            elif self.request_finished():
+                # 句柄已结束但 end 记录缺失：再给一个轮询周期（写盘与句柄不同步的窗口）
+                self.sleep(self.poll_interval)
+                self.reader.poll()
+                if self.reader.end is None:
+                    raise RuntimeError("请求已结束但没有台账 end 记录（不完整请求）")
+                continue
+            self.sleep(self.poll_interval)

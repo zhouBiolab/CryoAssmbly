@@ -6,8 +6,8 @@ main (orchestration) process never initialises CUDA, so the fork-based parallel
 CC / local-optimize pools stay safe.
 
 Inter-process protocol (no blocking):
-  - request  : one JSON line written to the server's stdin
-  - pred out : pred_*.pdb files written to output_dir (monitored by the caller)
+  - request  : one JSON line written to the server's stdin（含 O6 的 `request_id`）
+  - pred out : 候选文件写进 output_dir；**候选台账**（`candidates.jsonl`）发布 id/状态/名字
   - done     : server creates output_dir/_PARENET_DONE when a request finishes
   - stop     : caller creates output_dir/_PARENET_STOP to early-terminate
 Server stdout/stderr go to a log file (never a PIPE), so the caller can never
@@ -21,6 +21,7 @@ import atexit
 import logging
 import subprocess
 
+from protassem.fitting.candidate_ledger import LEDGER_NAME
 from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
                                       DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_HYPOTHESIS_CHUNK,
                                       DEFAULT_INFERENCE_MODE, DEFAULT_TAIL_PIPELINE,
@@ -179,10 +180,12 @@ def shutdown_server():
 class ParenetRequest:
     """Handle for one in-flight request; mimics a Popen (poll/terminate)."""
 
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, request_id=None):
         self.output_dir = output_dir
+        self.request_id = request_id
         self.done_file = os.path.join(output_dir, DONE_MARKER)
         self.stop_file = os.path.join(output_dir, STOP_MARKER)
+        self.ledger_path = os.path.join(output_dir, LEDGER_NAME)
 
     def poll(self):
         """None while running, 0 once the server signalled completion."""
@@ -206,15 +209,17 @@ class ParenetRequest:
 def start_request(target, source, chain_pdb, output_dir,
                   use_mask=True, configs="all",
                   mask_radius_factor=1.35, min_point_distance_factor=0.32,
-                  inference_mode=None):
+                  inference_mode=None, request_id=None):
     """Send one fitting request to the persistent server; return a handle.
 
     inference_mode：覆盖服务端默认推理路径（None = 用服务端设定）；仅用于对照实验。
+    request_id（O6）：请求身份，写入每一行候选台账；同时清掉本目录里上一次的台账，
+    保证新请求不会读到旧记录。
     """
     os.makedirs(output_dir, exist_ok=True)
-    # clear stale markers from any previous run in this dir
-    for m in (DONE_MARKER, STOP_MARKER):
-        fp = os.path.join(output_dir, m)
+    # clear stale markers/ledger from any previous run in this dir
+    for name in (DONE_MARKER, STOP_MARKER, LEDGER_NAME):
+        fp = os.path.join(output_dir, name)
         if os.path.exists(fp):
             os.remove(fp)
 
@@ -232,7 +237,10 @@ def start_request(target, source, chain_pdb, output_dir,
     # inference_mode 为 None 表示"用服务端设定"：此时**不写该键**（写 None 会被服务端当成非法值）
     if inference_mode is not None:
         request["inference_mode"] = inference_mode
+    if request_id is not None:
+        request["request_id"] = str(request_id)
     server.stdin.write(json.dumps(request) + "\n")
     server.stdin.flush()
-    log.info("PARENet request: %s", os.path.basename(str(source)))
-    return ParenetRequest(output_dir)
+    log.info("PARENet request: %s (request_id=%s)",
+             os.path.basename(str(source)), request_id)
+    return ParenetRequest(output_dir, request_id)

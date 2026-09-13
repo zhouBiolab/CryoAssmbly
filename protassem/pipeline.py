@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 
 from protassem.core.io import find_files, read_param_file
+from protassem.runtime.config import apply_seed
 from protassem.runtime.execution import ExecutionContext
 from protassem.runtime.metrics import Metrics
 from protassem.core.structure import read_chain_ids, split_structure_to_chains
@@ -131,6 +132,8 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         configure_inference_mode(runtime_config.inference_mode)
         configure_hypothesis_chunk(runtime_config.hypothesis_chunk)
         configure_tail_pipeline(runtime_config.tail_pipeline)
+        # 老卡收口（O6 复查项）：父进程随机源由配置固定 → 回退型局部优化不再随运行漂移
+        log.info("Parent RNG seeded: %s", apply_seed(runtime_config.seed))
 
     metrics = Metrics(os.path.join(output_dir, "metrics"))
     pipeline_started = time.perf_counter()

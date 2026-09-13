@@ -22,6 +22,8 @@ from protassem.runtime.metrics import Metrics, worker_count
 from protassem.runtime.execution import ExecutionContext
 
 from protassem.core.scoring import calculate_cc_mask
+from protassem.fitting.candidate_consumer import CandidateConsumer
+from protassem.fitting.candidate_ledger import LEDGER_NAME, LedgerReader
 from protassem.fitting.local_optimizer import local_optimize
 from protassem.fitting.parenet_client import start_request
 
@@ -32,6 +34,8 @@ _NUM_PROCESSES = 1
 # how many new pred files to accumulate before a monitor evaluation (set by run_fitting)
 _BATCH_SIZE = 20
 _METRICS = None
+# O6：请求身份计数器（同一进程内单调递增 → 两次运行的台账 request_id 序列一致）
+_REQUEST_SEQ = 0
 
 
 def _cc_worker(arg):
@@ -207,13 +211,18 @@ def _start_parenet(target, source, chain_pdb, output_dir):
     Returns a request handle (poll()/terminate()) compatible with the monitor.
     推理路径由服务端配置（`parenet_client.configure_inference_mode`，来自 RuntimeConfig）；
     这里不额外覆盖。
+    O6：为每个请求生成 `request_id`（任务 + 进程内序号），台账据此判定归属。
     """
+    global _REQUEST_SEQ
     task_id = os.path.basename(output_dir)
+    _REQUEST_SEQ += 1
+    request_id = "%s-%d" % (task_id, _REQUEST_SEQ)
     with _METRICS.stage("request_submit", task_id=task_id):
         return start_request(target, source, chain_pdb, output_dir,
                              use_mask=True, configs="all",
                              mask_radius_factor=1.35,
-                             min_point_distance_factor=0.32)
+                             min_point_distance_factor=0.32,
+                             request_id=request_id)
 
 
 # ======================================================================
@@ -223,85 +232,82 @@ def _start_parenet(target, source, chain_pdb, output_dir):
 def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                           chain_pdb, cc_threshold, stop_threshold,
                           temp_dir, proc, batch_size=None, context=None):
-    """Watch for pred_*.pdb files, evaluate CC, optimize candidates."""
+    """按候选台账消费（O6）：固定 ID 区间批次 + 批内原策略 + 首个达标即早停。
+
+    与旧实现的唯一区别是**候选顺序不再由文件出现时机决定**：
+    批次成员 = `[0, batch_size)`、`[batch_size, 2·batch_size)`…（`end` 到达后处理末尾不足额批），
+    批内仍按 (CC 降序, 候选 id) 逐个局部优化，第一个达到 `stop_threshold` 的候选触发早停。
+    """
     if batch_size is None:
         batch_size = _BATCH_SIZE
-    processed = set()
-    all_results = []
-    candidates = []
-    best_result = None
-    early_stop = False
-    gpu_wait_s = 0.0
-    scan_s = 0.0
-    first_pred_s = None
     task_id = os.path.basename(os.path.dirname(reg_dir))
     loop_started = time.perf_counter()
+    all_results = []
+    candidates = []
+    first_pred = [None]
+    early_stop_result = [None]
 
-    while True:
-        running = proc.poll() is None
-        _scan_started = time.perf_counter()
-        valid = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
-                 if _is_valid_pred(f)]
-        scan_s += time.perf_counter() - _scan_started
-        if first_pred_s is None and valid:
-            first_pred_s = time.perf_counter() - loop_started
-            _METRICS.record("first_pred", first_pred_s, task_id=task_id)
-        new_files = [f for f in valid if f not in processed]
+    reader = LedgerReader(os.path.join(reg_dir, LEDGER_NAME),
+                          request_id=getattr(proc, "request_id", None))
 
-        if running and len(new_files) >= batch_size:
-            batch = new_files[:batch_size]
-            for f in batch:
-                processed.add(f)
+    def evaluate_batch(records):
+        """批内策略不变：CC 评估 → 排序 → 逐个优化 → 首个达标即返回早停。"""
+        for record in records:
+            if record["state"] != "ok":
+                log.warning("候选 %d 状态 %s，跳过：%s", record["id"], record["state"],
+                            record.get("error") or record.get("reason") or "")
+        usable = [record for record in records if record["state"] == "ok"]
+        if not usable:
+            return [], False
+        if first_pred[0] is None:
+            first_pred[0] = time.perf_counter() - loop_started
+            _METRICS.record("first_pred", first_pred[0], task_id=task_id)
 
-            with _METRICS.stage("cc_batch", candidate_count=len(batch)):
-                batch_results = _batch_cc(batch, density_mrc, resolution, contour,
-                                          context)
-            all_results.extend(batch_results)
-
-            high = sorted(
-                [r for r in batch_results if r["cc_mask"] is not None and r["cc_mask"] > cc_threshold],
-                key=lambda r: r["cc_mask"], reverse=True)
-
-            for r in high:
-                with _METRICS.stage("local_optimize",
-                                    candidate_count=len(candidates) + 1):
-                    opt = _optimize_candidate(
-                        r["pdb_file"], density_mrc, resolution, contour,
-                        temp_dir, len(candidates) + 1, known_cc=r["cc_mask"],
-                        context=context)
-                if opt["success"]:
-                    candidates.append(opt)
-                    if opt["optimized_cc"] >= stop_threshold:
-                        best_result = opt
-                        early_stop = True
-                        _kill(proc)
-                        break
-            if early_stop:
-                break
-
-        if not running:
-            break
-        time.sleep(2.5)
-        gpu_wait_s += 2.5
-
-    _METRICS.record("gpu_wait", gpu_wait_s, task_id=task_id)
-
-    # process remaining files
-    _scan_started = time.perf_counter()
-    remaining = [f for f in sorted(glob.glob(os.path.join(reg_dir, "pred_*.pdb")))
-                 if _is_valid_pred(f) and f not in processed]
-    scan_s += time.perf_counter() - _scan_started
-    _METRICS.record("candidate_scan", scan_s, task_id=task_id)
-    if remaining:
-        for f in remaining:
-            processed.add(f)
-        with _METRICS.stage("cc_batch", candidate_count=len(remaining)):
-            batch_results = _batch_cc(remaining, density_mrc, resolution, contour,
-                                      context)
+        files = [os.path.join(reg_dir, record["name"]) for record in usable]
+        with _METRICS.stage("cc_batch", candidate_count=len(files)):
+            batch_results = _batch_cc(files, density_mrc, resolution, contour, context)
+        for record, result in zip(usable, batch_results):
+            result["candidate_id"] = record["id"]
+            if record.get("overlap") is not None:
+                result["overlap"] = record["overlap"]
         all_results.extend(batch_results)
 
-    # final strategy selection
-    if not early_stop:
+        high = sorted([r for r in batch_results
+                       if r["cc_mask"] is not None and r["cc_mask"] > cc_threshold],
+                      key=lambda r: (-r["cc_mask"], r["candidate_id"]))
+        for r in high:
+            with _METRICS.stage("local_optimize",
+                                candidate_count=len(candidates) + 1):
+                opt = _optimize_candidate(
+                    r["pdb_file"], density_mrc, resolution, contour,
+                    temp_dir, len(candidates) + 1, known_cc=r["cc_mask"],
+                    context=context)
+            if opt["success"]:
+                opt["candidate_id"] = r["candidate_id"]
+                candidates.append(opt)
+                if opt["optimized_cc"] >= stop_threshold:
+                    early_stop_result[0] = opt
+                    return batch_results, True
+        return batch_results, False
+
+    consumer = CandidateConsumer(
+        reader, batch_size, evaluate_batch,
+        request_finished=lambda: proc.poll() is not None,
+        on_cancel=lambda: _kill(proc))
+
+    _scan_started = time.perf_counter()
+    outcome = consumer.run()
+    _METRICS.record("candidate_scan", time.perf_counter() - _scan_started,
+                    task_id=task_id)
+    _METRICS.record("gpu_wait", outcome["waited_s"], task_id=task_id)
+    if outcome["skipped"]:
+        log.warning("候选台账含 %d 个非 ok 候选（filtered/error），已跳过",
+                    len(outcome["skipped"]))
+
+    if outcome["early_stop"]:
+        best_result = early_stop_result[0]
+    else:
+        # final_select 只在"全部批次消费完且未早停"时执行（规则与原实现一致）
         with _METRICS.stage("final_select", task_id=task_id):
             best_result = _select_final_result(
                 all_results, candidates, density_mrc, resolution, contour,
@@ -310,13 +316,14 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     if best_result is None and all_results:
         valid_r = [r for r in all_results if r["cc_mask"] is not None]
         if valid_r:
-            raw_best = max(valid_r, key=lambda r: r["cc_mask"])
+            raw_best = max(valid_r, key=lambda r: (r["cc_mask"],
+                                                   -r.get("candidate_id", 0)))
             best_result = {
                 "success": True, "optimized_pdb": raw_best["pdb_file"],
                 "optimized_cc": raw_best["cc_mask"], "is_unoptimized": True}
 
     return {"best_result": best_result, "all_results": all_results,
-            "candidates": candidates, "early_stop": early_stop}
+            "candidates": candidates, "early_stop": outcome["early_stop"]}
 
 
 def _hybrid_score(cc, overlap):
@@ -347,11 +354,12 @@ def _select_final_result(all_results, candidates, density_mrc, resolution,
     for r in unopt:
         r["hybrid"] = _hybrid_score(r["cc_mask"], r.get("overlap", 0))
 
-    # 1) top 5 by CC_mask
-    by_cc = sorted(unopt, key=lambda r: r["cc_mask"], reverse=True)[:5]
+    # 1) top 5 by CC_mask（并列用候选 id 作稳定次序）
+    by_cc = sorted(unopt, key=lambda r: (-r["cc_mask"], r.get("candidate_id", 0)))[:5]
     chosen = {r["pdb_file"] for r in by_cc}
     # 2) top 5 by hybrid score, excluding files already picked by CC
-    by_hybrid = [r for r in sorted(unopt, key=lambda r: r["hybrid"], reverse=True)
+    by_hybrid = [r for r in sorted(unopt,
+                                   key=lambda r: (-r["hybrid"], r.get("candidate_id", 0)))
                  if r["pdb_file"] not in chosen][:5]
     picks = by_cc + by_hybrid
     log.info("Final optimization: %d by CC + %d by hybrid (non-overlapping)",
@@ -364,8 +372,9 @@ def _select_final_result(all_results, candidates, density_mrc, resolution,
     if best:
         return best
     if candidates:
-        return max(candidates, key=lambda c: c["optimized_cc"])
-    raw_best = max(valid_r, key=lambda r: r["cc_mask"])
+        return max(candidates, key=lambda c: (c["optimized_cc"],
+                                              -c.get("candidate_id", 0)))
+    raw_best = max(valid_r, key=lambda r: (r["cc_mask"], -r.get("candidate_id", 0)))
     return {"success": True, "optimized_pdb": raw_best["pdb_file"],
             "optimized_cc": raw_best["cc_mask"], "is_unoptimized": True}
 

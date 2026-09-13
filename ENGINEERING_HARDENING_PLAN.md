@@ -58,7 +58,8 @@
 | 94 | 第 35 条的"P4 上限约 4%"【决策】 | 预估值 | **删除数字**：P4 只承诺"减少重复读取与解析"，收益以实测为准，不做倍数承诺 |
 | 95 | O6 定位【已核实】 | 开放项"需你定" | 升格为**完整流水线可重复性问题**并已定位机制：客户端按"本轮新出现的 `pred_*.pdb`"凑 `batch_size` 批（`--batch-size` 默认 10、每轮 `sleep(2.5)`），而候选文件由服务端"每掩码最优改名 + 删除其余"产生 → 顺序取决于写盘/改名时机；`_PARENET_DONE` 写在 `finally` 里，失败也写 done。接口定稿见附录 D |
 | 96 | 验收口径【决策】 | 第 5 节泛化"先微基准再真实 case" | 本轮真实运行共 **7 次**（O6×4：固定配置连续两次、`--num-processes 1`、`tail=on`；P4×1；P5×1；**第 7 次为暖缓存重复运行**，复用第六次的持久 TM 缓存以验证跨运行命中与结果重复性），纯运行 **≈2–2.5 h**（不按 17 min/次统一估算：`--num-processes 1` 明显更慢）。旧的 `out_t10_off` 只能作为**历史行为**证据，**不得**用于本轮速度归因。同一提交内不机械重复同一份微基准 |
-| 97 | 待核查项【待验证】 | — | ① `mask_data_list` 的顺序是否真的稳定（不得靠变量名推定：需核查集合遍历/并行完成顺序/随机状态）；② 局部优化的随机初始化是否让每个**逻辑任务**拿到同一种子（而不是继承各 worker 的 RNG 消费进度）——先核查，存在依赖才改 |
+| 97 | 待核查项【已核实】 | — | ① `mask_data_list` 的顺序**原先没有依据**：`utils.find_mask_files` 直接返回 `glob` 的目录顺序 → 已改为**按名排序**（候选 id 的"稳定生成顺序"以此为前提）；② 随机数：池内 worker（`_density_copy_worker`）**不用随机数**；父进程唯一的随机消费者是局部优化的回退（`local_optimizer.ScipyFitter` 的随机重启初值），而父进程原先**从未设种子**（NumPy 由 OS 熵初始化）→ 已用 `apply_seed(RuntimeConfig.seed)` 固定。`test/1` 的历史运行里该回退**从未触发**（日志 0 次），故这是消除潜在漂移，不是已发生的差异 |
+| 98 | O6 实施【已实施，待实跑验证】 | 附录 D 接口定稿 | 代码：`fitting/candidate_ledger.py`（新，请求级台账：`request_id` + 连续整数 id + `ok/filtered/error` + `end{ok/error/cancelled}`，先写文件后发布 + fsync）、`fitting/candidate_consumer.py`（新，固定 ID 区间批次 + 批内原策略 + 首个达标早停 + 缺 end/失败抛错 + 早停后确认请求结束）、`fitting/pipeline.py`（改台账消费，请求身份 `task-seq`）、`fitting/demo_mask.py`（掩码序号 / (config,sampling) 顺序发布）、`fitting/parenet_client.py`（请求带 `request_id`、发前清旧台账）、`fitting/utils.py`（掩码按名排序）、`runtime/config.py`（`apply_seed`）；单测 `tests/test_candidate_ledger.py` + `tests/test_candidate_ordering.py` 共 14 项；全量 201 项通过。**验收与基线冻结见第 99 条** |
 
 ### v4.9 → v4.10（T10 完整回归与交付）
 

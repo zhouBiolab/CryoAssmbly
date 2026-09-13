@@ -58,6 +58,21 @@ def effective_allow_tf32(inference_mode, allow_tf32=None):
     return bool(allow_tf32)
 
 
+def apply_seed(seed):
+    """在**父进程**里固定随机源（老卡收口 / O6 复查项）。
+
+    父进程里唯一使用随机数的生产路径是局部优化的回退（`local_optimizer.ScipyFitter`
+    的随机重启初值）与临时目录名的装饰性随机；池内 worker 不用随机数。
+    不给父进程固定种子时，NumPy 全局 RNG 由操作系统熵初始化 → 回退路径一旦触发，
+    结果就与运行无关地漂移。这里用 `RuntimeConfig.seed` 固定它。
+    """
+    import random
+    import numpy as np
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    return {"seed": int(seed)}
+
+
 def apply_tf32_policy(allow_tf32):
     """设定 TF32 精度策略（在**模型推理进程**里调用，早于任何前向）。
 

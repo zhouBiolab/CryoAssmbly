@@ -33,6 +33,7 @@ import pareconv.utils.data_mask as data_mask_module
 from protassem.fitting.parenet.config import make_cfg
 from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELDS
 from protassem.core.points_txt import read_point_cloud_file
+from protassem.fitting.candidate_ledger import CandidateLedgerWriter
 from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
                                               EncodingCache, GeometryCache)
 from protassem.fitting.parenet.model import model_fingerprint
@@ -509,7 +510,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                   geometry_cache=None, allow_tf32=DEFAULT_ALLOW_TF32,
                   inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None,
                   hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK,
-                  tail_pipeline_enabled=DEFAULT_TAIL_PIPELINE):
+                  tail_pipeline_enabled=DEFAULT_TAIL_PIPELINE, request_id=None):
     """Run PARENet inference for one source/target pair.
 
     Algorithm identical to the original main(); only parameterized so the model
@@ -522,6 +523,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     encoding_cache：T07 源编码缓存（None = 关闭；仅 split 模式使用）。
     hypothesis_chunk：T08 假设评分分块（0 = 原路径；模型构造前应用，需在首次加载时给出）。
     tail_pipeline_enabled：T09 CPU 尾部流水线开关（默认关闭；结果与顺序必须一致）。
+    request_id    ：O6 候选台账的请求身份（客户端生成；缺省时服务端自造一个）。
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -534,6 +536,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     model_net, cfg = _get_model(weights, effective_allow_tf32(inference_mode, allow_tf32),
                                 hypothesis_chunk)
     os.makedirs(output_dir, exist_ok=True)
+    ledger = CandidateLedgerWriter(
+        output_dir, request_id or "server-%d" % os.getpid())
 
     CONFIGS = VOXEL_SIZE_CONFIGS_MASK if use_mask else VOXEL_SIZE_CONFIGS_NORMAL
     point_limit = 70000 if use_mask else 70000
@@ -589,10 +593,24 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         if waited > 0.001:
             _record_timing(output_dir, "server_tail_wait", waited, where=stage)
 
+    def _publish(candidate_id, results, name=None, overlap=None, source=None):
+        """发布一个候选的终态（O6）：ok / filtered / error 三态必须显式。"""
+        if name and os.path.exists(name):
+            ledger.publish(candidate_id, "ok", name=name, overlap=overlap,
+                           source=source)
+            return
+        errors = [r.get("error") for r in results if r.get("error")]
+        if errors:
+            ledger.publish(candidate_id, "error", source=source, error=errors[0])
+        else:
+            ledger.publish(candidate_id, "filtered", source=source,
+                           reason="no valid prediction")
+
+    failure = None
     try:
         if use_mask and mask_data_list:
             optimal_results = []
-            for mask_file, mask_data in mask_data_list:
+            for mask_index, (mask_file, mask_data) in enumerate(mask_data_list):
                 if _stopped():
                     break
                 mask_name = os.path.basename(mask_file)
@@ -621,6 +639,14 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             log.error("Config %d-%s crashed: %s", cid, sm, e)
                 _drain_tail("mask_best")      # 消费本掩码结果前必须等尾部完成
                 best = process_single_mask_optimally(mask_results)
+                # O6：id = 掩码在 mask_data_list 中的序号（稳定生成顺序）；
+                # 改名/删除已在上一步完成，此处发布的名字不会再变
+                _publish(mask_index, mask_results,
+                         name=(best or {}).get("pred_pdb_path"),
+                         overlap=(best or {}).get("overlap"),
+                         source={"mask": mask_name,
+                                 "config": (best or {}).get("config_id"),
+                                 "sampling": (best or {}).get("sampling_method")})
                 if best:
                     optimal_results.append(best)
 
@@ -632,6 +658,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                 log.info("  %d. %s overlap=%.6f", i, pdb, r.get("overlap", 0))
         else:
             logged = 0
+            candidate_id = 0
             for cid in config_ids:
                 if _stopped():
                     break
@@ -649,6 +676,12 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                         all_results.append(r)
                     except Exception as e:
                         log.error("Config %d-%s crashed: %s", cid, sm, e)
+                        r = {"error": str(e)}
+                    # O6：无掩码分支用自己的稳定生成顺序分配整数 id（config 外层、sampling 内层）
+                    _publish(candidate_id, [r],
+                             name=r.get("pred_pdb_path"), overlap=r.get("overlap"),
+                             source={"config": cid, "sampling": sm})
+                    candidate_id += 1
                 _drain_tail("ranking")        # 排名与日志都要读结果
                 while logged < len(all_results):
                     done = all_results[logged]
@@ -665,11 +698,24 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
 
         # summary（读结果前必须等尾部完成）
         _drain_tail("summary")
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
         try:
             tail_pipeline.close()
         except Exception as e:
             log.error("尾部流水线关闭失败：%s", e)
+        # O6：结束记录是唯一权威的结束标记；失败必须显式，不能被当成正常结束
+        try:
+            if failure is not None:
+                ledger.finish("error", error="%s: %s" % (type(failure).__name__, failure))
+            elif _stopped():
+                ledger.finish("cancelled")
+            else:
+                ledger.finish("ok")
+        except Exception as e:
+            log.error("候选台账结束记录写入失败：%s", e)
     if tail_pipeline.enabled:
         _record_timing(output_dir, "server_tail_stats", 0.0,
                        submitted=tail_pipeline.submitted, completed=tail_pipeline.completed,
@@ -766,7 +812,8 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                 allow_tf32=resolved_tf32,
                 inference_mode=req.get("inference_mode") or inference_mode,
                 encoding_cache=encoding_cache, hypothesis_chunk=hypothesis_chunk,
-                tail_pipeline_enabled=tail_pipeline)
+                tail_pipeline_enabled=tail_pipeline,
+                request_id=req.get("request_id"))
         except Exception as e:
             log.error("request failed: %s", e)
         finally:

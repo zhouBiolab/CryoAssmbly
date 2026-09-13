@@ -193,12 +193,16 @@ def generate_optimal_pdb_path(original_path, overlap_score, mask_name):
 # ======================================================================
 
 def find_mask_files(temp_dir):
-    """Find mask .txt files in a temp directory."""
+    """Find mask .txt files in a temp directory.
+
+    O6：按名字排序返回 —— 若沿用 `glob` 的目录顺序，候选 id 所依赖的"稳定生成顺序"
+    就没有依据（不得靠变量名推定顺序）。
+    """
     if not os.path.exists(temp_dir):
         return []
     skip = {"all_mask_centers.txt", "masks_report.txt"}
     mask_files = []
-    for f in glob.glob(os.path.join(temp_dir, "*.txt")):
+    for f in sorted(glob.glob(os.path.join(temp_dir, "*.txt"))):
         name = os.path.basename(f)
         if name in skip:
             continue
