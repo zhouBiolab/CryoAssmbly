@@ -31,6 +31,9 @@ DEFAULT_INFERENCE_MODE = "joint"
 # 源编码缓存（T07）：GPU 预算（MiB，0 = 关闭）；只在 split 模式下生效（joint 不做单侧编码）
 DEFAULT_ENCODING_CACHE_MB = 256
 
+# 位姿假设评分分块（T08）：0 = 原整批路径（默认）；>0 时按该大小分块（任务卡建议先测 64）
+DEFAULT_HYPOTHESIS_CHUNK = 0
+
 
 def effective_allow_tf32(inference_mode, allow_tf32=None):
     """解析 TF32 策略：显式值优先；未给定时跟随推理模式。
@@ -78,10 +81,14 @@ class RuntimeConfig:
     allow_tf32: bool = DEFAULT_ALLOW_TF32
     # 源编码缓存 GPU 预算（MiB，T07；0 = 关闭）；joint 模式不使用
     encoding_cache_mb: int = DEFAULT_ENCODING_CACHE_MB
+    # 位姿假设评分分块（T08；0 = 原整批路径，>0 = 按假设分块）
+    hypothesis_chunk: int = DEFAULT_HYPOTHESIS_CHUNK
 
     def __post_init__(self):
-        # 早失败：非法模式或不安全的精度组合在构造配置时就报错
+        # 早失败：非法模式、不安全的精度组合或负的分块在构造配置时就报错
         effective_allow_tf32(self.inference_mode, self.allow_tf32)
+        if int(self.hypothesis_chunk) < 0:
+            raise ValueError("hypothesis_chunk 不能为负：%r" % (self.hypothesis_chunk,))
 
     def tf32(self):
         """实测生效的 TF32 策略（解析 inference_mode 与显式覆盖）。"""

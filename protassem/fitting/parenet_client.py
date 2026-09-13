@@ -22,8 +22,8 @@ import logging
 import subprocess
 
 from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
-                                      DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_INFERENCE_MODE,
-                                      INFERENCE_MODES)
+                                      DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_HYPOTHESIS_CHUNK,
+                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES)
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ _GEOMETRY_CACHE_MB = DEFAULT_GEOMETRY_CACHE_MB
 _INFERENCE_MODE = DEFAULT_INFERENCE_MODE
 _ALLOW_TF32 = DEFAULT_ALLOW_TF32
 _ENCODING_CACHE_MB = DEFAULT_ENCODING_CACHE_MB
+_HYPOTHESIS_CHUNK = DEFAULT_HYPOTHESIS_CHUNK
 
 
 def configure_geometry_cache(geometry_cache_mb):
@@ -87,6 +88,20 @@ def configure_encoding_cache(encoding_cache_mb):
     return _ENCODING_CACHE_MB
 
 
+def configure_hypothesis_chunk(hypothesis_chunk):
+    """设定服务端假设评分分块（T08；0 = 原整批路径；必须在服务启动前调用）。"""
+    global _HYPOTHESIS_CHUNK
+    value = int(hypothesis_chunk)
+    if value < 0:
+        raise ValueError("hypothesis_chunk 不能为负：%r" % (hypothesis_chunk,))
+    if _SERVER is not None and _SERVER.poll() is None and value != _HYPOTHESIS_CHUNK:
+        log.warning("PARENet server already running with hypothesis_chunk=%s; "
+                    "keeping it (new value %s ignored)", _HYPOTHESIS_CHUNK, value)
+        return _HYPOTHESIS_CHUNK
+    _HYPOTHESIS_CHUNK = value
+    return _HYPOTHESIS_CHUNK
+
+
 def configure_inference_mode(inference_mode):
     """设定服务端推理路径（joint/split；必须在第一次请求之前调用）。"""
     global _INFERENCE_MODE
@@ -111,7 +126,8 @@ def get_server():
     command = [sys.executable, DEMO_MASK_PATH, "--server",
                "--geometry-cache-mb", str(_GEOMETRY_CACHE_MB),
                "--encoding-cache-mb", str(_ENCODING_CACHE_MB),
-               "--inference-mode", _INFERENCE_MODE]
+               "--inference-mode", _INFERENCE_MODE,
+               "--hypothesis-chunk", str(_HYPOTHESIS_CHUNK)]
     if _ALLOW_TF32 is True:
         command.append("--allow-tf32")
     elif _ALLOW_TF32 is False:
@@ -121,9 +137,9 @@ def get_server():
         text=True, cwd=DEMO_MASK_CWD)
     atexit.register(shutdown_server)
     log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, encoding_cache_mb=%s, "
-             "inference_mode=%s, allow_tf32=%s, log=%s)",
+             "inference_mode=%s, allow_tf32=%s, hypothesis_chunk=%s, log=%s)",
              _SERVER.pid, _GEOMETRY_CACHE_MB, _ENCODING_CACHE_MB, _INFERENCE_MODE,
-             _ALLOW_TF32, log_path)
+             _ALLOW_TF32, _HYPOTHESIS_CHUNK, log_path)
     return _SERVER
 
 

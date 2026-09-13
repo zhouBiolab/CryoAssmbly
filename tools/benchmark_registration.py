@@ -31,8 +31,8 @@ MANIFEST_VERSION = 1
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_INFERENCE_MODE,
-                                      INFERENCE_MODES)
+from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_HYPOTHESIS_CHUNK,
+                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES)
 
 
 def sha256(path):
@@ -139,13 +139,14 @@ def summarize_predictions(pair_dir):
 
 def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
                  inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32,
-                 encoding_cache_mb=None):
+                 encoding_cache_mb=None, hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
     """按 manifest 重放固定配准（不生成掩码、不跑装配）。
 
     geometry_cache_mb：T05 单侧几何缓存容量（MiB）；0 = 关闭，None = 用运行配置默认值。
     inference_mode  ：T06 推理路径（joint 默认 = 联合布局 + forward；split = 单侧编码 + 双侧配准）。
     allow_tf32      ：TF32 策略；None = 跟随 inference_mode（split 强制关闭）。
     encoding_cache_mb：T07 源编码缓存 GPU 预算（MiB，仅 split 模式）；0 = 关闭。
+    hypothesis_chunk：T08 假设评分分块（0 = 原整批路径）。
     """
     from protassem.fitting.cloud_encoding import EncodingCache, GeometryCache
     from protassem.fitting.demo_mask import _get_model, run_inference
@@ -168,12 +169,14 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
     weights = manifest["dependencies"]["weights_path"]
     if encoding_cache_mb is None:
         encoding_cache_mb = DEFAULT_ENCODING_CACHE_MB
+    # 模型单例：TF32 策略与 T08 假设分块必须在构造模型时给定
+    model, _cfg = _get_model(weights, resolved_tf32, hypothesis_chunk)
     encoding_cache = None
     if inference_mode == "split" and encoding_cache_mb:
-        model, _cfg = _get_model(weights, resolved_tf32)
         encoding_cache = EncodingCache(int(encoding_cache_mb) * 1024 * 1024,
                                        model_fingerprint(model))
         print("encoding cache: %d MiB" % encoding_cache_mb)
+    print("hypothesis_chunk: %d" % int(hypothesis_chunk))
 
     os.makedirs(out_dir, exist_ok=True)
     metrics = Metrics(output_dir=os.path.join(out_dir, "metrics"),
@@ -193,7 +196,8 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
                     weights=weights, use_mask=False,
                     configs=manifest["params"]["configs"], seed=manifest["seed"],
                     geometry_cache=geometry_cache, allow_tf32=resolved_tf32,
-                    inference_mode=inference_mode, encoding_cache=encoding_cache)
+                    inference_mode=inference_mode, encoding_cache=encoding_cache,
+                    hypothesis_chunk=hypothesis_chunk)
             elapsed = time.perf_counter() - started
             pred_files, overlaps = summarize_predictions(pair_dir)
             records.append({
@@ -216,6 +220,7 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
               "geometry_cache_mb": geometry_cache_mb, "geometry_cache": cache_stats,
               "inference_mode": inference_mode, "allow_tf32": resolved_tf32,
               "tf32_policy": policy, "encoding_cache_mb": encoding_cache_mb,
+              "hypothesis_chunk": int(hypothesis_chunk),
               "encoding_cache": encoding_cache.snapshot() if encoding_cache else None,
               "metrics_summary": summary_path}
     with open(os.path.join(out_dir, "t00_report.json"), "w", encoding="utf-8") as handle:
@@ -247,6 +252,8 @@ def main(argv=None):
                      help="关闭 TF32（数值与形状无关；split 必须）")
     run.add_argument("--encoding-cache-mb", type=int, default=None,
                      help="源编码缓存 GPU 预算（MiB，0 = 关闭；仅 split 模式）")
+    run.add_argument("--hypothesis-chunk", type=int, default=DEFAULT_HYPOTHESIS_CHUNK,
+                     help="位姿假设评分分块大小（T08；0 = 原整批路径）")
 
     args = parser.parse_args(argv)
     if args.command == "manifest":
@@ -269,7 +276,8 @@ def main(argv=None):
                           geometry_cache_mb=args.geometry_cache_mb,
                           inference_mode=args.inference_mode,
                           allow_tf32=args.allow_tf32,
-                          encoding_cache_mb=args.encoding_cache_mb)
+                          encoding_cache_mb=args.encoding_cache_mb,
+                          hypothesis_chunk=args.hypothesis_chunk)
     print("report written: %s" % os.path.join(args.out_dir, "t00_report.json"))
     print("geometry cache: %s" % (report["geometry_cache"] or "关闭"))
     print("encoding cache: %s" % (report["encoding_cache"] or "关闭/不适用"))

@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-13 **v4.7**（T00–T07 完成；取代 v2.1–v4.6/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-13 **v4.8**（T00–T08 完成；取代 v2.1–v4.7/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -43,6 +43,15 @@
 ---
 
 ## 修订记录
+
+### v4.7 → v4.8（T08 位姿假设评分分块）
+
+| # | 位置 | v4.7 的状态 | v4.8 的结论 |
+|---|---|---|---|
+| 72 | 任务卡 T08 | 待实施 | **已完成**：热点 = LGR/HypothesisProposer 的两处整批假设评分；**不修改共享 pareconv**，用子类覆盖单个方法 + `select_best_hypothesis()` 分块；**chunk=64 与 chunk=0 的 72/72 预测哈希逐位一致**，峰值 `max_allocated` 1194 → **1008 MiB（−15.6%）**、`max_reserved` −31%，墙钟 −3…−7%；报告 `tests/reports/2026-09-13_t08_hypothesis_chunking.md` |
+| 73 | 默认配置 | `hypothesis_chunk` 无此配置 | 新增 `RuntimeConfig.hypothesis_chunk`，**默认 0（原路径，任务卡要求）**；64 作为已验证可选配置（`--hypothesis-chunk 64`），是否提升默认由 T10 复测决定 |
+| 74 | 新事实：分块大小必须逐位验证 | T06 只证明"TF32 依赖张量形状" | **chunk=1 结果会变**（24/72 哈希一致、target 0/2 的 overlap 改变）且慢 63%：1 元素批次的 `apply_transform` 在 TF32 下走不同内核；关闭 TF32 时 chunk=1 与整批逐位一致（单测）。即"块越小越安全"不成立 |
+| 75 | 上游包装纪律 | T06 起保留 `forward` 对照 | 本卡的子类复制了上游两个方法体（逐行一致，唯一差别是分块调用）；上游改动必须同步并重跑 `tests/test_hypothesis_chunking.py`（该测试直接比较分块与整批输出） |
 
 ### v4.6 → v4.7（T07 精确 scale 源编码缓存）
 

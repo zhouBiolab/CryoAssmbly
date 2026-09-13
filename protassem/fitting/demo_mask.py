@@ -37,9 +37,9 @@ from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
                                               EncodingCache, GeometryCache)
 from protassem.fitting.parenet.model import model_fingerprint
 from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
-                                      DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_INFERENCE_MODE,
-                                      INFERENCE_MODES, apply_tf32_policy,
-                                      effective_allow_tf32)
+                                      DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_HYPOTHESIS_CHUNK,
+                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES,
+                                      apply_tf32_policy, effective_allow_tf32)
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -434,6 +434,9 @@ def make_parser():
     p.add_argument("--geometry-cache-mb", type=int, default=DEFAULT_GEOMETRY_CACHE_MB,
                    help="单侧几何 CPU 缓存容量（MiB，0 = 关闭；默认 %d）"
                         % DEFAULT_GEOMETRY_CACHE_MB)
+    p.add_argument("--hypothesis-chunk", type=int, default=DEFAULT_HYPOTHESIS_CHUNK,
+                   help="位姿假设评分分块大小（T08；0 = 原整批路径，默认 %d）"
+                        % DEFAULT_HYPOTHESIS_CHUNK)
     p.add_argument("--encoding-cache-mb", type=int, default=DEFAULT_ENCODING_CACHE_MB,
                    help="源编码缓存 GPU 预算（MiB，0 = 关闭；仅 split 模式；默认 %d）"
                         % DEFAULT_ENCODING_CACHE_MB)
@@ -457,21 +460,22 @@ _MODEL = None
 _CFG = None
 
 
-def _get_model(weights, allow_tf32):
+def _get_model(weights, allow_tf32, hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
     """Load the PARENet model once and cache it (model, cfg).
 
-    TF32 策略在**加载时**设定（早于任何前向）；取值由调用方按 inference_mode 解析
-    （见 `runtime/config.effective_allow_tf32`），本函数只负责应用。
+    TF32 策略与 T08 假设分块都在**构造模型之前**设定（早于任何前向）；
+    取值由调用方按 RuntimeConfig 解析，本函数只负责应用。
     """
     global _MODEL, _CFG
     if _MODEL is None:
         policy = apply_tf32_policy(allow_tf32)
         _CFG = make_cfg()
-        _MODEL = create_model(_CFG).cuda()
+        _MODEL = create_model(_CFG, hypothesis_chunk=int(hypothesis_chunk)).cuda()
         state = torch.load(weights)
         _MODEL.load_state_dict(state["model"])
         _MODEL.eval()
-        log.info("Model loaded (cached); TF32 policy: %s", policy)
+        log.info("Model loaded (cached); TF32 policy: %s; hypothesis_chunk=%d",
+                 policy, int(hypothesis_chunk))
     return _MODEL, _CFG
 
 
@@ -484,7 +488,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                   mask_radius_factor=1.35, min_coverage=0.15,
                   min_point_distance_factor=0.32, stop_file=None,
                   geometry_cache=None, allow_tf32=DEFAULT_ALLOW_TF32,
-                  inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None):
+                  inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None,
+                  hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
     """Run PARENet inference for one source/target pair.
 
     Algorithm identical to the original main(); only parameterized so the model
@@ -495,6 +500,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     allow_tf32    ：TF32 策略（None = 跟随 inference_mode；由调用方解析）。
     inference_mode："joint"（联合布局 + forward，默认）或 "split"（单侧编码 + 双侧配准）。
     encoding_cache：T07 源编码缓存（None = 关闭；仅 split 模式使用）。
+    hypothesis_chunk：T08 假设评分分块（0 = 原路径；模型构造前应用，需在首次加载时给出）。
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -504,7 +510,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         log.error("Mask mode requested but sw_mask not available")
         return
 
-    model_net, cfg = _get_model(weights, effective_allow_tf32(inference_mode, allow_tf32))
+    model_net, cfg = _get_model(weights, effective_allow_tf32(inference_mode, allow_tf32),
+                                hypothesis_chunk)
     os.makedirs(output_dir, exist_ok=True)
 
     CONFIGS = VOXEL_SIZE_CONFIGS_MASK if use_mask else VOXEL_SIZE_CONFIGS_NORMAL
@@ -644,7 +651,8 @@ def _record_timing(output_dir, stage, elapsed_s, **fields):
 
 def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                  inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32,
-                 encoding_cache_mb=DEFAULT_ENCODING_CACHE_MB):
+                 encoding_cache_mb=DEFAULT_ENCODING_CACHE_MB,
+                 hypothesis_chunk=DEFAULT_HYPOTHESIS_CHUNK):
     """Read one JSON request per stdin line; signal completion via _DONE file.
 
     Request keys: target, source, chain_pdb, output_dir, use_mask, configs,
@@ -658,7 +666,7 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
     T07：源编码缓存（GPU，仅 split 模式）同样由本进程拥有、跨请求复用。
     """
     resolved_tf32 = effective_allow_tf32(inference_mode, allow_tf32)
-    model, _cfg = _get_model(weights, resolved_tf32)  # preload once
+    model, _cfg = _get_model(weights, resolved_tf32, hypothesis_chunk)  # preload once
     geometry_cache = GeometryCache(int(geometry_cache_mb) * 1024 * 1024) \
         if geometry_cache_mb else None
     encoding_cache = None
@@ -668,9 +676,9 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
         log.info("Encoding cache enabled: %d MiB, model fingerprint %s…",
                  encoding_cache_mb, fingerprint[:12])
     log.info("PARENet server ready (pid=%d, geometry_cache_mb=%s, inference_mode=%s, "
-             "allow_tf32=%s, encoding_cache_mb=%s)",
+             "allow_tf32=%s, encoding_cache_mb=%s, hypothesis_chunk=%d)",
              os.getpid(), geometry_cache_mb, inference_mode, resolved_tf32,
-             encoding_cache_mb if encoding_cache is not None else 0)
+             encoding_cache_mb if encoding_cache is not None else 0, int(hypothesis_chunk))
     _last_request_end = time.perf_counter()
     for line in sys.stdin:
         line = line.strip()
@@ -700,7 +708,7 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                 stop_file=stop_file, geometry_cache=geometry_cache,
                 allow_tf32=resolved_tf32,
                 inference_mode=req.get("inference_mode") or inference_mode,
-                encoding_cache=encoding_cache)
+                encoding_cache=encoding_cache, hypothesis_chunk=hypothesis_chunk)
         except Exception as e:
             log.error("request failed: %s", e)
         finally:
@@ -726,7 +734,7 @@ def main():
 
     if args.server:
         _server_loop(args.weights, args.geometry_cache_mb, args.inference_mode,
-                     args.allow_tf32, args.encoding_cache_mb)
+                     args.allow_tf32, args.encoding_cache_mb, args.hypothesis_chunk)
         return
 
     # single-run CLI (backward compatible)
@@ -739,7 +747,7 @@ def main():
     encoding_cache = None
     if args.inference_mode == "split" and args.encoding_cache_mb:
         resolved_tf32 = effective_allow_tf32(args.inference_mode, args.allow_tf32)
-        model_net, _cfg = _get_model(args.weights, resolved_tf32)
+        model_net, _cfg = _get_model(args.weights, resolved_tf32, args.hypothesis_chunk)
         encoding_cache = EncodingCache(args.encoding_cache_mb * 1024 * 1024,
                                        model_fingerprint(model_net))
     run_inference(
@@ -749,7 +757,8 @@ def main():
         mask_radius_factor=args.mask_radius_factor, min_coverage=args.min_coverage,
         min_point_distance_factor=args.min_point_distance_factor,
         geometry_cache=geometry_cache, allow_tf32=args.allow_tf32,
-        inference_mode=args.inference_mode, encoding_cache=encoding_cache)
+        inference_mode=args.inference_mode, encoding_cache=encoding_cache,
+        hypothesis_chunk=args.hypothesis_chunk)
 
 
 if __name__ == "__main__":

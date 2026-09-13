@@ -19,6 +19,7 @@ from pareconv.modules.geotransformer import (
 
 from pareconv.modules.registration import HypothesisProposer, combineRegisraition
 
+from protassem.fitting.chunked_registration import build_registration
 from protassem.fitting.parenet.backbone import PAREConvFPN
 from protassem.fitting.cloud_encoding import backbone_input, node_partition
 from protassem.runtime.cuda_timing import CudaStageRecorder, cuda_stage
@@ -93,8 +94,11 @@ def SM(corr, src_keypts, tgt_keypts, inlier_threshold=0.1, top_ratio=0.85):
     # pred_trans = rigid_transform_3d(src_keypts, tgt_keypts, leading_eig * pred_labels)
     return pred_labels
 class PARE_Net(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, hypothesis_chunk=0):
         super(PARE_Net, self).__init__()
+        # T08：假设评分分块大小（0 = 原整批路径）。显式传参而非改 cfg ——
+        # `make_cfg()` 返回模块级单例，改它会污染同进程内的其他模型。
+        self.hypothesis_chunk = int(hypothesis_chunk)
         self.num_points_in_patch = cfg.model.num_points_in_patch
         self.matching_radius = cfg.model.ground_truth_matching_radius
 
@@ -143,7 +147,9 @@ class PARE_Net(nn.Module):
         #self.proj1 = nn.Linear(cfg.backbone.output_dim // 3 * 3, cfg.backbone.output_dim // 3 * 3, True)
 
         
-        self.combienrefistration=combineRegisraition(
+        # T08：hypothesis_chunk > 0 时用分块版替换 LGR/HP 的假设评分（0 = 原路径）
+        self.combienrefistration=build_registration(
+        hypothesis_chunk=self.hypothesis_chunk,
         # LocalGlobalRegistration 参数 (第一阶段)
         lgr_k=cfg.fine_matching_geo.topk,
         lgr_acceptance_radius=cfg.fine_matching_geo.acceptance_radius,
@@ -715,8 +721,8 @@ class PARE_Net(nn.Module):
         return select_output_fields(output_dict, output_fields)
 
 
-def create_model(config):
-    model = PARE_Net(config)
+def create_model(config, hypothesis_chunk=0):
+    model = PARE_Net(config, hypothesis_chunk=hypothesis_chunk)
     return model
 
 
