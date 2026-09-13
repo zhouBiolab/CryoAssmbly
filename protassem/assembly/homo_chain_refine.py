@@ -30,7 +30,7 @@ from Bio.PDB import (MMCIFParser, PDBParser, PDBIO, MMCIFIO, Select,
                      Structure, Model, Chain)
 
 from protassem.core.scoring import calculate_cc_mask
-from protassem.core.similarity import calculate_seqid
+from protassem.core.similarity import usalign_pair
 from protassem.fitting.local_optimizer import local_optimize
 from protassem.assembly.refine.tr_rmsd import calculate_and_align_with_sequence
 
@@ -131,7 +131,8 @@ def _count_breaks(chain_pdb, ranges, workdir, loose_max=10.0):
 # 并行：Seq_ID 分组 / cc_mask
 # ----------------------------------------------------------------------
 def _seqid_worker(a):
-    return calculate_seqid(a[0], a[1], USALIGN)
+    """worker：只跑 USalign（P5 规定 SQLite 由父进程查询/写入，worker 不碰库）。"""
+    return usalign_pair(a[0], a[1], USALIGN)[1]
 
 
 def homolog_groups(chains, seqid_thr=0.9, nproc=8):

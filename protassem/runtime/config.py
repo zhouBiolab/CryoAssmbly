@@ -63,6 +63,10 @@ def effective_allow_tf32(inference_mode, allow_tf32=None):
 DEFAULT_SCORE_CACHE_MB = 128
 SCORE_CACHE_ENV = "PROTASSEM_SCORE_CACHE_MB"
 
+# TM 缓存（SQLite，老卡收口 P5）："auto" = $XDG_CACHE_HOME/protassem/tm.sqlite3
+# （未设置该变量时用 ~/.cache/protassem/tm.sqlite3）；"off" = 关闭；其他非空字符串 = 显式路径。
+DEFAULT_TM_CACHE = "auto"
+
 
 def apply_seed(seed):
     """在**父进程**里固定随机源（老卡收口 / O6 复查项）。
@@ -114,6 +118,8 @@ class RuntimeConfig:
     tail_pipeline: bool = DEFAULT_TAIL_PIPELINE
     # 评分缓存预算（MiB，老卡收口 P4；密度上下文与结构坐标共享，0 = 关闭）
     score_cache_mb: int = DEFAULT_SCORE_CACHE_MB
+    # TM 缓存（老卡收口 P5）："auto" / "off" / 显式 SQLite 路径
+    tm_cache: str = DEFAULT_TM_CACHE
 
     def __post_init__(self):
         # 早失败：非法模式、不安全的精度组合或负的分块在构造配置时就报错
@@ -122,6 +128,9 @@ class RuntimeConfig:
             raise ValueError("hypothesis_chunk 不能为负：%r" % (self.hypothesis_chunk,))
         if int(self.score_cache_mb) < 0:
             raise ValueError("score_cache_mb 不能为负：%r" % (self.score_cache_mb,))
+        if not isinstance(self.tm_cache, str) or not self.tm_cache.strip():
+            raise ValueError("tm_cache 必须是非空字符串（auto/off/路径）：%r"
+                             % (self.tm_cache,))
 
     def tf32(self):
         """实测生效的 TF32 策略（解析 inference_mode 与显式覆盖）。"""

@@ -110,13 +110,13 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     if runtime_config is not None:
         log.info("Runtime config: blas_threads=%d seed=%d geometry_cache_mb=%d "
                  "encoding_cache_mb=%d inference_mode=%s allow_tf32=%s(生效 %s) "
-                 "hypothesis_chunk=%d tail_pipeline=%s score_cache_mb=%d",
+                 "hypothesis_chunk=%d tail_pipeline=%s score_cache_mb=%d tm_cache=%s",
                  runtime_config.blas_threads, runtime_config.seed,
                  runtime_config.geometry_cache_mb, runtime_config.encoding_cache_mb,
                  runtime_config.inference_mode,
                  runtime_config.allow_tf32, runtime_config.tf32(),
                  runtime_config.hypothesis_chunk, runtime_config.tail_pipeline,
-                 runtime_config.score_cache_mb)
+                 runtime_config.score_cache_mb, runtime_config.tm_cache)
         log.info("Effective threads: %s",
                  runtime_config.describe_effective_threads())
         # T05–T09：缓存容量、推理路径、TF32 策略、假设分块与尾部流水线透传给 PARENet 常驻服务进程
@@ -138,6 +138,9 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         # 老卡收口 P4：评分缓存预算（密度上下文 + 结构坐标；worker 通过环境变量继承）
         from protassem.core.scoring import apply_score_cache
         log.info("Score cache: %s", apply_score_cache(runtime_config.score_cache_mb))
+        # 老卡收口 P5：TM 缓存（SQLite；父进程查询/写入，worker 只跑 USalign）
+        from protassem.core.similarity import configure_tm_cache
+        log.info("TM cache: %s", configure_tm_cache(runtime_config.tm_cache))
 
     metrics = Metrics(os.path.join(output_dir, "metrics"))
     pipeline_started = time.perf_counter()
@@ -327,6 +330,20 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         log.info("Score cache (parent side): %s", snapshot)
     except Exception as exc:
         log.warning("Score cache snapshot failed: %s", exc)
+    # 老卡收口 P5：TM 缓存统计（父进程查询/写入；worker 只跑 USalign，不写库）
+    try:
+        from protassem.core.similarity import tm_cache_snapshot
+        tm_snapshot = tm_cache_snapshot()
+        metrics.record("tm_cache", 0.0,
+                       mode=tm_snapshot.get("tm_cache_mode"),
+                       hits=tm_snapshot.get("hits"),
+                       misses=tm_snapshot.get("misses"),
+                       writes=tm_snapshot.get("writes"),
+                       rows=tm_snapshot.get("rows"),
+                       memory_entries=tm_snapshot.get("memory_entries"))
+        log.info("TM cache (parent side): %s", tm_snapshot)
+    except Exception as exc:
+        log.warning("TM cache snapshot failed: %s", exc)
     summary_path = metrics.write_summary()
     log.info("Performance summary: %s", summary_path)
 
