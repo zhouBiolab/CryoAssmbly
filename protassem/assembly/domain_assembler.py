@@ -12,6 +12,12 @@ from protassem.core.structure import pdb_to_cif
 log = logging.getLogger(__name__)
 
 
+def chain_map_of(orch, chain_id):
+    """取该组件的占位链号 -> 真链号映射（原始 chain_records 是唯一来源）。"""
+    record = orch.chain_record(chain_id)
+    return (record.get("chain_map") or {}) if record else {}
+
+
 def assemble_domain_chains(orch):
     """Assemble each failed chain's accepted domains into chain CIFs.
 
@@ -40,8 +46,10 @@ def assemble_domain_chains(orch):
             _handle_single_domain(orch, cid, chain_rec, fitted[0])
             continue
 
+        is_complex = chain_rec.get("is_complex", False)
         ranges, _ = orch.domain_adjacency.get(cid, ({}, {}))
-        assembled_cif = merge_domains(orch, cid, fitted, ranges)
+        assembled_cif = merge_domains(orch, cid, fitted, ranges,
+                                      is_complex=is_complex)
         if not assembled_cif:
             log.info("Chain %s: domain merge failed; chain dropped", cid)
             continue
@@ -51,7 +59,8 @@ def assemble_domain_chains(orch):
         log.info("Chain %s: assembled from %d domains (cc=%.4f)",
                  cid, len(fitted), domain_cc)
         filtered_cif = _filtered_domain_cif(orch, cid, fitted, ranges,
-                                            assembled_cif)
+                                            assembled_cif,
+                                            is_complex=is_complex)
         _save_domain_chain(orch, cid, assembled_cif, domain_cc, fitted,
                            filtered_cif)
 
@@ -77,6 +86,7 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
         model_obj = Model.Model(0)
 
         if is_complex:
+            chain_map = chain_map_of(orch, chain_id)
             chains_map = {}
             serial = 1
             for seg in segments:
@@ -85,7 +95,9 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
                     continue
                 src_cid = seg["drec"].get("source_chain_id", chain_id)
                 if src_cid not in chains_map:
-                    chains_map[src_cid] = Chain.Chain(src_cid)
+                    # 源链号在 CIF 输入时是占位空间（A/B），写出前映射回真链号（Q/R）；
+                    # chain_map 的键只含占位链号，真链号原样通过，不会二次映射。
+                    chains_map[src_cid] = Chain.Chain(chain_map.get(src_cid, src_cid))
                 chain_obj = chains_map[src_cid]
                 parser = MMCIFParser(QUIET=True)
                 ds = parser.get_structure("d", cif)
@@ -135,7 +147,8 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
         return None
 
 
-def _filtered_domain_cif(orch, chain_id, fitted_domains, ranges, full_cif):
+def _filtered_domain_cif(orch, chain_id, fitted_domains, ranges, full_cif,
+                         is_complex=False):
     """过滤版域链 CIF：仅保留 cc_mask >= complex_min_cc 的域。
 
     返回：
@@ -150,7 +163,8 @@ def _filtered_domain_cif(orch, chain_id, fitted_domains, ranges, full_cif):
     if not kept:
         return None
     out = str(orch.work_dir / ("assembled_%s_filtered.cif" % chain_id))
-    return merge_domains(orch, chain_id, kept, ranges, out_cif=out)
+    return merge_domains(orch, chain_id, kept, ranges, out_cif=out,
+                         is_complex=is_complex)
 
 
 def _handle_single_domain(orch, chain_id, chain_rec, domain_rec):

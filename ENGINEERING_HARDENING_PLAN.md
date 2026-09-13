@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-12 **v2.5**（实施期间同步；取代 v2.1–v2.4/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-13 **v2.6**（实施期间同步；取代 v2.1–v2.5/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -43,6 +43,14 @@
 ---
 
 ## 修订记录
+
+### v2.5 → v2.6（R1：域链合并丢链修复）
+
+| # | 位置 | v2.5 的状态 | v2.6 的处理 |
+|---|---|---|---|
+| 25 | §1.2 同源问题 | 未记录域链合并丢链 | 新增 F：复合物多链域合并必然失败 → **已修复**（补 `is_complex` + 链号恢复），4 项定向测试 + 同配置真实运行验证 |
+| 26 | §1.3 / O5 | S4b 残留分支待查可达性 | **不可达**：`_backfill_chains_as_domains` 只处理 `type=="chain"`；真正消费位置是 `assemble_domain_chains`，已在 R1 中修复并验证真链号恢复 |
+| 27 | §1.6 V3 | 部分销项 | 维持"引入点为中间产物"，并把可达消费者路径的结论写入 R1 报告 |
 
 ### v2.4 → v2.5（S4b 定向探针）
 
@@ -124,6 +132,7 @@
 | C | 库函数里 `sys.exit(1)` | `domain_pdb_txt.py:107,110,113,148,159` | S3：改抛异常，`__main__` 统一转退出码 |
 | D | 无 `tests/`；README 的 `example2` 不在仓库 | `ls tests` 不存在；`find /xiangyux -name example2` 无 | S7：新建 `tests/`；README 改写为 `<case_dir>` |
 | E | vendored 第三方与自研代码同包（`pareconv_src`、`refine/`） | 目录结构 | 不搬迁，只在文档标明边界 |
+| F | **复合物多链的域链合并必然失败并被静默丢链**：`assemble_domain_chains` 未传 `is_complex`，两条链的域（残基号各自从 1 起）并进同一条链 → 残基 ID 重复 → 整链丢弃 → 空复合物 | S4b probe3 日志 `merge_domains error: (' ', 1, ' ') defined twice` + `chain dropped`；`domain_assembler.py:44` 调用缺参 | **已修复（R1）**：补传 `is_complex` + `chain_map` 恢复真链号；见 `tests/reports/2026-09-13_r1_complex_domain_assembly_fix.md` |
 
 ### 1.3 链号空间审计（v2 新增，**S4 的核心**）
 

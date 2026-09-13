@@ -84,7 +84,8 @@ def make_mrc(path, shape=(8, 8, 8), voxel_size=2.0, origin=(1.0, 2.0, 3.0),
     return path
 
 
-def make_chain_structure(path, chains, residues=10, rise=3.8):
+def make_chain_structure(path, chains, residues=10, rise=3.8,
+                         residue_start=1):
     """Write a CA-only structure file and return its path.
 
     Args:
@@ -93,6 +94,7 @@ def make_chain_structure(path, chains, residues=10, rise=3.8):
             residues numbered 1..residues, spaced ``rise`` angstroms along x
         residues: residues per chain
         rise: distance between consecutive CA atoms in angstroms
+        residue_start: first residue number (default 1)
     """
     from Bio.PDB import MMCIFIO, PDBIO, StructureBuilder
 
@@ -103,7 +105,7 @@ def make_chain_structure(path, chains, residues=10, rise=3.8):
         builder.init_chain(chain_id)
         builder.init_seg(" ")
         for i in range(residues):
-            builder.init_residue("ALA", " ", i + 1, " ")
+            builder.init_residue("ALA", " ", residue_start + i, " ")
             coord = (i * rise + offset[0], offset[1], offset[2])
             builder.init_atom("CA", coord, 1.0, 0.0, " ", "CA", element="C")
     structure = builder.get_structure()
