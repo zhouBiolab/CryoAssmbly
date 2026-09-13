@@ -142,3 +142,15 @@ GPU：A800 **MIG 7g.80gb 切片**。
    原因是本卡在拼装后仍**同时持有**单侧几何张量与联合张量（拼装是拷贝），分配器的缓存块集合更碎；
    真实输入更大所以被放大。**真实占用（`allocated`）稳定在 ~10–30 MiB 且不增长**，不构成泄漏或
    容量风险；几何对象的生存期归 T05（几何缓存）设计，届时一并决定何时释放单侧张量。
+
+## 七、复现路径（`/xiangyux/claude_c_work/demo_reg_cases/`，不进仓库）
+
+| 产物 | 说明 |
+|---|---|
+| `t04_check_manifest.txt` | 真实输入的独立 vs 联合逐阶段按位比较（`tools/check_geometry_split.py --manifest`） |
+| `t04_check_synthetic.txt` | 三组合成输入（300×120 / 2048×96 / 96×2048）比较输出 |
+| `t04_bench` / `t04_bench2` | T04 微基准（改动前后各一次，用于证明注释/校验重构不改结果） |
+| `t04_compare.md` | T03 → T04 的微基准对比（一致性/墙钟/阶段/显存） |
+| `t04_bench_vs_bench2.md` | 改动前后微基准对比（72/72 哈希一致） |
+| `out_t04` / `t04_result.txt` / `t04_e2e_run.sh` | 端到端产物、日志与时间账、运行脚本 |
+| `04_probe_split.py`（前缀 `t04_probe_split.py`） | 立项前的可行性探针（单侧 grid_subsample/kNN 与联合切片按位一致） |
