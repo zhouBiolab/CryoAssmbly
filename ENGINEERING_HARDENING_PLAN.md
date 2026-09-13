@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-13 **v2.7**（实施期间同步；取代 v2.1–v2.6/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-13 **v2.8**（实施期间同步；取代 v2.1–v2.7/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -43,6 +43,13 @@
 ---
 
 ## 修订记录
+
+### v2.7 → v2.8（O5 收口）
+
+| # | 位置 | v2.7 的状态 | v2.8 的结论 |
+|---|---|---|---|
+| 30 | 附录 C O5 | 残留分支待查可达性 | **不可达**：`refine_step._backfill_chains_as_domains` 跳过 `type != "chain"`，复合物为 `type="complex"`；真正消费位置已在 R1 修复并真实验证 |
+| 31 | §1.6 V3 | 部分销项 | **已销项**：引入点为中间产物，可达的最终输出路径均恢复真链号 |
 
 ### v2.6 → v2.7（O4 空结果输出契约）
 
@@ -228,7 +235,7 @@
 |---|---|---|---|
 | V1 | 采样 TXT 头部第 1 行的轴序是 `nz ny nx` 还是 `nx ny nz`（v1 的写法是**推断**） | 用 6×8×10 非立方网格跑 `Sample`，读第 1 行 | S3 前置 |
 | V2 | 数字占位链号是否真的破坏下游 | **部分销项**：`read_structure`/`calculate_cc_mask`/USalign 实测通过（`tests/test_chain_ids.py`）；DomainParser/domain split 未覆盖，容量保留 62 | S5 |
-| V3 | S4b 传播链中哪个出口泄漏占位链号 | **已部分销项**：引入点为 `chain_improve` 域 CIF；`final_results` 三路径均未见泄漏；残留分支见 O5 | S4b |
+| V3 | S4b 传播链中哪个出口泄漏占位链号 | **已销项**：引入点是 `work/chain_improve_*` 中间产物；可达的最终输出路径（整链接受 / 域链组装）均恢复真链号，R1 修复后由真实运行验证 | S4b/R1 |
 | V4 | `test/1` 完整流水线耗时与基线结果 | **已销项**：基线 967 s、新版 956 s，输出逐字节一致 | S7 |
 | V5 | 复合物域优化分支（`--complex-domain-opt`）在默认参数下的触发条件与耗时 | 显式加该参数运行 | S7 |
 
@@ -699,4 +706,4 @@ ssh my-server 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate 
 | O2 | 5kem 是否纳入阶段一（当前定为 S4a/S5 后各一次） | 同上 |
 | O3 | 阶段二启动时间与 P1–P11 的取舍 | 阶段一验收后 |
 | O4 | 无组件被接受时的空结果输出契约 | **已修复（R2）**：不写空 CIF、清理旧产物、返回 `None`、摘要状态字段、Step4 门控；6 项测试 + 真实集成验证 |
-| O5 | S4b 残留分支：链被接受且记录 `domain_cifs` + 域拟合 + 同源 Step4 三者同时成立时的链号出口 | 阶段二或专门复现 |
+| O5 | S4b 残留分支（refine backfill 的链号出口） | **已收口**：`refine_step._backfill_chains_as_domains` 只处理 `type == "chain"`，而复合物记录是 `type="complex"` → 该路径**对复合物不可达**；真正消费复合物域产物的位置是 `assemble_domain_chains` → `merge_domains(is_complex=True)` → `_save_domain_chain` → `build_complex`，已在 R1 修复（补 `is_complex` + `chain_map` 恢复真链号）并用真实运行验证（链号 `Q`,`R`） |
