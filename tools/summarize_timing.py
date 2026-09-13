@@ -19,7 +19,7 @@ import json
 import os
 
 CLIENT_SUBSTAGES = ("gpu_wait", "cc_batch", "cc_candidate_initial", "cc_verify",
-                    "local_optimize", "candidate_scan", "final_select", "save_result",
+                    "local_optimize", "candidate_stream", "final_select", "save_result",
                     "analyze_sources")
 SERVER_STAGES = ("server_queue_wait", "server_request_total", "server_preprocess",
                  "server_masks", "server_mask_preprocess", "server_to_gpu",

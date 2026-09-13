@@ -295,9 +295,10 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         request_finished=lambda: proc.poll() is not None,
         on_cancel=lambda: _kill(proc))
 
-    _scan_started = time.perf_counter()
+    _stream_started = time.perf_counter()
     outcome = consumer.run()
-    _METRICS.record("candidate_scan", time.perf_counter() - _scan_started,
+    # O6：这里记录的是**整个候选流消费时长**（旧实现的 candidate_scan 只表示 glob 轮询耗时）
+    _METRICS.record("candidate_stream", time.perf_counter() - _stream_started,
                     task_id=task_id)
     _METRICS.record("gpu_wait", outcome["waited_s"], task_id=task_id)
     if outcome["skipped"]:

@@ -1,0 +1,9 @@
+# O6（候选消费确定性）之后的冻结基线
+# 结论：O6 修复**未改变默认路径的产物** —— 与 baseline_after_t01_fix.md5 逐位相同。
+# 验证：分支 feat/old-card-closeout，提交 592d617，test/1（10 worker，1 BLAS 线程）连续两次运行
+#       （out_o6_a / out_o6_b）三个 CIF md5 一致、候选台账一致（24/28/115 个候选、id 连续、end=ok）、
+#       候选消费序列 sha1 一致（de02d03105ebff9f）；--num-processes 1 与 tail_pipeline=true 见报告。
+# 说明：assembly_summary.txt 含时间戳与绝对路径，逐次运行必然不同，只作参考、不作判据。
+76638d0f97d4ee5775110c66b15e73c6  assembled_complex.cif
+76638d0f97d4ee5775110c66b15e73c6  assembled_complex_all.cif
+bd281f40e25352455ba34d41e6bbc9f7  refined_complex.cif
