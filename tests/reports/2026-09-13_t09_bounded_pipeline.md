@@ -130,3 +130,22 @@ waited, stage=stage)` 的字段名 `stage` 与 `_record_timing(output_dir, stage
 | `t09_ab_result.txt` / `run_t09_ab.sh` | 微基准 + 端到端 A/B 的原始输出与脚本 |
 | `t09_bench_result.txt` / `run_t09_bench.sh` / `t09b_off1|on1|off2|on2` | 微基准四轮 A/B 的原始输出与产物（每轮 3 目标 × 12 预测） |
 | `out_t09_off` / `out_t09_on` / `rt_t09_off.json` / `rt_t09_on.json` | 端到端 A/B 产物与运行配置 |
+| T10 的复测产物 | 见 `tests/reports/2026-09-13_t10_full_regression.md` 第六节 |
+
+## 九、补遗（T10 复测修正，2026-09-13 21:20）
+
+> 本节由 T10（完整回归与交付）追加，**修正第五节与第七节第 4 条的判定依据**，原文保留不改。
+
+1. 第五节的"on 轮三个 CIF md5 与冻结基线完全一致"是**单次观测**，**不可复现**：
+   T10 又跑了 2 次同配置 on（`out_t10_on`、`out_t10_on2`），两次都给出**另一个产物**
+   （`assembled_complex.cif` `51009d69…`、`refined_complex.cif` `1ca5f6f9…`，CC 0.4189/0.4230/0.4431），
+   彼此逐位一致；而 off 路径在此期间的第 2 次运行仍复现冻结基线（`76638d0f…`）。
+2. 根因不在尾部流水线的计算：链 A 的 24 个 `registration/pred_*.pdb` 在 off/on 两次运行里
+   **逐位相同**（模型层等价成立）。差异出现在**客户端候选消费顺序**——候选按"文件出现时机"
+   成批评估（`fitting/pipeline.py`：`sorted(glob('pred_*.pdb'))` 取差集、`>= batch_size(10)` 评估一批、
+   每轮 `sleep(2.5)`）：`pred_chain_A_ed_points_0.301508.pdb` 在 off 是候选 `#8`、在 on 是 `#11`。
+   尾部流水线把写盘挪到后台线程，正好移动了这个批次边界。
+3. 速度结论不变且更稳：on 三次墙钟 994 / 1006 / 993 s，off 两次 1092 / 1083 s（−8.4% … −9.1%）。
+4. 因此 `tail_pipeline` 维持**默认关闭**；T10 报告的第三节给出完整证据链。
+5. 第四节"微基准 on 慢 9.5%"同样**不成立为结论**：T10 交叉复测里 on 反而快 3.2%，而组内两轮
+   之差可达 2.5 s → 微基准只能判等价与显存，判收益要用真实运行。
