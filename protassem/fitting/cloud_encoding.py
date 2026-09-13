@@ -1,0 +1,285 @@
+"""单侧点云几何：源与目标各自独立构建多尺度点、邻居与上下采样索引（任务卡 T04）。
+
+设计要点
+--------
+1. `CloudGeometry` 只保存**单侧局部索引**；跨侧拼接由 `join_geometries()` 适配层加偏移完成，
+   从而保持旧联合入口（pareconv `registration_collate_fn_stack_mode` + `precompute_neibors`）
+   的语义与逐位结果不变。
+2. 多尺度配置（各级体素尺寸、最后一层采样方式）**显式传参**，不再依赖 pareconv 的模块级
+   全局变量；调用方（`demo_mask`）把当前真正生效的值读出来传入并记录。
+3. pointops 的 k-NN 在邻居不足时用 0 填充尾部槽位（哨兵）。只有 `source_count >= k` 时才
+   保证没有哨兵；出现哨兵时保持 0、**不加偏移**（见 `offset_indices`），否则会指向另一侧的
+   真实点。
+4. `upsampling` 按 **stage 对齐**（stage 0 为 None）；pareconv 的紧凑列表约定（元素 j 对应
+   stage j+1）由适配层负责还原，避免"不同尺度偏移错"。
+
+一行一个操作、参数显式传递、不新增隐式全局状态。
+"""
+
+import hashlib
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+from pareconv.extensions.pointops.functions import pointops
+from pareconv.modules.ops import grid_subsample, point_to_node_partition
+from pareconv.utils.data_mask import farthest_point_sampling_gpu
+
+# 单侧几何结构版本：任何影响 points/neighbors/索引语义的改动都必须 +1（缓存 key 的一部分）
+GEOMETRY_VERSION = 1
+FPS_TARGET_RATIO = 0.25     # 与 pareconv precompute_subsample 的 fps 分支一致
+
+
+class GeometryError(ValueError):
+    """几何构建的输入不满足契约。"""
+
+
+@dataclass
+class NodePartition:
+    """一个点云在粗阶段上的节点分区（把细节点分配给最近的粗节点）。"""
+
+    masks: torch.Tensor          # (N_c,) bool
+    knn_indices: torch.Tensor    # (N_c, K) long，局部索引
+    knn_masks: torch.Tensor      # (N_c, K) bool
+
+
+@dataclass
+class CloudGeometry:
+    """单侧多尺度几何。所有索引都是本侧局部索引。"""
+
+    points: List[torch.Tensor]              # 每阶段 (N_i, D)；points[0] 是原始点
+    lengths: List[torch.Tensor]             # 每阶段 (1,) 点数
+    features: torch.Tensor                  # (N_0, C)
+    voxel_sizes: Tuple[float, ...]          # 实际生效的体素尺寸
+    sampling_method: str                    # 实际生效的最后一层采样方式（voxel/fps）
+    centroid: Optional[np.ndarray] = None   # 中心化前的质心（原坐标系），仅记录用
+    neighbors: List[torch.Tensor] = field(default_factory=list)     # (N_i, k) 指向 points[i]
+    subsampling: List[torch.Tensor] = field(default_factory=list)   # (N_{i+1}, k) 指向 points[i]
+    upsampling: List[Optional[torch.Tensor]] = field(default_factory=list)  # (N_i, 1) 指向 points[i+1]
+    node_partition: Optional[NodePartition] = None
+
+    @property
+    def device(self):
+        return self.points[0].device
+
+    @property
+    def num_stages(self):
+        return len(self.points)
+
+    @property
+    def stage_counts(self):
+        return [int(item.shape[0]) for item in self.points]
+
+    @property
+    def point_count(self):
+        return int(self.points[0].shape[0])
+
+    def fingerprint(self):
+        """几何指纹：实际点集与顺序、特征、生效采样配置、结构版本。
+
+        供 T05 的几何缓存做 key；不含质心（质心只影响写出，不影响网络输入）。
+        """
+        digest = hashlib.sha256()
+        digest.update(("geometry_version=%d;" % GEOMETRY_VERSION).encode())
+        digest.update(("stages=%d;voxels=%s;sampling=%s;"
+                       % (self.num_stages,
+                          ",".join("%.6f" % value for value in self.voxel_sizes),
+                          self.sampling_method)).encode())
+        for index, item in enumerate(self.points):
+            array = item.detach().cpu().numpy()
+            digest.update(("stage=%d;dtype=%s;shape=%s;" % (index, array.dtype,
+                                                            array.shape)).encode())
+            digest.update(np.ascontiguousarray(array).tobytes())
+        features = self.features.detach().cpu().numpy()
+        digest.update(("features;dtype=%s;shape=%s;" % (features.dtype, features.shape)).encode())
+        digest.update(np.ascontiguousarray(features).tobytes())
+        return digest.hexdigest()
+
+
+def _check_points(points, features):
+    if not isinstance(points, torch.Tensor) or points.dim() != 2:
+        raise GeometryError("points 必须是二维张量 (N, D)")
+    if points.shape[0] == 0:
+        raise GeometryError("points 为空")
+    if not isinstance(features, torch.Tensor) or features.dim() != 2:
+        raise GeometryError("features 必须是二维张量 (N, C)")
+    if features.shape[0] != points.shape[0]:
+        raise GeometryError("features 行数 %d 与 points 点数 %d 不一致"
+                            % (features.shape[0], points.shape[0]))
+    if points.dim() < 2 or points.shape[1] < 3:
+        raise GeometryError("points 至少要有 3 列坐标")
+
+
+def _check_sampling(voxel_sizes, sampling_method):
+    """校验采样配置并返回阶段数（阶段数 = len(voxel_sizes)）。"""
+    num_stages = len(voxel_sizes)
+    if num_stages < 2:
+        raise GeometryError("阶段数 %d < 2：多尺度几何至少需要 2 个阶段" % num_stages)
+    if sampling_method not in ("voxel", "fps"):
+        raise GeometryError("未知的采样方式: %r（只支持 voxel/fps）" % (sampling_method,))
+    return num_stages
+
+
+def _check_neighbors(num_neighbors, num_stages):
+    if len(num_neighbors) != num_stages:
+        raise GeometryError("num_neighbors 长度 %d 与阶段数 %d 不一致"
+                            % (len(num_neighbors), num_stages))
+
+
+def _stage_voxel_size(voxel_sizes, stage, num_stages, sampling_method):
+    """复刻 pareconv precompute_subsample 的体素选择规则；最后一层可能返回 None（走 fps）。"""
+    if stage < len(voxel_sizes) - 1:
+        return voxel_sizes[stage]
+    if stage == num_stages - 1 and sampling_method == "fps":
+        return None
+    return voxel_sizes[-1]
+
+
+def build_stage_points(points, features, voxel_sizes, sampling_method,
+                       centroid=None, device="cuda"):
+    """单侧多尺度点（对应 precompute_subsample 的单侧等价实现）；阶段数 = len(voxel_sizes)。
+
+    下采样是 CPU 实现（pareconv.ext.grid_subsampling），因此输入必须是 CPU 张量；
+    构建完成后点/特征搬到 `device`（默认 CUDA，与旧联合入口一致）。
+    """
+    _check_points(points, features)
+    num_stages = _check_sampling(voxel_sizes, sampling_method)
+    if points.is_cuda:
+        raise GeometryError("build_stage_points 需要 CPU 点云（grid_subsampling 是 CPU 实现）")
+
+    points_list = [points]
+    cur_points = points
+    for stage in range(1, num_stages):
+        lengths = torch.tensor([cur_points.shape[0]], dtype=torch.long)
+        voxel_size = _stage_voxel_size(voxel_sizes, stage, num_stages, sampling_method)
+        if voxel_size is None:
+            cur_points, _ = farthest_point_sampling_gpu(cur_points, lengths, FPS_TARGET_RATIO)
+        else:
+            cur_points, _ = grid_subsample(cur_points, lengths, voxel_size)
+        points_list.append(cur_points)
+
+    moved = [item.to(device) for item in points_list]
+    lengths = [torch.tensor([item.shape[0]], dtype=torch.long, device=device)
+               for item in moved]
+    return CloudGeometry(points=moved, lengths=lengths, features=features.to(device),
+                         voxel_sizes=tuple(float(value) for value in voxel_sizes),
+                         sampling_method=sampling_method,
+                         centroid=None if centroid is None else np.asarray(centroid),
+                         upsampling=[None] * num_stages)
+
+
+def build_neighbors(geometry, num_neighbors):
+    """就地补齐单侧邻居/上下采样索引（pointops k-NN 只有 CUDA 实现）。
+
+    邻居指向本阶段点集；subsampling 行是下一阶段点、值指向本阶段点；
+    upsampling 行是本阶段点、值指向下一阶段点（按 stage 对齐，stage 0 为 None）。
+    """
+    num_stages = geometry.num_stages
+    if _check_sampling(geometry.voxel_sizes, geometry.sampling_method) != num_stages:
+        raise GeometryError("voxel_sizes 长度与几何阶段数 %d 不一致" % num_stages)
+    _check_neighbors(num_neighbors, num_stages)
+    if not geometry.points[0].is_cuda:
+        raise GeometryError("build_neighbors 需要 CUDA 点云（pointops.knnquery_heap 只有 CUDA 实现）")
+
+    neighbors: List[torch.Tensor] = []
+    subsampling: List[torch.Tensor] = []
+    upsampling: List[Optional[torch.Tensor]] = [None] * num_stages
+    for stage in range(num_stages):
+        cur = geometry.points[stage][:, :3].contiguous().unsqueeze(0)
+        neighbors.append(pointops.knnquery_heap(num_neighbors[stage], cur, cur).squeeze(0))
+        if stage < num_stages - 1:
+            sub = geometry.points[stage + 1][:, :3].contiguous().unsqueeze(0)
+            subsampling.append(pointops.knnquery_heap(num_neighbors[stage], cur, sub).squeeze(0))
+            if stage > 0:
+                upsampling[stage] = pointops.knnquery_heap(1, sub, cur).squeeze(0)
+    geometry.neighbors = neighbors
+    geometry.subsampling = subsampling
+    geometry.upsampling = upsampling
+    return geometry
+
+
+def build_geometry(points, features, voxel_sizes, sampling_method, num_neighbors,
+                   centroid=None, device="cuda"):
+    """单侧几何（多尺度点 + 邻居）：等价于 build_stage_points + build_neighbors。"""
+    geometry = build_stage_points(points, features, voxel_sizes, sampling_method,
+                                  centroid=centroid, device=device)
+    return build_neighbors(geometry, num_neighbors)
+
+
+def attach_node_partition(geometry, num_points_in_patch, fine_stage=1, coarse_stage=-1):
+    """就地补齐节点分区（细节点 → 最近粗节点），与模型里 point_to_node_partition 同源。"""
+    if geometry.num_stages < 2:
+        raise GeometryError("节点分区至少需要 2 个阶段")
+    fine = geometry.points[fine_stage][:, :3].contiguous()
+    coarse = geometry.points[coarse_stage][:, :3].contiguous()
+    _, masks, knn_indices, knn_masks = point_to_node_partition(fine, coarse, num_points_in_patch)
+    geometry.node_partition = NodePartition(masks=masks, knn_indices=knn_indices,
+                                            knn_masks=knn_masks)
+    return geometry
+
+
+def offset_indices(indices, offset, source_count):
+    """局部索引 → 联合索引；尾部哨兵槽位保持 0，不参与偏移。
+
+    pointops 在邻居不足时用 0 填充尾部槽位，槽位数 = k - source_count（source_count < k 时）。
+    """
+    if offset == 0:
+        return indices
+    if source_count >= indices.shape[-1]:
+        return indices + offset
+    slot = torch.arange(indices.shape[-1], device=indices.device)
+    valid = (slot < source_count).unsqueeze(0).expand_as(indices)
+    return torch.where(valid, indices + offset, torch.zeros_like(indices))
+
+
+def join_geometries(ref, src, scale, transform):
+    """把两段单侧几何拼成旧联合入口的 data_dict（跨侧索引加偏移）。"""
+    if ref.num_stages != src.num_stages:
+        raise GeometryError("两侧阶段数不同：%d vs %d" % (ref.num_stages, src.num_stages))
+    if ref.device != src.device:
+        raise GeometryError("两侧几何设备不同：%s vs %s" % (ref.device, src.device))
+    for name in ("neighbors", "subsampling"):
+        if len(getattr(ref, name)) != len(getattr(src, name)):
+            raise GeometryError("%s 长度不同：%d vs %d"
+                                % (name, len(getattr(ref, name)), len(getattr(src, name))))
+
+    num_stages = ref.num_stages
+    device = ref.device
+    points, lengths = [], []
+    neighbors, subsampling, upsampling = [], [], []
+    for stage in range(num_stages):
+        ref_points = ref.points[stage]
+        src_points = src.points[stage]
+        points.append(torch.cat([ref_points, src_points], dim=0))
+        lengths.append(torch.tensor([ref_points.shape[0], src_points.shape[0]],
+                                    dtype=torch.long, device=device))
+        neighbors.append(torch.cat([
+            ref.neighbors[stage],
+            offset_indices(src.neighbors[stage], ref_points.shape[0], src_points.shape[0])],
+            dim=0))
+        if stage < num_stages - 1:
+            ref_next = ref.points[stage + 1]
+            src_next = src.points[stage + 1]
+            subsampling.append(torch.cat([
+                ref.subsampling[stage],
+                offset_indices(src.subsampling[stage], ref_points.shape[0],
+                               src_points.shape[0])], dim=0))
+            if stage > 0:
+                upsampling.append(torch.cat([
+                    ref.upsampling[stage],
+                    offset_indices(src.upsampling[stage], ref_next.shape[0],
+                                   src_next.shape[0])], dim=0))
+
+    return {
+        "points": points,
+        "lengths": lengths,
+        "features": torch.cat([ref.features, src.features], dim=0),
+        "neighbors": neighbors,
+        "subsampling": subsampling,
+        "upsampling": upsampling,
+        "transform": transform.to(device) if isinstance(transform, torch.Tensor) else transform,
+        "scale": scale,
+        "batch_size": 1,
+    }

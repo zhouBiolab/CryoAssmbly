@@ -29,13 +29,12 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from pareconv.utils.data_mask import registration_collate_fn_stack_mode, precompute_neibors
 import pareconv.utils.data_mask as data_mask_module
-from pareconv.utils.torch import to_cuda
-from pareconv.modules.ops.transformation import apply_transform
 from protassem.fitting.parenet.config import make_cfg
 from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELDS
 from protassem.core.points_txt import read_point_cloud_file
+from protassem.fitting.cloud_encoding import (build_stage_points, build_neighbors,
+                                              join_geometries)
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -154,6 +153,19 @@ def preprocess_point_cloud_data(file_path, point_limit=65000, is_mask_file=False
 # Core inference
 # ======================================================================
 
+def effective_sampling_config():
+    """当前真正生效的多尺度配置（体素尺寸列表 + 最后一层采样方式）。
+
+    pareconv 的 `precompute_subsample` 从模块级全局变量读配置；本仓库没有任何地方设置它们，
+    因此实际始终是 config 0 + voxel（T02 实测：标签 configs=all 时 6 个配置的输入完全相同）。
+    T04 起单侧几何构建显式传参，这里只把生效值读出来，不修改全局状态。
+    """
+    config_id, sampling_method = data_mask_module.get_current_config()
+    voxel_sizes = data_mask_module.VOXEL_SIZE_CONFIGS.get(
+        config_id, data_mask_module.VOXEL_SIZE_CONFIGS[0])
+    return [float(value) for value in voxel_sizes], sampling_method
+
+
 @torch.no_grad()   # T03：推理全程关闭梯度，不建计算图（权重/数值路径不变）
 def process_single_pair(src_data, tgt_data, source_path, target_path,
                         chain_pdb_path, model, cfg, config_id, sampling_method,
@@ -162,7 +174,7 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                         original_target_data=None):
     """Run PARENet inference on one source-target pair.
 
-    只有本函数调用模型；@torch.no_grad() 覆盖 collate/上卡/前向/后处理全路径。
+    只有本函数调用模型；@torch.no_grad() 覆盖"单侧几何构建 → 联合拼装 → 前向 → 后处理"全路径。
     """
     result = {
         "source_file": os.path.basename(source_path),
@@ -211,36 +223,40 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         scale = max(np.linalg.norm(ref_norm, axis=1).max(),
                     np.linalg.norm(src_norm, axis=1).max()).astype(np.float32)
 
-        data_dict = {
-            "ref_points": ref_norm.astype(np.float32),
-            "src_points": src_norm.astype(np.float32),
-            "ref_feats": np.ones((ref_norm.shape[0], 1), dtype=np.float32),
-            "src_feats": np.ones((src_norm.shape[0], 1), dtype=np.float32),
-            "transform": torch.from_numpy(np.eye(4, dtype=np.float32)),
-            "scale": scale,
-        }
+        # T04：源/目标各自构建单侧几何（多尺度点 + 邻居），再由适配层拼成联合布局。
+        # 生效采样配置来自 pareconv 的模块级全局变量（T02 实测：标签 configs=all 实际只跑
+        # config 0 + voxel），这里显式读出、传参并记录，不再依赖隐式全局。
+        voxel_sizes, effective_sampling = effective_sampling_config()
+        ref_features = torch.ones((ref_norm.shape[0], 1), dtype=torch.float32)
+        src_features = torch.ones((src_norm.shape[0], 1), dtype=torch.float32)
 
         _t_stage = time.perf_counter()
-        data_dict = registration_collate_fn_stack_mode(
-            [data_dict], cfg.backbone.num_stages, cfg.backbone.init_voxel_size,
-            cfg.backbone.num_neighbors, cfg.backbone.subsample_ratio)
+        ref_geometry = build_stage_points(
+            torch.from_numpy(ref_norm.astype(np.float32)), ref_features,
+            voxel_sizes, effective_sampling, centroid=c_ref)
+        src_geometry = build_stage_points(
+            torch.from_numpy(src_norm.astype(np.float32)), src_features,
+            voxel_sizes, effective_sampling, centroid=c_src)
         _record_timing(output_dir, "server_collate", time.perf_counter() - _t_stage,
                        config_id=config_id, sampling=sampling_method)
 
         _t_stage = time.perf_counter()
-        data_dict = to_cuda(data_dict)
-        _record_timing(output_dir, "server_to_gpu", time.perf_counter() - _t_stage)
+        build_neighbors(ref_geometry, cfg.backbone.num_neighbors)
+        build_neighbors(src_geometry, cfg.backbone.num_neighbors)
+        _record_timing(output_dir, "server_neighbors", time.perf_counter() - _t_stage)
 
         _t_stage = time.perf_counter()
-        nbr = precompute_neibors(data_dict["points"], data_dict["lengths"],
-                                 cfg.backbone.num_stages, cfg.backbone.num_neighbors)
-        data_dict.update(nbr)
-        _record_timing(output_dir, "server_neighbors", time.perf_counter() - _t_stage)
+        data_dict = join_geometries(
+            ref_geometry, src_geometry, scale=scale,
+            transform=torch.from_numpy(np.eye(4, dtype=np.float32)))
+        _record_timing(output_dir, "server_join", time.perf_counter() - _t_stage)
 
         # T02：输入指纹与有效参数（用于判断缓存可复用比例）
         import struct
         _record_timing(output_dir, "server_pair_info", 0.0,
                        config_id=config_id, sampling=sampling_method,
+                       effective_sampling=effective_sampling,
+                       voxel_sizes=[float(value) for value in voxel_sizes],
                        src_points=int(src_data.points.shape[0]),
                        tgt_points=int(tgt_data.points.shape[0]),
                        ref_radius=float(np.linalg.norm(ref_norm, axis=1).max()),
