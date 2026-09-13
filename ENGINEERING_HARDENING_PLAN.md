@@ -1,6 +1,6 @@
 # demo_reg 工程化硬化与运行时优化实施方案（v2）
 
-版本：2026-09-13 **v3.1**（实施期间同步；取代 v2.1–v3.0/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
+版本：2026-09-13 **v3.2**（实施期间同步；取代 v2.1–v3.1/v2/v1）　基线提交：`5b016f5`（含 3 处未提交改动）　目标分支：`feat/engineering-hardening`
 状态：**方案，未实施**。本文只描述要做什么、怎么验，不代表任何一项已完成。
 
 事实分级（全文标注）：
@@ -43,6 +43,14 @@
 ---
 
 ## 修订记录
+
+### v3.1 → v3.2（P3 复用池完成）
+
+| # | 位置 | v3.1 的状态 | v3.2 的结论 |
+|---|---|---|---|
+| 41 | §4.1 P3 | 待实施 | **已完成**：池创建 79 → 1（串行 0）；同配置结果与冻结基线逐字节一致；报告 `tests/reports/2026-09-13_p3_shared_pool_acceptance.md` |
+| 42 | §3 P3 验收项 | "worker=1 与当前配置返回相同排序与分数" | **实测不成立**：1 worker 会改变最终结果；用冻结基线代码复现同 md5 → 属既有配置敏感性（不是 P3 引入），登记为开放项 O6 |
+| 43 | §4.2 P4/P5 | 上限须重估、P5 暂缓 | 维持：先统计全部评分调用点再评估 P4；P5 暂缓；服务端 CPU 后处理与写盘为当前最高杠杆 |
 
 ### v3.0 → v3.1（P2 细化时间账 + 优先级修订）
 
@@ -730,4 +738,5 @@ ssh my-server 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate 
 | O2 | 5kem 是否纳入阶段一（当前定为 S4a/S5 后各一次） | 同上 |
 | O3 | 阶段二启动时间与 P1–P11 的取舍 | 阶段一验收后 |
 | O4 | 无组件被接受时的空结果输出契约 | **已修复（R2）**：不写空 CIF、清理旧产物、返回 `None`、摘要状态字段、Step4 门控；6 项测试 + 真实集成验证 |
+| O6 | **`--num-processes` 会改变最终结果**：1 worker 与 10 worker 的 `assembled_complex.cif` md5 不同（冻结基线代码同样如此）→ 属既有配置敏感性（监测循环按批次/轮询节奏挑选候选与早停）；若需要结果可复现，需固定候选消费顺序或显式排序 | 需你定 |
 | O5 | S4b 残留分支（refine backfill 的链号出口） | **已收口**：`refine_step._backfill_chains_as_domains` 只处理 `type == "chain"`，而复合物记录是 `type="complex"` → 该路径**对复合物不可达**；真正消费复合物域产物的位置是 `assemble_domain_chains` → `merge_domains(is_complex=True)` → `_save_domain_chain` → `build_complex`，已在 R1 修复（补 `is_complex` + `chain_map` 恢复真链号）并用真实运行验证（链号 `Q`,`R`） |
