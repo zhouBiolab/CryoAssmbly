@@ -2,9 +2,14 @@
 
 约定：池的创建与关闭都在父进程计时；worker 内不得再建池。
 `start_method=None` 表示系统默认（Linux 为 fork）；显式传 "spawn" 可单独测启动成本。
+
+老卡收口（v4.11）：`open_pool` 额外记录**建池瞬间的父进程状态**（线程数、CUDA 是否已初始化），
+用于每次真实运行留证 fork 的适用范围 —— fork 会复制父进程内存，若父进程已初始化 CUDA，
+子进程继承的是不可用上下文；本项目的池只跑 CPU worker。
 """
 
 import multiprocessing
+import threading
 import time
 from contextlib import contextmanager
 
@@ -16,13 +21,25 @@ def pool_context(start_method=None):
     return multiprocessing
 
 
+def parent_state():
+    """建池瞬间的父进程状态：线程数与 CUDA 是否已初始化（查询失败记 None）。"""
+    try:
+        import torch
+        cuda = bool(torch.cuda.is_initialized())
+    except Exception:
+        cuda = None
+    return {"threads": threading.active_count(), "cuda_initialized": cuda}
+
+
 def open_pool(metrics, processes, label, start_method=None):
-    """创建进程池并记录 pool_start；调用方负责用 close_pool() 释放。"""
+    """创建进程池并记录 pool_start（含父进程状态）；调用方负责用 close_pool() 释放。"""
+    state = parent_state()
     started = time.perf_counter()
     pool = pool_context(start_method).Pool(processes=processes)
     if metrics is not None:
         metrics.record("pool_start", time.perf_counter() - started, pool=label,
-                       workers=processes, start_method=start_method or "default")
+                       workers=processes, start_method=start_method or "default",
+                       **state)
     return pool
 
 

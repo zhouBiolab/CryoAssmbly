@@ -1,17 +1,27 @@
-"""P3 复用池测试：顺序归并、复用（只建一次池）、串行回退、异常与幂等释放。"""
+"""P3 复用池测试：顺序归并、复用（只建一次池）、串行回退、异常与幂等释放、异常回收。"""
 
+import multiprocessing
 import os
 import tempfile
 import unittest
 
 from protassem.runtime.execution import ExecutionContext
 from protassem.runtime.metrics import Metrics
-from protassem.runtime.pool import open_pool, close_pool
+from protassem.runtime.pool import close_pool, open_pool, parent_state
 
 
 def _double(value):
     """模块级 worker（可被 spawn 序列化）。"""
     return value * 2
+
+
+def _boom(value):
+    """模块级 worker：故意失败，用于异常回收路径。"""
+    raise RuntimeError("worker failure: %s" % value)
+
+
+def _active_child_pids():
+    return {child.pid for child in multiprocessing.active_children()}
 
 
 class ExecutionContextTest(unittest.TestCase):
@@ -76,6 +86,39 @@ class ExecutionContextTest(unittest.TestCase):
             self.assertEqual(context.map(_double, [3]), [6])
         starts = [row for row in metrics.records if row["stage"] == "pool_start"]
         self.assertEqual(starts[0]["start_method"], "spawn")
+
+    def test_pool_start_records_parent_state(self):
+        """fork 适用范围留证：建池瞬间的父进程线程数与 CUDA 状态必须入账。"""
+        metrics = Metrics(output_dir=self.tmp, run_id="ctx-8")
+        state = parent_state()
+        with ExecutionContext(metrics=metrics, pool_workers=2) as context:
+            context.map(_double, [1])
+        start = [row for row in metrics.records
+                 if row["stage"] == "pool_start"][0]
+        self.assertIn("threads", start)
+        self.assertIn("cuda_initialized", start)
+        self.assertGreaterEqual(start["threads"], state["threads"])
+        self.assertEqual(start["cuda_initialized"], state["cuda_initialized"])
+
+
+class PoolRecoveryTest(unittest.TestCase):
+    """异常路径的资源回收：worker 抛异常后池必须能被回收干净。"""
+
+    def test_worker_exception_propagates_and_children_are_reaped(self):
+        before = _active_child_pids()
+        pool = open_pool(None, 2, "recover")
+        with self.assertRaises(RuntimeError):
+            pool.map(_boom, [1, 2], chunksize=1)
+        close_pool(None, pool, "recover")
+        self.assertEqual(_active_child_pids() - before, set())
+
+    def test_context_manager_reaps_children_after_worker_exception(self):
+        before = _active_child_pids()
+        context = ExecutionContext(metrics=None, pool_workers=2)
+        with self.assertRaises(RuntimeError):
+            context.map(_boom, [1, 2])
+        context.close()
+        self.assertEqual(_active_child_pids() - before, set())
 
 
 class PoolPrimitivesTest(unittest.TestCase):
