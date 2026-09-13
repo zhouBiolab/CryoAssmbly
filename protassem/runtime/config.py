@@ -58,6 +58,12 @@ def effective_allow_tf32(inference_mode, allow_tf32=None):
     return bool(allow_tf32)
 
 
+# 评分缓存预算（MiB，老卡收口 P4）：密度上下文与结构坐标**共享**该预算，0 = 关闭。
+# 常量放在 runtime/config.py 以保持该模块"无重依赖"（P1 两段式导入）；worker 通过环境变量继承。
+DEFAULT_SCORE_CACHE_MB = 128
+SCORE_CACHE_ENV = "PROTASSEM_SCORE_CACHE_MB"
+
+
 def apply_seed(seed):
     """在**父进程**里固定随机源（老卡收口 / O6 复查项）。
 
@@ -106,12 +112,16 @@ class RuntimeConfig:
     hypothesis_chunk: int = DEFAULT_HYPOTHESIS_CHUNK
     # CPU 尾部流水线（T09；False = 就地执行后处理与写盘）
     tail_pipeline: bool = DEFAULT_TAIL_PIPELINE
+    # 评分缓存预算（MiB，老卡收口 P4；密度上下文与结构坐标共享，0 = 关闭）
+    score_cache_mb: int = DEFAULT_SCORE_CACHE_MB
 
     def __post_init__(self):
         # 早失败：非法模式、不安全的精度组合或负的分块在构造配置时就报错
         effective_allow_tf32(self.inference_mode, self.allow_tf32)
         if int(self.hypothesis_chunk) < 0:
             raise ValueError("hypothesis_chunk 不能为负：%r" % (self.hypothesis_chunk,))
+        if int(self.score_cache_mb) < 0:
+            raise ValueError("score_cache_mb 不能为负：%r" % (self.score_cache_mb,))
 
     def tf32(self):
         """实测生效的 TF32 策略（解析 inference_mode 与显式覆盖）。"""

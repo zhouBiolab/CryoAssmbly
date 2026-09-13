@@ -110,12 +110,13 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     if runtime_config is not None:
         log.info("Runtime config: blas_threads=%d seed=%d geometry_cache_mb=%d "
                  "encoding_cache_mb=%d inference_mode=%s allow_tf32=%s(生效 %s) "
-                 "hypothesis_chunk=%d tail_pipeline=%s",
+                 "hypothesis_chunk=%d tail_pipeline=%s score_cache_mb=%d",
                  runtime_config.blas_threads, runtime_config.seed,
                  runtime_config.geometry_cache_mb, runtime_config.encoding_cache_mb,
                  runtime_config.inference_mode,
                  runtime_config.allow_tf32, runtime_config.tf32(),
-                 runtime_config.hypothesis_chunk, runtime_config.tail_pipeline)
+                 runtime_config.hypothesis_chunk, runtime_config.tail_pipeline,
+                 runtime_config.score_cache_mb)
         log.info("Effective threads: %s",
                  runtime_config.describe_effective_threads())
         # T05–T09：缓存容量、推理路径、TF32 策略、假设分块与尾部流水线透传给 PARENet 常驻服务进程
@@ -134,6 +135,9 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         configure_tail_pipeline(runtime_config.tail_pipeline)
         # 老卡收口（O6 复查项）：父进程随机源由配置固定 → 回退型局部优化不再随运行漂移
         log.info("Parent RNG seeded: %s", apply_seed(runtime_config.seed))
+        # 老卡收口 P4：评分缓存预算（密度上下文 + 结构坐标；worker 通过环境变量继承）
+        from protassem.core.scoring import apply_score_cache
+        log.info("Score cache: %s", apply_score_cache(runtime_config.score_cache_mb))
 
     metrics = Metrics(os.path.join(output_dir, "metrics"))
     pipeline_started = time.perf_counter()
@@ -309,6 +313,20 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         log.info("Assembly finished (no complex produced)")
 
     metrics.record("pipeline_total", time.perf_counter() - pipeline_started)
+    # 老卡收口 P4：父进程侧的评分缓存统计（worker 进程各自持有缓存，不在此聚合）
+    try:
+        from protassem.core.scoring import score_cache_snapshot
+        snapshot = score_cache_snapshot()
+        metrics.record("score_cache", 0.0, parent_side=True,
+                       density_hits=snapshot["density"]["hits"],
+                       density_misses=snapshot["density"]["misses"],
+                       density_bytes=snapshot["density"]["bytes"],
+                       density_peak_bytes=snapshot["density"]["peak_bytes"],
+                       structure_hits=snapshot["structure"]["hits"],
+                       structure_misses=snapshot["structure"]["misses"])
+        log.info("Score cache (parent side): %s", snapshot)
+    except Exception as exc:
+        log.warning("Score cache snapshot failed: %s", exc)
     summary_path = metrics.write_summary()
     log.info("Performance summary: %s", summary_path)
 

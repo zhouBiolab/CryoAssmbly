@@ -19,8 +19,11 @@ import json
 import os
 
 CLIENT_SUBSTAGES = ("gpu_wait", "cc_batch", "cc_candidate_initial", "cc_verify",
-                    "local_optimize", "candidate_stream", "final_select", "save_result",
+                    "local_optimize", "final_select", "save_result",
                     "analyze_sources")
+# 与上表**区间重叠**（candidate_stream 覆盖 gpu_wait/cc_batch/local_optimize/final_select），
+# 只分列展示，不计入"已识别子阶段合计"，否则未归因会算成负数。
+CLIENT_OVERLAP_STAGES = ("candidate_stream",)
 SERVER_STAGES = ("server_queue_wait", "server_request_total", "server_preprocess",
                  "server_masks", "server_mask_preprocess", "server_to_gpu",
                  "server_forward", "server_postprocess", "server_write_pred")
@@ -148,6 +151,9 @@ def main():
     print_cache(server_rows)
     print()
 
+    print_table("客户端：候选流（覆盖上表多个阶段，不重复计入）",
+                totals(client_rows), only=CLIENT_OVERLAP_STAGES)
+    print()
     fit = client.get("fit_request", {}).get("seconds", 0.0)
     identified = sum(client.get(stage, {}).get("seconds", 0.0)
                      for stage in CLIENT_SUBSTAGES)

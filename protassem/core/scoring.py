@@ -1,4 +1,22 @@
-"""CC_mask calculation — direct computation, no subprocess."""
+"""CC_mask calculation — direct computation, no subprocess.
+
+老卡收口 P4：把「密度侧输入」与「结构坐标」抽成可复用的上下文，并加**有界**缓存。
+
+- `DensityMapContext` 保存**原 dtype** 的密度数组（只做一次阈值化：`>contour ? x : -1.0`）
+  以及 origin / voxel_size / shape / contour / 指纹；**不改变评分路径的 dtype 与阈值顺序**
+  （不在这里做类型转换优化）。
+- `score_coords(context, coords, elements, resolution)` 是坐标数组入口；
+  `calculate_cc_mask(...)` 保留原签名，退化为薄包装（读上下文 + 读结构 + 评分）。
+- 缓存：`score_cache_mb` 默认 **128 MiB / 进程**，密度上下文与结构坐标**共享**该预算；
+  0 = 关闭。缓存是**进程本地**的（worker 进程各自持有），多 worker 下总量按进程数放大。
+- 失效：`(abspath, size, mtime_ns, contour, SCORING_VERSION)`；会被同名覆盖的动态密度必须
+  显式给出 `density_version` 或调用 `invalidate_density()` —— mtime 不是版本契约。
+- 只读约定：缓存里的数组只读，需要修改时用 `.copy()`。
+- 配置变化（预算）会**清空并重建**缓存；`apply_score_cache()` 也写环境变量，
+  这样 fork 出来的 worker 与 spawn 出来的 worker 都能拿到同一个预算。
+"""
+
+import os
 
 import numpy as np
 import mrcfile
@@ -7,6 +25,11 @@ from numba import njit
 from protassem.core.io import read_structure
 from protassem.core.constants import atomic_number_dict, VDW_RADII
 from protassem.core.numba_kernels import add_gaussian_to_grid, add_sphere_mask
+from protassem.runtime.byte_cache import ByteLruCache, object_bytes
+from protassem.runtime.config import DEFAULT_SCORE_CACHE_MB, SCORE_CACHE_ENV
+
+SCORING_VERSION = 1
+STRUCTURE_VERSION = 1
 
 
 def read_mrc_full(filename):
@@ -127,17 +150,163 @@ def _make_phenix_mask(origin, voxel_size, box_size, coords, elements,
     return soft > 0.5
 
 
-def calculate_cc_mask(density_mrc, structure_file, resolution, contour):
-    """Compute CC_mask between experimental map and structure."""
-    exp_map, voxel_size, origin, dims = read_mrc_full(density_mrc)
-    exp_map = np.where(exp_map > contour, exp_map, -1.0)
+class DensityMapContext:
+    """一次评分所需的密度侧输入（阈值化只做一次；**不改变原 dtype**）。"""
 
+    __slots__ = ("path", "data", "voxel_size", "origin", "shape", "contour",
+                 "fingerprint")
+
+    def __init__(self, path, data, voxel_size, origin, contour, fingerprint):
+        self.path = path
+        self.data = data
+        self.voxel_size = voxel_size
+        self.origin = origin
+        self.shape = data.shape
+        self.contour = contour
+        self.fingerprint = fingerprint
+
+
+class _ScoreCache:
+    """进程本地缓存：密度上下文 + 结构坐标共享一个字节预算。"""
+
+    def __init__(self, capacity_mb):
+        self.capacity_mb = int(capacity_mb)
+        capacity_bytes = max(0, self.capacity_mb) * 1024 * 1024
+        self.density = ByteLruCache(capacity_bytes, self._density_bytes, "density")
+        self.structure = ByteLruCache(capacity_bytes, self._structure_bytes,
+                                      "structure")
+
+    @staticmethod
+    def _density_bytes(context):
+        return object_bytes(context.data) + object_bytes(context.voxel_size) \
+            + object_bytes(context.origin) + 512
+
+    @staticmethod
+    def _structure_bytes(value):
+        coords, elements = value
+        return object_bytes(coords) + object_bytes(elements) + 256
+
+    @property
+    def enabled(self):
+        return self.density.enabled or self.structure.enabled
+
+    def clear(self):
+        self.density.clear()
+        self.structure.clear()
+
+    def snapshot(self):
+        return {"score_cache_mb": self.capacity_mb,
+                "density": self.density.snapshot(),
+                "structure": self.structure.snapshot()}
+
+
+def _env_capacity_mb():
+    raw = os.environ.get(SCORE_CACHE_ENV)
+    if raw in (None, ""):
+        return DEFAULT_SCORE_CACHE_MB
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return DEFAULT_SCORE_CACHE_MB
+
+
+_CACHE = _ScoreCache(_env_capacity_mb())
+
+
+def configure_score_cache(capacity_mb):
+    """设置本进程的评分缓存预算（MiB，0 = 关闭）；预算变化时重建，否则清空。"""
+    global _CACHE
+    capacity_mb = max(0, int(capacity_mb))
+    if capacity_mb != _CACHE.capacity_mb:
+        _CACHE = _ScoreCache(capacity_mb)
+    else:
+        _CACHE.clear()
+    return _CACHE.snapshot()
+
+
+def apply_score_cache(capacity_mb):
+    """父进程应用预算：写环境变量（worker 继承）+ 直接配置本进程。"""
+    os.environ[SCORE_CACHE_ENV] = str(int(max(0, int(capacity_mb))))
+    return configure_score_cache(capacity_mb)
+
+
+def score_cache_snapshot():
+    return _CACHE.snapshot()
+
+
+def invalidate_density():
+    """显式失效（返回清掉的条目数）。
+
+    同名覆盖的动态密度有两种正确做法：给 `density_version`（精确、按 key 失效），
+    或在这里整体失效。这里不做"按路径删除"—— 半吊子的部分失效比整体失效更危险。
+    """
+    entries = _CACHE.density.stats.entries
+    _CACHE.density.clear()
+    return entries
+
+
+def density_fingerprint(density_mrc, contour, density_version=None):
+    """内容指纹：版本 + 路径 + size + mtime_ns + contour。
+
+    `density_version` 由调用方给出（例如掩码/写入轮次）：**同名覆盖的动态密度必须给**，
+    否则只能依赖 mtime —— 那不是版本契约。
+    """
+    stat = os.stat(str(density_mrc))
+    return "|".join([str(SCORING_VERSION), os.path.abspath(str(density_mrc)),
+                     str(stat.st_size), str(stat.st_mtime_ns),
+                     repr(float(contour)),
+                     "-" if density_version is None else str(density_version)])
+
+
+def load_density_context(density_mrc, contour, density_version=None):
+    """读取 + 阈值化（无缓存路径；缓存走 `density_context`）。"""
+    data, voxel_size, origin, _dims = read_mrc_full(density_mrc)
+    data = np.where(data > contour, data, -1.0)
+    return DensityMapContext(
+        path=os.path.abspath(str(density_mrc)), data=data, voxel_size=voxel_size,
+        origin=origin, contour=float(contour),
+        fingerprint=density_fingerprint(density_mrc, contour, density_version))
+
+
+def density_context(density_mrc, contour, density_version=None):
+    """取（可能命中缓存的）密度上下文；返回的数组视为**只读**。"""
+    key = density_fingerprint(density_mrc, contour, density_version)
+    cached = _CACHE.density.get(key)
+    if cached is not None:
+        return cached
+    context = load_density_context(density_mrc, contour, density_version)
+    _CACHE.density.put(key, context)
+    return context
+
+
+def structure_coords(structure_file):
+    """结构坐标（缓存 key 含 size + mtime_ns + 版本）。"""
+    path = os.path.abspath(str(structure_file))
+    try:
+        stat = os.stat(path)
+        key = "|".join([str(STRUCTURE_VERSION), path, str(stat.st_size),
+                        str(stat.st_mtime_ns)])
+    except OSError:
+        key = None
+    cached = _CACHE.structure.get(key)
+    if cached is not None:
+        return cached
     coords, elements = read_structure(str(structure_file))
+    value = (list(coords), list(elements))
+    _CACHE.structure.put(key, value)
+    return value
+
+
+def score_coords(context, coords, elements, resolution):
+    """按坐标数组评分（原 `calculate_cc_mask` 的计算部分，逐行等价）。"""
+    exp_map = context.data
+    dims = context.shape
+    origin, voxel_size = context.origin, context.voxel_size
     elem_list = list(elements)
 
     sim_map = _make_sim_map(origin, voxel_size, dims, coords, elem_list, resolution)
     mask = _make_phenix_mask(origin, voxel_size, dims, coords, elem_list,
-                            resolution=resolution)
+                             resolution=resolution)
 
     sel = mask
     if np.count_nonzero(sel) == 0:
@@ -145,3 +314,11 @@ def calculate_cc_mask(density_mrc, structure_file, resolution, contour):
     exp_vals = exp_map[sel].astype(np.float64)
     sim_vals = sim_map[sel].astype(np.float64)
     return float(_pearson(exp_vals, sim_vals))
+
+
+def calculate_cc_mask(density_mrc, structure_file, resolution, contour,
+                      density_version=None):
+    """Compute CC_mask between experimental map and structure（薄包装）。"""
+    context = density_context(density_mrc, contour, density_version)
+    coords, elements = structure_coords(structure_file)
+    return score_coords(context, coords, elements, resolution)
