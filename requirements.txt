@@ -30,3 +30,6 @@ torch==1.10.0+cu113          # 按机器 CUDA 选版本；需配 --extra-index-u
 #   cd pareconv/extensions/pointops/ && python setup.py install      # 编译 pointops
 # 验证：
 #   python -c "import torch; import pointops_cuda; from pareconv.modules.ops import index_select; print('pareconv OK')"
+
+# 线程控制（P1）：实测生效线程数用；当前 Python 3.8 + Linux 上验证版本 3.5.0
+threadpoolctl==3.5.0

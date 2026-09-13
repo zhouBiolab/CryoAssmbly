@@ -14,8 +14,8 @@ import argparse
 import os
 import sys
 
-from protassem.core.io import find_files, read_param_file
-from protassem.pipeline import run_pipeline
+# 重依赖（NumPy/Torch）必须在 RuntimeConfig.apply_thread_env() 之后再导入，
+# 否则线程限制对已加载的 BLAS 无效 —— 见 main() 内部的两段式导入。
 
 
 def build_parser():
@@ -71,6 +71,8 @@ def build_parser():
                         help="预筛按结构域而非整链接受；未命中域的链仍走常规流程")
     parser.add_argument("--no-domain-split", metavar="IDS", default="",
                         help="不做结构域拆分的链 ID，逗号分隔，如 A,B")
+    parser.add_argument("--runtime-config", metavar="JSON", default=None,
+                        help="运行配置 JSON（线程数/种子等；未给出的键取默认值）")
     return parser
 
 
@@ -135,6 +137,14 @@ def main(argv=None):
     if args is None:
         return 0
 
+    from protassem.runtime.config import RuntimeConfig
+    runtime_config = (RuntimeConfig.from_json(args.runtime_config)
+                      if args.runtime_config else RuntimeConfig())
+    runtime_config.apply_thread_env()   # 必须在导入 NumPy/Torch 之前
+
+    from protassem.core.io import find_files
+    from protassem.pipeline import run_pipeline
+
     kwargs = assembly_kwargs_from(args)
     log_file = resolve_log_file(args)
 
@@ -150,6 +160,7 @@ def main(argv=None):
             contour=_read_param(parser, os.path.join(data_dir, "contour_level.txt")),
             log_file=log_file,
             assembly_kwargs=kwargs,
+            runtime_config=runtime_config,
         )
         return 0
 
@@ -167,12 +178,14 @@ def main(argv=None):
         output_dir=args.paths[4] if len(args.paths) == 5 else None,
         log_file=log_file,
         assembly_kwargs=kwargs,
+        runtime_config=runtime_config,
     )
     return 0
 
 
 def _read_param(parser, path):
     """读取自动模式下的数值参数文件；缺失时报出具体路径。"""
+    from protassem.core.io import read_param_file
     if not os.path.isfile(path):
         parser.error("missing parameter file: %s" % path)
     return read_param_file(path)

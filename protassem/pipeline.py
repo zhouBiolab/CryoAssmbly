@@ -72,7 +72,7 @@ def _validate_inputs(density_mrc, structure_files, resolution, contour, voxel_si
 
 def run_pipeline(density_mrc, structure_files, resolution, contour,
                  output_dir=None, voxel_size=2.0, log_file=None,
-                 assembly_kwargs=None):
+                 assembly_kwargs=None, runtime_config=None):
     """Run the full three-step pipeline.
 
     Args:
@@ -83,6 +83,7 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         output_dir: output directory (default: <mrc_dir>/output)
         voxel_size: sampling voxel size (default 2.0)
         log_file: True for auto log file, or str path, or None
+        runtime_config: RuntimeConfig（阶段二）；提供时记录实测生效线程数
         assembly_kwargs: dict of thresholds passed to AssemblyOrchestrator
             chain_threshold, initial_domain_threshold,
             min_domain_threshold, similarity_threshold
@@ -101,6 +102,12 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     os.makedirs(output_dir, exist_ok=True)
 
     setup_logging(output_dir, log_file)
+
+    if runtime_config is not None:
+        log.info("Runtime config: blas_threads=%d seed=%d",
+                 runtime_config.blas_threads, runtime_config.seed)
+        log.info("Effective threads: %s",
+                 runtime_config.describe_effective_threads())
 
     log.info("Density map : %s", density_mrc)
     log.info("Structures  : %d files", len(structure_files))
