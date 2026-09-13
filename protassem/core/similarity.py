@@ -44,7 +44,12 @@ _FILE_FINGERPRINTS = {}
 
 
 def structure_fingerprint(path):
-    """结构内容指纹：sha256；按 (path, size, mtime_ns) 记忆化避免重复读盘。"""
+    """结构**内容**指纹：`size:sha256`；按 (path, size, mtime_ns) 记忆化避免重复读盘。
+
+    **不含路径**：缓存要能跨运行复用，而同一份内容在不同运行里落在不同输出目录
+    （例如 `out_p5/…/pred_A_d_1.cif` 与 `out_warm/…/pred_A_d_1.cif`）。把路径写进指纹
+    等于每个输出目录一份缓存，跨运行命中率恒为 0（第 7 步暖缓存运行实测到该缺陷）。
+    """
     absolute = os.path.abspath(str(path))
     stat = os.stat(absolute)
     cache_key = (absolute, stat.st_size, stat.st_mtime_ns)
@@ -55,7 +60,7 @@ def structure_fingerprint(path):
     with open(absolute, "rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
-    value = "%s:%d:%s" % (absolute, stat.st_size, digest.hexdigest())
+    value = "%d:%s" % (stat.st_size, digest.hexdigest())
     _FILE_FINGERPRINTS.clear()          # 只保留最近一批，避免无界增长
     _FILE_FINGERPRINTS[cache_key] = value
     return value

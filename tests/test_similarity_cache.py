@@ -182,6 +182,19 @@ class SimilarityCacheTest(unittest.TestCase):
                                         _FakeContext(), self.usalign)
         self.assertEqual(self._rows(), 0)
 
+    def test_content_only_fingerprint_enables_cross_run_reuse(self):
+        """同一内容放在不同路径（不同运行输出目录）必须命中同一条缓存。"""
+        copy = os.path.join(self.dir, "another_run", "b_copy.pdb")
+        os.makedirs(os.path.dirname(copy), exist_ok=True)
+        with open(self.structure_b, "rb") as source, open(copy, "wb") as target:
+            target.write(source.read())
+        self.assertEqual(similarity.structure_fingerprint(copy),
+                         similarity.structure_fingerprint(self.structure_b))
+        calculate_tm_score(self.structure_a, self.structure_b, self.usalign)
+        value = calculate_tm_score(self.structure_a, copy, self.usalign)
+        self.assertEqual(_count_calls(self.log), 1)
+        self.assertAlmostEqual(value, self.expected, places=6)
+
     def test_pair_key_is_versioned_and_symmetric(self):
         key1 = pair_key(self.structure_a, self.structure_b, self.usalign)
         key2 = pair_key(self.structure_b, self.structure_a, self.usalign)
