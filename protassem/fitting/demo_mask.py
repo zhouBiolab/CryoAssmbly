@@ -246,8 +246,10 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
             try:
                 pred_pdb = generate_output_pdb_path(
                     source_path, config_id, sampling_method, output_dir, mask_suffix)
+                # 位姿在点云质心系求解：写出时以 c_src 为旋转中心、并把平移补到 c_ref
                 t_corrected = pred_t + (c_ref.astype(np.float32) - c_src.astype(np.float32))
-                transform_pdb(chain_pdb_path, pred_R, t_corrected, pred_pdb)
+                transform_pdb(chain_pdb_path, pred_R, t_corrected, pred_pdb,
+                              center=c_src.astype(np.float32))
                 result["pred_pdb_path"] = pred_pdb
             except Exception as e:
                 log.warning("PDB transform failed: %s", e)

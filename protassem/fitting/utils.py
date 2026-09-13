@@ -121,15 +121,23 @@ def apply_transformation(points, R, t):
 # PDB transformation
 # ======================================================================
 
-def transform_pdb(input_pdb, R, t, output_pdb):
+def transform_pdb(input_pdb, R, t, output_pdb, center=None):
     """Read PDB, apply rotation+translation to all ATOM coords, write PDB.
 
-    Uses local_optimizer.StructureData for robust PDB read/write.
+    写出坐标 = R (x - center) + center + t。
+
+    center=None 时绕**原子质心**旋转（局部优化沿用该参数化，不要改）；
+    配准输出边界应显式传入**点云质心** c_src——网络位姿是在点云质心系求解的，
+    否则写出坐标会出现 (I - R)(c_atom - c_src) 的系统偏移（T01 实测）。
     """
     from protassem.fitting.local_optimizer import StructureData
 
     structure = StructureData(input_pdb)
-    structure.apply_transformation(R, t)
+    if center is None:
+        structure.apply_transformation(R, t)
+    else:
+        coords = structure.get_coordinates()
+        structure.set_coordinates(np.dot(coords - center, R.T) + center + t)
     structure.write_pdb(output_pdb)
 
 
