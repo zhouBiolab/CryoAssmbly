@@ -21,8 +21,9 @@ import atexit
 import logging
 import subprocess
 
-from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_GEOMETRY_CACHE_MB,
-                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES)
+from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
+                                      DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_INFERENCE_MODE,
+                                      INFERENCE_MODES)
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ _SERVER = None
 _GEOMETRY_CACHE_MB = DEFAULT_GEOMETRY_CACHE_MB
 _INFERENCE_MODE = DEFAULT_INFERENCE_MODE
 _ALLOW_TF32 = DEFAULT_ALLOW_TF32
+_ENCODING_CACHE_MB = DEFAULT_ENCODING_CACHE_MB
 
 
 def configure_geometry_cache(geometry_cache_mb):
@@ -71,6 +73,20 @@ def configure_allow_tf32(allow_tf32):
     return _ALLOW_TF32
 
 
+def configure_encoding_cache(encoding_cache_mb):
+    """设定服务端源编码缓存预算（MiB，T07；0 = 关闭；必须在第一次请求之前调用）。"""
+    global _ENCODING_CACHE_MB
+    value = int(encoding_cache_mb)
+    if value < 0:
+        raise ValueError("encoding_cache_mb 不能为负：%r" % (encoding_cache_mb,))
+    if _SERVER is not None and _SERVER.poll() is None and value != _ENCODING_CACHE_MB:
+        log.warning("PARENet server already running with encoding_cache_mb=%s; "
+                    "keeping it (new value %s ignored)", _ENCODING_CACHE_MB, value)
+        return _ENCODING_CACHE_MB
+    _ENCODING_CACHE_MB = value
+    return _ENCODING_CACHE_MB
+
+
 def configure_inference_mode(inference_mode):
     """设定服务端推理路径（joint/split；必须在第一次请求之前调用）。"""
     global _INFERENCE_MODE
@@ -94,6 +110,7 @@ def get_server():
     logf = open(log_path, "a", buffering=1)
     command = [sys.executable, DEMO_MASK_PATH, "--server",
                "--geometry-cache-mb", str(_GEOMETRY_CACHE_MB),
+               "--encoding-cache-mb", str(_ENCODING_CACHE_MB),
                "--inference-mode", _INFERENCE_MODE]
     if _ALLOW_TF32 is True:
         command.append("--allow-tf32")
@@ -103,9 +120,10 @@ def get_server():
         command, stdin=subprocess.PIPE, stdout=logf, stderr=logf,
         text=True, cwd=DEMO_MASK_CWD)
     atexit.register(shutdown_server)
-    log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, inference_mode=%s, "
-             "allow_tf32=%s, log=%s)",
-             _SERVER.pid, _GEOMETRY_CACHE_MB, _INFERENCE_MODE, _ALLOW_TF32, log_path)
+    log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, encoding_cache_mb=%s, "
+             "inference_mode=%s, allow_tf32=%s, log=%s)",
+             _SERVER.pid, _GEOMETRY_CACHE_MB, _ENCODING_CACHE_MB, _INFERENCE_MODE,
+             _ALLOW_TF32, log_path)
     return _SERVER
 
 
@@ -169,7 +187,7 @@ def start_request(target, source, chain_pdb, output_dir,
             os.remove(fp)
 
     server = get_server()
-    req = json.dumps({
+    request = {
         "target": str(target),
         "source": str(source),
         "chain_pdb": str(chain_pdb) if chain_pdb else None,
@@ -178,9 +196,11 @@ def start_request(target, source, chain_pdb, output_dir,
         "configs": configs,
         "mask_radius_factor": mask_radius_factor,
         "min_point_distance_factor": min_point_distance_factor,
-        "inference_mode": inference_mode,
-    })
-    server.stdin.write(req + "\n")
+    }
+    # inference_mode 为 None 表示"用服务端设定"：此时**不写该键**（写 None 会被服务端当成非法值）
+    if inference_mode is not None:
+        request["inference_mode"] = inference_mode
+    server.stdin.write(json.dumps(request) + "\n")
     server.stdin.flush()
     log.info("PARENet request: %s", os.path.basename(str(source)))
     return ParenetRequest(output_dir)

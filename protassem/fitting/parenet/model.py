@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -717,6 +718,21 @@ class PARE_Net(nn.Module):
 def create_model(config):
     model = PARE_Net(config)
     return model
+
+
+def model_fingerprint(model):
+    """权重与结构的指纹（T07 编码缓存 key 的一部分）。
+
+    覆盖 state_dict 的键名/形状/dtype 与全部权重字节：权重一变（重新训练、换了 checkpoint）
+    缓存即失效。只看一次调用（模型加载后计算一次即可），约 0.1–0.2 s。
+    """
+    digest = hashlib.sha256()
+    state = model.state_dict()
+    for name in sorted(state):
+        tensor = state[name]
+        digest.update(("%s;%s;%s;" % (name, tuple(tensor.shape), tensor.dtype)).encode())
+        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
 
 def main():
     from config import make_cfg

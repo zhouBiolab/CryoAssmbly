@@ -20,6 +20,7 @@
 """
 
 import hashlib
+import struct
 import time
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence, Tuple
@@ -38,6 +39,8 @@ GEOMETRY_VERSION = 1
 FPS_TARGET_RATIO = 0.25     # 与 pareconv precompute_subsample 的 fps 分支一致
 # 只有确定性采样才能缓存：fps 走 pytorch3d 的 random_start_point，结果依赖全局 RNG 状态
 DETERMINISTIC_SAMPLING = ("voxel",)
+# 编码语义版本（T07）：改动 encode_cloud 的输出内容/含义时必须 +1（编码缓存 key 的一部分）
+ENCODING_CACHE_VERSION = 1
 
 
 class GeometryError(ValueError):
@@ -67,6 +70,9 @@ class CloudGeometry:
     subsampling: List[torch.Tensor] = field(default_factory=list)   # (N_{i+1}, k) 指向 points[i]
     upsampling: List[Optional[torch.Tensor]] = field(default_factory=list)  # (N_i, 1) 指向 points[i+1]
     node_partition: Optional[NodePartition] = None
+    # 指纹记忆（不参与相等性比较）：只覆盖不可变部分（点/特征/配置），
+    # build_neighbors/attach_node_partition 的改动不影响它，因此缓存安全
+    _fingerprint: Optional[str] = field(default=None, repr=False, compare=False)
 
     @property
     def device(self):
@@ -87,8 +93,11 @@ class CloudGeometry:
     def fingerprint(self):
         """几何指纹：实际点集与顺序、特征、生效采样配置、结构版本。
 
-        供 T05 的几何缓存做 key；不含质心（质心只影响写出，不影响网络输入）。
+        供 T05 几何缓存与 T07 编码缓存做 key；不含质心（质心只影响写出，不影响网络输入）。
+        首次计算后记忆（只覆盖不可变部分，见 `_fingerprint` 字段说明）。
         """
+        if self._fingerprint is not None:
+            return self._fingerprint
         digest = hashlib.sha256()
         digest.update(("geometry_version=%d;" % GEOMETRY_VERSION).encode())
         digest.update(("stages=%d;voxels=%s;sampling=%s;"
@@ -103,7 +112,8 @@ class CloudGeometry:
         features = self.features.detach().cpu().numpy()
         digest.update(("features;dtype=%s;shape=%s;" % (features.dtype, features.shape)).encode())
         digest.update(np.ascontiguousarray(features).tobytes())
-        return digest.hexdigest()
+        self._fingerprint = digest.hexdigest()
+        return self._fingerprint
 
 
 def _check_points(points, features):
@@ -470,3 +480,77 @@ def acquire_geometry(cache, points, features, voxel_sizes, sampling_method, num_
                          collate_seconds=collate_seconds,
                          neighbors_seconds=neighbors_seconds,
                          store_seconds=store_seconds)
+
+
+# ======================================================================
+# 源编码缓存（T07）：精确 scale，GPU 预算 256 MiB
+# ======================================================================
+
+def object_tensor_bytes(value):
+    """通用字节计费：dataclass 实例（或张量/列表）里全部张量的字节数。
+
+    编码结果（EncodedCloud）与几何一样是 dataclass，字段里有张量/可选张量；
+    这里递归求和，避免遗漏新字段导致账面低估。
+    """
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (list, tuple)):
+        return sum(object_tensor_bytes(item) for item in value)
+    if hasattr(value, "__dataclass_fields__"):
+        return sum(object_tensor_bytes(getattr(value, name))
+                   for name in value.__dataclass_fields__)
+    return 0
+
+
+def encoding_cache_key(geometry_key, scale, model_fingerprint, dtype,
+                       version=ENCODING_CACHE_VERSION):
+    """编码缓存 key：几何指纹 + 精确 scale bits + 权重/配置指纹 + dtype + 编码版本。
+
+    - 几何指纹覆盖"实际点集与顺序 + 特征 + 生效采样配置"（旋转/平移/换掩码都会变）；
+    - scale 用**精确位模式**（`struct.pack(">f")`），不做分桶，避免近似尺度错命中；
+    - 权重/配置指纹来自 `model_fingerprint()`，权重变化即失效。
+    """
+    digest = hashlib.sha256()
+    digest.update(("encoding_version=%d;" % version).encode())
+    digest.update(("geometry=%s;" % geometry_key).encode())
+    digest.update(("scale_bits=%s;" % struct.pack(">f", float(scale)).hex()).encode())
+    digest.update(("model=%s;" % model_fingerprint).encode())
+    digest.update(("dtype=%s;" % dtype).encode())
+    return digest.hexdigest()
+
+
+class EncodingCache:
+    """源编码的**有界 GPU** 缓存（T07）。
+
+    - 只缓存**源**侧编码；目标编码只保留当前请求（用完即释放），符合任务卡"优先当前源"；
+    - 预算以字节计（默认 256 MiB），0 = 关闭；单条超预算时正常使用但不缓存；
+    - 不缓存 attention 大矩阵、逐层激活或 hypotheses（这些本来就不在 `EncodedCloud` 里）；
+    - key 用精确 scale 位模式，无分桶、无磁盘持久化。
+    """
+
+    def __init__(self, capacity_bytes, model_fingerprint, name="encoding"):
+        self.model_fingerprint = model_fingerprint
+        self._cache = ByteLruCache(capacity_bytes, object_tensor_bytes, name=name)
+
+    @property
+    def enabled(self):
+        return self._cache.enabled
+
+    @property
+    def capacity_bytes(self):
+        return self._cache.capacity_bytes
+
+    def key_for(self, geometry, scale, dtype="torch.float32"):
+        return encoding_cache_key(geometry.fingerprint(), scale, self.model_fingerprint,
+                                  dtype)
+
+    def get(self, geometry, scale, dtype="torch.float32"):
+        """命中返回编码（GPU 张量，只读）；未命中返回 None。"""
+        return self._cache.get(self.key_for(geometry, scale, dtype))
+
+    def put(self, geometry, scale, encoded, dtype="torch.float32"):
+        """存入编码（同设备、只读约定）；返回是否真的存下。"""
+        return self._cache.put(self.key_for(geometry, scale, dtype), encoded)
+
+    def snapshot(self):
+        return self._cache.snapshot()

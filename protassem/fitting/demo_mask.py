@@ -34,10 +34,12 @@ from protassem.fitting.parenet.config import make_cfg
 from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELDS
 from protassem.core.points_txt import read_point_cloud_file
 from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
-                                              GeometryCache)
-from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_GEOMETRY_CACHE_MB,
-                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES,
-                                      apply_tf32_policy, effective_allow_tf32)
+                                              EncodingCache, GeometryCache)
+from protassem.fitting.parenet.model import model_fingerprint
+from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_ENCODING_CACHE_MB,
+                                      DEFAULT_GEOMETRY_CACHE_MB, DEFAULT_INFERENCE_MODE,
+                                      INFERENCE_MODES, apply_tf32_policy,
+                                      effective_allow_tf32)
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -175,12 +177,13 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                         output_dir=None, use_mask=False, masks=None,
                         masks_save_path=None, mask_suffix=None,
                         original_target_data=None, geometry_cache=None,
-                        inference_mode=DEFAULT_INFERENCE_MODE):
+                        inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None):
     """Run PARENet inference on one source-target pair.
 
     只有本函数调用模型；@torch.no_grad() 覆盖"单侧几何构建 → 编码 → 配准 → 后处理"全路径。
     geometry_cache：T05 的单侧几何缓存（None = 关闭；由服务进程或调用方显式拥有）。
     inference_mode：joint = 联合布局 + `forward`（默认，旧数值）；split = 单侧编码 + 双侧配准。
+    encoding_cache：T07 的源编码缓存（仅 split 模式使用；None = 关闭）。
     """
     result = {
         "source_file": os.path.basename(source_path),
@@ -297,15 +300,32 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
             ref_encoded = model.encode_cloud(ref_geometry, scale, timing=timing_sink)
             _record_timing(output_dir, "server_encode_tgt", time.perf_counter() - _t_stage,
                            config_id=config_id, sampling=sampling_method)
-            _t_stage = time.perf_counter()
-            src_encoded = model.encode_cloud(src_geometry, scale, timing=timing_sink)
-            _record_timing(output_dir, "server_encode_src", time.perf_counter() - _t_stage,
-                           config_id=config_id, sampling=sampling_method)
+            # T07：源编码命中则跳过源 backbone（目标编码不缓存，只保留当前掩码结果）
+            src_encoded, src_hit = None, False
+            if encoding_cache is not None and encoding_cache.enabled:
+                _t_stage = time.perf_counter()
+                src_encoded = encoding_cache.get(src_geometry, scale)
+                src_hit = src_encoded is not None
+                _record_timing(output_dir, "server_encode_cache",
+                               time.perf_counter() - _t_stage, src_hit=src_hit)
+            if src_encoded is None:
+                _t_stage = time.perf_counter()
+                src_encoded = model.encode_cloud(src_geometry, scale, timing=timing_sink)
+                _record_timing(output_dir, "server_encode_src",
+                               time.perf_counter() - _t_stage,
+                               config_id=config_id, sampling=sampling_method,
+                               cached=False)
+                if encoding_cache is not None and encoding_cache.enabled:
+                    _t_stage = time.perf_counter()
+                    encoding_cache.put(src_geometry, scale, src_encoded)
+                    _record_timing(output_dir, "server_encode_store",
+                                   time.perf_counter() - _t_stage)
             _t_stage = time.perf_counter()
             output_dict = model.register_pair(
                 ref_encoded, src_encoded, output_fields=INFERENCE_OUTPUT_FIELDS,
                 timing=timing_sink)
-            _record_timing(output_dir, "server_register", time.perf_counter() - _t_stage)
+            _record_timing(output_dir, "server_register", time.perf_counter() - _t_stage,
+                           src_cache_hit=src_hit)
 
         # 后处理计时必须从模型结束处开始，否则会与 server_forward 重叠相加（T02 偏差处理）
         _t_stage = time.perf_counter()
@@ -414,6 +434,9 @@ def make_parser():
     p.add_argument("--geometry-cache-mb", type=int, default=DEFAULT_GEOMETRY_CACHE_MB,
                    help="单侧几何 CPU 缓存容量（MiB，0 = 关闭；默认 %d）"
                         % DEFAULT_GEOMETRY_CACHE_MB)
+    p.add_argument("--encoding-cache-mb", type=int, default=DEFAULT_ENCODING_CACHE_MB,
+                   help="源编码缓存 GPU 预算（MiB，0 = 关闭；仅 split 模式；默认 %d）"
+                        % DEFAULT_ENCODING_CACHE_MB)
     p.add_argument("--inference-mode", choices=INFERENCE_MODES, default=DEFAULT_INFERENCE_MODE,
                    help="推理路径：joint = 联合布局 + forward（默认，旧数值）；"
                         "split = 单侧编码 + 双侧配准（要求关闭 TF32）")
@@ -461,7 +484,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                   mask_radius_factor=1.35, min_coverage=0.15,
                   min_point_distance_factor=0.32, stop_file=None,
                   geometry_cache=None, allow_tf32=DEFAULT_ALLOW_TF32,
-                  inference_mode=DEFAULT_INFERENCE_MODE):
+                  inference_mode=DEFAULT_INFERENCE_MODE, encoding_cache=None):
     """Run PARENet inference for one source/target pair.
 
     Algorithm identical to the original main(); only parameterized so the model
@@ -471,6 +494,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     geometry_cache：T05 单侧几何缓存（None = 关闭）；由调用方显式传入并拥有。
     allow_tf32    ：TF32 策略（None = 跟随 inference_mode；由调用方解析）。
     inference_mode："joint"（联合布局 + forward，默认）或 "split"（单侧编码 + 双侧配准）。
+    encoding_cache：T07 源编码缓存（None = 关闭；仅 split 模式使用）。
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -547,7 +571,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             output_dir, use_mask=False,
                             mask_suffix=suffix, original_target_data=tgt_data,
                             geometry_cache=geometry_cache,
-                            inference_mode=inference_mode)
+                            inference_mode=inference_mode,
+                            encoding_cache=encoding_cache)
                         mask_results.append(r)
                         all_results.append(r)
                     except Exception as e:
@@ -573,7 +598,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                         output_dir, use_mask=use_mask,
                         masks=masks, masks_save_path=masks_save_path,
                         geometry_cache=geometry_cache,
-                        inference_mode=inference_mode)
+                        inference_mode=inference_mode,
+                        encoding_cache=encoding_cache)
                     all_results.append(r)
                     if not r["error"]:
                         log.info("Config %d-%s: overlap=%.6f", cid, sm, r.get("overlap", 0))
@@ -617,7 +643,8 @@ def _record_timing(output_dir, stage, elapsed_s, **fields):
 
 
 def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
-                 inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32):
+                 inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32,
+                 encoding_cache_mb=DEFAULT_ENCODING_CACHE_MB):
     """Read one JSON request per stdin line; signal completion via _DONE file.
 
     Request keys: target, source, chain_pdb, output_dir, use_mask, configs,
@@ -628,13 +655,22 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
 
     T05：几何缓存由**本服务进程拥有**，跨请求复用（容量以 MiB 计，0 = 关闭）。
     T06：推理路径与 TF32 策略在加载模型时设定（默认 joint + 框架默认精度，即旧数值）。
+    T07：源编码缓存（GPU，仅 split 模式）同样由本进程拥有、跨请求复用。
     """
     resolved_tf32 = effective_allow_tf32(inference_mode, allow_tf32)
-    _get_model(weights, resolved_tf32)  # preload once
+    model, _cfg = _get_model(weights, resolved_tf32)  # preload once
     geometry_cache = GeometryCache(int(geometry_cache_mb) * 1024 * 1024) \
         if geometry_cache_mb else None
-    log.info("PARENet server ready (pid=%d, geometry_cache_mb=%s, inference_mode=%s, allow_tf32=%s)",
-             os.getpid(), geometry_cache_mb, inference_mode, resolved_tf32)
+    encoding_cache = None
+    if inference_mode == "split" and encoding_cache_mb:
+        fingerprint = model_fingerprint(model)
+        encoding_cache = EncodingCache(int(encoding_cache_mb) * 1024 * 1024, fingerprint)
+        log.info("Encoding cache enabled: %d MiB, model fingerprint %s…",
+                 encoding_cache_mb, fingerprint[:12])
+    log.info("PARENet server ready (pid=%d, geometry_cache_mb=%s, inference_mode=%s, "
+             "allow_tf32=%s, encoding_cache_mb=%s)",
+             os.getpid(), geometry_cache_mb, inference_mode, resolved_tf32,
+             encoding_cache_mb if encoding_cache is not None else 0)
     _last_request_end = time.perf_counter()
     for line in sys.stdin:
         line = line.strip()
@@ -663,7 +699,8 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                 min_point_distance_factor=req.get("min_point_distance_factor", 0.32),
                 stop_file=stop_file, geometry_cache=geometry_cache,
                 allow_tf32=resolved_tf32,
-                inference_mode=req.get("inference_mode", inference_mode))
+                inference_mode=req.get("inference_mode") or inference_mode,
+                encoding_cache=encoding_cache)
         except Exception as e:
             log.error("request failed: %s", e)
         finally:
@@ -678,6 +715,9 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
         if geometry_cache is not None:
             _record_timing(output_dir, "server_cache_stats", 0.0,
                            **geometry_cache.snapshot())
+        if encoding_cache is not None:
+            _record_timing(output_dir, "server_encoding_cache_stats", 0.0,
+                           **encoding_cache.snapshot())
 
 
 def main():
@@ -685,7 +725,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
     if args.server:
-        _server_loop(args.weights, args.geometry_cache_mb, args.inference_mode, args.allow_tf32)
+        _server_loop(args.weights, args.geometry_cache_mb, args.inference_mode,
+                     args.allow_tf32, args.encoding_cache_mb)
         return
 
     # single-run CLI (backward compatible)
@@ -695,6 +736,12 @@ def main():
     output_dir = args.output_dir or os.path.dirname(args.source)
     geometry_cache = GeometryCache(args.geometry_cache_mb * 1024 * 1024) \
         if args.geometry_cache_mb else None
+    encoding_cache = None
+    if args.inference_mode == "split" and args.encoding_cache_mb:
+        resolved_tf32 = effective_allow_tf32(args.inference_mode, args.allow_tf32)
+        model_net, _cfg = _get_model(args.weights, resolved_tf32)
+        encoding_cache = EncodingCache(args.encoding_cache_mb * 1024 * 1024,
+                                       model_fingerprint(model_net))
     run_inference(
         target=args.target, source=args.source, chain_pdb=args.chain_pdb,
         output_dir=output_dir, weights=args.weights, use_mask=args.use_mask,
@@ -702,7 +749,7 @@ def main():
         mask_radius_factor=args.mask_radius_factor, min_coverage=args.min_coverage,
         min_point_distance_factor=args.min_point_distance_factor,
         geometry_cache=geometry_cache, allow_tf32=args.allow_tf32,
-        inference_mode=args.inference_mode)
+        inference_mode=args.inference_mode, encoding_cache=encoding_cache)
 
 
 if __name__ == "__main__":
