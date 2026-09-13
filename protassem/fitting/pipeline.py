@@ -205,6 +205,8 @@ def _start_parenet(target, source, chain_pdb, output_dir):
     """Send a fitting request to the persistent PARENet server.
 
     Returns a request handle (poll()/terminate()) compatible with the monitor.
+    推理路径由服务端配置（`parenet_client.configure_inference_mode`，来自 RuntimeConfig）；
+    这里不额外覆盖。
     """
     task_id = os.path.basename(output_dir)
     with _METRICS.stage("request_submit", task_id=task_id):

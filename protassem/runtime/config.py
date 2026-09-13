@@ -18,6 +18,46 @@ THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 # main.py 必须在导入 NumPy/Torch 之前导入它（两段式导入，P1）。
 DEFAULT_GEOMETRY_CACHE_MB = 512
 
+# 模型推理是否允许 TF32。T06 实测：TF32 会让卷积/matmul 的数值依赖张量形状，从而让"单侧编码"
+# 这种改变形状的重构改变结果（真实输入位姿差 0.127）；关闭后差 3.8e-06。该精度模式在本模型上
+# 也没有带来可测加速，因此 **split 模式强制关闭**；joint（旧路径）跟随框架默认（True）以保持
+# 既有数值与冻结基线。
+DEFAULT_ALLOW_TF32 = None       # None = 跟随 inference_mode
+
+# 推理路径：joint = 联合布局 + forward（旧路径，默认）；split = 单侧编码 + 双侧配准（T06 起可选）
+INFERENCE_MODES = ("joint", "split")
+DEFAULT_INFERENCE_MODE = "joint"
+
+
+def effective_allow_tf32(inference_mode, allow_tf32=None):
+    """解析 TF32 策略：显式值优先；未给定时跟随推理模式。
+
+    split 模式在 TF32 下**不等价**（实测位姿差 0.127），因此显式要求 allow_tf32=True 时直接报错，
+    而不是给出"看起来正常"的错误结果。
+    """
+    if inference_mode not in INFERENCE_MODES:
+        raise ValueError("未知的 inference_mode: %r（支持 %s）"
+                         % (inference_mode, "/".join(INFERENCE_MODES)))
+    if allow_tf32 is None:
+        return inference_mode == "joint"
+    if inference_mode == "split" and allow_tf32:
+        raise ValueError("inference_mode=split 要求 allow_tf32=false：TF32 下单侧编码不等价"
+                         "（真实输入位姿差 0.127）")
+    return bool(allow_tf32)
+
+
+def apply_tf32_policy(allow_tf32):
+    """设定 TF32 精度策略（在**模型推理进程**里调用，早于任何前向）。
+
+    allow_tf32=False：关闭 cuDNN 卷积与 matmul 的 TF32，数值与张量形状无关（split 模式要求）。
+    allow_tf32=True ：保留框架默认（PyTorch 1.10 两者默认 True），即 joint 旧路径的既有数值。
+    """
+    import torch
+    torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+    torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+    return {"cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+            "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32)}
+
 
 @dataclass
 class RuntimeConfig:
@@ -29,6 +69,18 @@ class RuntimeConfig:
     pool_start_method: str = None
     # 单侧几何 CPU 缓存容量（MiB，0 = 关闭）；透传给 PARENet 常驻服务进程（T05）
     geometry_cache_mb: int = DEFAULT_GEOMETRY_CACHE_MB
+    # 推理路径（T06）：joint = 联合布局 + forward（默认，保持既有数值）；split = 单侧编码 + 双侧配准
+    inference_mode: str = DEFAULT_INFERENCE_MODE
+    # TF32：None = 跟随 inference_mode（joint→True、split→False）；split 下不允许 True
+    allow_tf32: bool = DEFAULT_ALLOW_TF32
+
+    def __post_init__(self):
+        # 早失败：非法模式或不安全的精度组合在构造配置时就报错
+        effective_allow_tf32(self.inference_mode, self.allow_tf32)
+
+    def tf32(self):
+        """实测生效的 TF32 策略（解析 inference_mode 与显式覆盖）。"""
+        return effective_allow_tf32(self.inference_mode, self.allow_tf32)
 
     @classmethod
     def from_json(cls, path):

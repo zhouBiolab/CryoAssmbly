@@ -35,7 +35,9 @@ from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELD
 from protassem.core.points_txt import read_point_cloud_file
 from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
                                               GeometryCache)
-from protassem.runtime.config import DEFAULT_GEOMETRY_CACHE_MB
+from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_GEOMETRY_CACHE_MB,
+                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES,
+                                      apply_tf32_policy, effective_allow_tf32)
 
 from protassem.fitting.utils import (
     compute_overlap,
@@ -172,11 +174,13 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                         chain_pdb_path, model, cfg, config_id, sampling_method,
                         output_dir=None, use_mask=False, masks=None,
                         masks_save_path=None, mask_suffix=None,
-                        original_target_data=None, geometry_cache=None):
+                        original_target_data=None, geometry_cache=None,
+                        inference_mode=DEFAULT_INFERENCE_MODE):
     """Run PARENet inference on one source-target pair.
 
-    只有本函数调用模型；@torch.no_grad() 覆盖"单侧几何构建 → 联合拼装 → 前向 → 后处理"全路径。
+    只有本函数调用模型；@torch.no_grad() 覆盖"单侧几何构建 → 编码 → 配准 → 后处理"全路径。
     geometry_cache：T05 的单侧几何缓存（None = 关闭；由服务进程或调用方显式拥有）。
+    inference_mode：joint = 联合布局 + `forward`（默认，旧数值）；split = 单侧编码 + 双侧配准。
     """
     result = {
         "source_file": os.path.basename(source_path),
@@ -255,11 +259,17 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         _record_timing(output_dir, "server_cache_store",
                        ref_acquired.store_seconds + src_acquired.store_seconds)
 
-        _t_stage = time.perf_counter()
-        data_dict = join_geometries(
-            ref_geometry, src_geometry, scale=scale,
-            transform=torch.from_numpy(np.eye(4, dtype=np.float32)))
-        _record_timing(output_dir, "server_join", time.perf_counter() - _t_stage)
+        # T06：inference_mode="split" 时走单侧编码（可缓存）+ 双侧配准；"joint" 时走旧联合布局 + forward
+        timing_sink = lambda stage, seconds: _record_timing(  # noqa: E731
+            output_dir, stage, seconds, config_id=config_id, sampling=sampling_method)
+        joint_reference = inference_mode == "joint"
+        data_dict = None
+        if joint_reference:
+            _t_stage = time.perf_counter()
+            data_dict = join_geometries(
+                ref_geometry, src_geometry, scale=scale,
+                transform=torch.from_numpy(np.eye(4, dtype=np.float32)))
+            _record_timing(output_dir, "server_join", time.perf_counter() - _t_stage)
 
         # T02：输入指纹与有效参数（用于判断缓存可复用比例）
         import struct
@@ -273,16 +283,29 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                        src_radius=float(np.linalg.norm(src_norm, axis=1).max()),
                        scale=float(scale),
                        scale_bits=struct.pack(">f", float(scale)).hex(),
+                       inference_mode=inference_mode,
                        collate_stage_points=[int(item.shape[0]) for item in
-                                             data_dict["points"]])
+                                             ref_geometry.points])
 
-        _t_stage = time.perf_counter()
-        output_dict = model(
-            data_dict, output_fields=INFERENCE_OUTPUT_FIELDS,
-            timing=lambda stage, seconds: _record_timing(
-                output_dir, stage, seconds, config_id=config_id,
-                sampling=sampling_method))
-        _record_timing(output_dir, "server_forward", time.perf_counter() - _t_stage)
+        if joint_reference:
+            _t_stage = time.perf_counter()
+            output_dict = model(data_dict, output_fields=INFERENCE_OUTPUT_FIELDS,
+                                timing=timing_sink)
+            _record_timing(output_dir, "server_forward", time.perf_counter() - _t_stage)
+        else:
+            _t_stage = time.perf_counter()
+            ref_encoded = model.encode_cloud(ref_geometry, scale, timing=timing_sink)
+            _record_timing(output_dir, "server_encode_tgt", time.perf_counter() - _t_stage,
+                           config_id=config_id, sampling=sampling_method)
+            _t_stage = time.perf_counter()
+            src_encoded = model.encode_cloud(src_geometry, scale, timing=timing_sink)
+            _record_timing(output_dir, "server_encode_src", time.perf_counter() - _t_stage,
+                           config_id=config_id, sampling=sampling_method)
+            _t_stage = time.perf_counter()
+            output_dict = model.register_pair(
+                ref_encoded, src_encoded, output_fields=INFERENCE_OUTPUT_FIELDS,
+                timing=timing_sink)
+            _record_timing(output_dir, "server_register", time.perf_counter() - _t_stage)
 
         # 后处理计时必须从模型结束处开始，否则会与 server_forward 重叠相加（T02 偏差处理）
         _t_stage = time.perf_counter()
@@ -391,6 +414,13 @@ def make_parser():
     p.add_argument("--geometry-cache-mb", type=int, default=DEFAULT_GEOMETRY_CACHE_MB,
                    help="单侧几何 CPU 缓存容量（MiB，0 = 关闭；默认 %d）"
                         % DEFAULT_GEOMETRY_CACHE_MB)
+    p.add_argument("--inference-mode", choices=INFERENCE_MODES, default=DEFAULT_INFERENCE_MODE,
+                   help="推理路径：joint = 联合布局 + forward（默认，旧数值）；"
+                        "split = 单侧编码 + 双侧配准（要求关闭 TF32）")
+    p.add_argument("--allow-tf32", dest="allow_tf32", action="store_true", default=DEFAULT_ALLOW_TF32,
+                   help="允许 TF32（默认跟随推理模式：joint 允许、split 不允许）")
+    p.add_argument("--no-allow-tf32", dest="allow_tf32", action="store_false",
+                   help="关闭 TF32（数值与张量形状无关；split 模式必须）")
     p.add_argument("--server", action="store_true",
                    help="persistent server mode: load model once, serve stdin requests")
     return p
@@ -404,16 +434,21 @@ _MODEL = None
 _CFG = None
 
 
-def _get_model(weights):
-    """Load the PARENet model once and cache it (model, cfg)."""
+def _get_model(weights, allow_tf32):
+    """Load the PARENet model once and cache it (model, cfg).
+
+    TF32 策略在**加载时**设定（早于任何前向）；取值由调用方按 inference_mode 解析
+    （见 `runtime/config.effective_allow_tf32`），本函数只负责应用。
+    """
     global _MODEL, _CFG
     if _MODEL is None:
+        policy = apply_tf32_policy(allow_tf32)
         _CFG = make_cfg()
         _MODEL = create_model(_CFG).cuda()
         state = torch.load(weights)
         _MODEL.load_state_dict(state["model"])
         _MODEL.eval()
-        log.info("Model loaded (cached)")
+        log.info("Model loaded (cached); TF32 policy: %s", policy)
     return _MODEL, _CFG
 
 
@@ -425,7 +460,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                   use_mask=True, configs="all", seed=100000,
                   mask_radius_factor=1.35, min_coverage=0.15,
                   min_point_distance_factor=0.32, stop_file=None,
-                  geometry_cache=None):
+                  geometry_cache=None, allow_tf32=DEFAULT_ALLOW_TF32,
+                  inference_mode=DEFAULT_INFERENCE_MODE):
     """Run PARENet inference for one source/target pair.
 
     Algorithm identical to the original main(); only parameterized so the model
@@ -433,6 +469,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     in-process equivalent of killing the old subprocess).
 
     geometry_cache：T05 单侧几何缓存（None = 关闭）；由调用方显式传入并拥有。
+    allow_tf32    ：TF32 策略（None = 跟随 inference_mode；由调用方解析）。
+    inference_mode："joint"（联合布局 + forward，默认）或 "split"（单侧编码 + 双侧配准）。
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -442,7 +480,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         log.error("Mask mode requested but sw_mask not available")
         return
 
-    model_net, cfg = _get_model(weights)
+    model_net, cfg = _get_model(weights, effective_allow_tf32(inference_mode, allow_tf32))
     os.makedirs(output_dir, exist_ok=True)
 
     CONFIGS = VOXEL_SIZE_CONFIGS_MASK if use_mask else VOXEL_SIZE_CONFIGS_NORMAL
@@ -508,7 +546,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             chain_pdb, model_net, cfg, cid, sm,
                             output_dir, use_mask=False,
                             mask_suffix=suffix, original_target_data=tgt_data,
-                            geometry_cache=geometry_cache)
+                            geometry_cache=geometry_cache,
+                            inference_mode=inference_mode)
                         mask_results.append(r)
                         all_results.append(r)
                     except Exception as e:
@@ -533,7 +572,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                         chain_pdb, model_net, cfg, cid, sm,
                         output_dir, use_mask=use_mask,
                         masks=masks, masks_save_path=masks_save_path,
-                        geometry_cache=geometry_cache)
+                        geometry_cache=geometry_cache,
+                        inference_mode=inference_mode)
                     all_results.append(r)
                     if not r["error"]:
                         log.info("Config %d-%s: overlap=%.6f", cid, sm, r.get("overlap", 0))
@@ -576,7 +616,8 @@ def _record_timing(output_dir, stage, elapsed_s, **fields):
         log.warning("server timing write failed: %s", exc)
 
 
-def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB):
+def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
+                 inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32):
     """Read one JSON request per stdin line; signal completion via _DONE file.
 
     Request keys: target, source, chain_pdb, output_dir, use_mask, configs,
@@ -586,12 +627,14 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB):
     so the client never blocks on a full pipe.
 
     T05：几何缓存由**本服务进程拥有**，跨请求复用（容量以 MiB 计，0 = 关闭）。
+    T06：推理路径与 TF32 策略在加载模型时设定（默认 joint + 框架默认精度，即旧数值）。
     """
-    _get_model(weights)  # preload once
+    resolved_tf32 = effective_allow_tf32(inference_mode, allow_tf32)
+    _get_model(weights, resolved_tf32)  # preload once
     geometry_cache = GeometryCache(int(geometry_cache_mb) * 1024 * 1024) \
         if geometry_cache_mb else None
-    log.info("PARENet server ready (pid=%d, geometry_cache_mb=%s)",
-             os.getpid(), geometry_cache_mb)
+    log.info("PARENet server ready (pid=%d, geometry_cache_mb=%s, inference_mode=%s, allow_tf32=%s)",
+             os.getpid(), geometry_cache_mb, inference_mode, resolved_tf32)
     _last_request_end = time.perf_counter()
     for line in sys.stdin:
         line = line.strip()
@@ -618,7 +661,9 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB):
                 mask_radius_factor=req.get("mask_radius_factor", 1.35),
                 min_coverage=req.get("min_coverage", 0.15),
                 min_point_distance_factor=req.get("min_point_distance_factor", 0.32),
-                stop_file=stop_file, geometry_cache=geometry_cache)
+                stop_file=stop_file, geometry_cache=geometry_cache,
+                allow_tf32=resolved_tf32,
+                inference_mode=req.get("inference_mode", inference_mode))
         except Exception as e:
             log.error("request failed: %s", e)
         finally:
@@ -640,7 +685,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
     if args.server:
-        _server_loop(args.weights, args.geometry_cache_mb)
+        _server_loop(args.weights, args.geometry_cache_mb, args.inference_mode, args.allow_tf32)
         return
 
     # single-run CLI (backward compatible)
@@ -656,7 +701,8 @@ def main():
         configs=args.configs, seed=args.seed,
         mask_radius_factor=args.mask_radius_factor, min_coverage=args.min_coverage,
         min_point_distance_factor=args.min_point_distance_factor,
-        geometry_cache=geometry_cache)
+        geometry_cache=geometry_cache, allow_tf32=args.allow_tf32,
+        inference_mode=args.inference_mode)
 
 
 if __name__ == "__main__":

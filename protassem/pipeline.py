@@ -107,14 +107,21 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     setup_logging(output_dir, log_file)
 
     if runtime_config is not None:
-        log.info("Runtime config: blas_threads=%d seed=%d geometry_cache_mb=%d",
+        log.info("Runtime config: blas_threads=%d seed=%d geometry_cache_mb=%d "
+                 "inference_mode=%s allow_tf32=%s(生效 %s)",
                  runtime_config.blas_threads, runtime_config.seed,
-                 runtime_config.geometry_cache_mb)
+                 runtime_config.geometry_cache_mb, runtime_config.inference_mode,
+                 runtime_config.allow_tf32, runtime_config.tf32())
         log.info("Effective threads: %s",
                  runtime_config.describe_effective_threads())
-        # T05：几何缓存容量透传给 PARENet 常驻服务进程（必须在第一次请求前设定）
-        from protassem.fitting.parenet_client import configure_geometry_cache
+        # T05/T06：缓存容量、推理路径与 TF32 策略透传给 PARENet 常驻服务进程
+        # （必须在第一次请求前设定；服务已在运行时只告警不重启）
+        from protassem.fitting.parenet_client import (configure_allow_tf32,
+                                                     configure_geometry_cache,
+                                                     configure_inference_mode)
         configure_geometry_cache(runtime_config.geometry_cache_mb)
+        configure_allow_tf32(runtime_config.allow_tf32)
+        configure_inference_mode(runtime_config.inference_mode)
 
     metrics = Metrics(os.path.join(output_dir, "metrics"))
     pipeline_started = time.perf_counter()

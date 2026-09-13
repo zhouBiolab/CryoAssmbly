@@ -216,16 +216,40 @@ def build_geometry(points, features, voxel_sizes, sampling_method, num_neighbors
     return build_neighbors(geometry, num_neighbors)
 
 
-def attach_node_partition(geometry, num_points_in_patch, fine_stage=1, coarse_stage=-1):
-    """就地补齐节点分区（细节点 → 最近粗节点），与模型里 point_to_node_partition 同源。"""
+def node_partition(geometry, num_points_in_patch, fine_stage=1, coarse_stage=-1):
+    """单侧节点分区（细节点 → 最近粗节点），与模型 `point_to_node_partition` 同源。
+
+    注意：分区依赖 `num_points_in_patch`，属于**编码**层（T06 的 `EncodedCloud` 保存它）；
+    几何缓存（T05）的 key 不含该项，因此生产路径不把分区放进几何、而是编码时现算。
+    """
     if geometry.num_stages < 2:
         raise GeometryError("节点分区至少需要 2 个阶段")
     fine = geometry.points[fine_stage][:, :3].contiguous()
     coarse = geometry.points[coarse_stage][:, :3].contiguous()
     _, masks, knn_indices, knn_masks = point_to_node_partition(fine, coarse, num_points_in_patch)
-    geometry.node_partition = NodePartition(masks=masks, knn_indices=knn_indices,
-                                            knn_masks=knn_masks)
+    return NodePartition(masks=masks, knn_indices=knn_indices, knn_masks=knn_masks)
+
+
+def attach_node_partition(geometry, num_points_in_patch, fine_stage=1, coarse_stage=-1):
+    """就地补齐节点分区（T04 的几何记录能力；编码路径按需现算，见 `node_partition`）。"""
+    geometry.node_partition = node_partition(geometry, num_points_in_patch,
+                                             fine_stage=fine_stage, coarse_stage=coarse_stage)
     return geometry
+
+
+def backbone_input(geometry, scale, device=None):
+    """单侧几何 → backbone 需要的输入字典（局部索引，无需跨侧偏移）。
+
+    `upsampling` 在 pareconv 里是紧凑列表（元素 j 对应 stage j+1），这里按该约定还原。
+    """
+    device = geometry.device if device is None else device
+    return {
+        "points": geometry.points,
+        "neighbors": geometry.neighbors,
+        "subsampling": geometry.subsampling,
+        "upsampling": [item for item in geometry.upsampling if item is not None],
+        "scale": torch.as_tensor(scale, device=device),
+    }
 
 
 def offset_indices(indices, offset, source_count):

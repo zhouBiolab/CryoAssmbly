@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Optional
+
 from pareconv.modules.ops import point_to_node_partition, index_select
 from pareconv.modules.registration import get_node_correspondences
 from pareconv.modules.sinkhorn import LearnableLogOptimalTransport
@@ -16,11 +19,36 @@ from pareconv.modules.geotransformer import (
 from pareconv.modules.registration import HypothesisProposer, combineRegisraition
 
 from protassem.fitting.parenet.backbone import PAREConvFPN
+from protassem.fitting.cloud_encoding import backbone_input, node_partition
 from protassem.runtime.cuda_timing import CudaStageRecorder, cuda_stage
 
 # 推理链路（demo_mask.process_single_pair）只消费最终位姿与两侧点数；
 # 训练/诊断路径传 output_fields=None，保持返回全部字段的旧行为。
 INFERENCE_OUTPUT_FIELDS = ("estimated_transform", "ref_points", "src_points")
+
+
+@dataclass
+class EncodedCloud:
+    """单侧编码结果（T06）：只含与本侧几何有关的张量，可独立缓存。
+
+    字段含义与 `forward()` 里的同名中间量一一对应（ref=target、src=source）：
+    `node_knn_points` 已含 padding 哨兵点；`node_masks`/`node_knn_*` 为节点分区。
+    """
+
+    points: torch.Tensor
+    points_f: torch.Tensor
+    points_c: torch.Tensor
+    feats_f: torch.Tensor
+    re_feats_f: torch.Tensor
+    feats_c: torch.Tensor
+    re_feats_c: torch.Tensor
+    m_scores: torch.Tensor
+    node_masks: torch.Tensor
+    node_knn_indices: torch.Tensor
+    node_knn_masks: torch.Tensor
+    node_knn_points: torch.Tensor
+    scale: torch.Tensor
+    geometry_key: Optional[str] = None
 
 
 def select_output_fields(output_dict, output_fields):
@@ -509,6 +537,180 @@ class PARE_Net(nn.Module):
         output_dict['transform'] = transform
         if recorder is not None:
             recorder.flush()   # 同步一次后回放各阶段耗时
+        return select_output_fields(output_dict, output_fields)
+
+    # ==================================================================
+    # T06：单侧编码 / 双侧配准拆分
+    # ==================================================================
+    # 上面 forward() 是**兼容对照实现**（联合布局、原样保留，训练入口仍走它）；
+    # 下面两个方法把同一条推理链路拆成"与本侧几何有关"和"依赖两侧交互"两段。
+    # 两者的数值等价性由 tools/check_encoding_split.py 逐层校验（统一验收容差
+    # 特征 atol=1e-6 / rtol=1e-5；位姿与候选身份要求一致）。
+
+    def encode_cloud(self, geometry, scale, timing=None):
+        """单侧编码：backbone + 节点分区，只依赖本侧几何与共享 scale。
+
+        geometry: CloudGeometry（T04/T05，本侧局部索引）
+        scale   : 两侧共享的归一化尺度（联合布局时的同一个标量）
+        返回 EncodedCloud（可独立缓存；不含任何跨侧交互量）。
+        """
+        recorder = CudaStageRecorder(timing) if timing is not None else None
+        device = next(self.parameters()).device
+
+        with cuda_stage(recorder, "model_backbone"):
+            re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(
+                backbone_input(geometry, scale, device=device))
+        with cuda_stage(recorder, "model_node_partition"):
+            partition = geometry.node_partition
+            if partition is None:
+                partition = node_partition(geometry, self.num_points_in_patch)
+
+        points = geometry.points[0][:, :3].detach()
+        points_f = geometry.points[1][:, :3].detach()
+        points_c = geometry.points[-1][:, :3].detach()
+        # 细节点邻域点（含 padding 哨兵点，与 forward 里的 ref_padded_points_f 一致）
+        padded_points_f = torch.cat([points_f, torch.zeros_like(points_f[:1])], dim=0)
+        node_knn_points = index_select(padded_points_f, partition.knn_indices, dim=0)
+        if recorder is not None:
+            recorder.flush()
+
+        return EncodedCloud(
+            points=points, points_f=points_f, points_c=points_c,
+            feats_f=feats_f, re_feats_f=re_feats_f, feats_c=feats_c, re_feats_c=re_feats_c,
+            m_scores=m_scores, node_masks=partition.masks,
+            node_knn_indices=partition.knn_indices, node_knn_masks=partition.knn_masks,
+            node_knn_points=node_knn_points,
+            scale=torch.as_tensor(scale, device=device),
+            geometry_key=geometry.fingerprint())
+
+    def register_pair(self, target_encoded, source_encoded, timing=None, output_fields=None):
+        """双侧配准：cross-attention → 粗匹配 → 点匹配 → LGR 假设与选优。
+
+        target_encoded / source_encoded: 两侧的 EncodedCloud（scale 必须一致）。
+        返回字段与 forward() 同名（不含输入 transform：推理不使用参考位姿）。
+        只支持推理（`self.training == False`）；训练入口请用 forward()。
+        """
+        if self.training:
+            raise RuntimeError("register_pair 只用于推理；训练请用 forward()")
+        recorder = CudaStageRecorder(timing) if timing is not None else None
+        output_dict = {}
+        ref = target_encoded
+        src = source_encoded
+        scale = ref.scale
+        if not torch.equal(scale, src.scale):
+            raise ValueError("两侧编码的 scale 不一致：%s vs %s" % (scale, src.scale))
+
+        ref_points_c, src_points_c = ref.points_c, src.points_c
+        ref_points_f, src_points_f = ref.points_f, src.points_f
+        ref_points, src_points = ref.points, src.points
+        output_dict['ref_points_c'] = ref_points_c
+        output_dict['src_points_c'] = src_points_c
+        output_dict['ref_points_f'] = ref_points_f
+        output_dict['src_points_f'] = src_points_f
+        output_dict['ref_points'] = ref_points
+        output_dict['src_points'] = src_points
+        output_dict['ref_node_knn_indices'] = ref.node_knn_indices
+        output_dict['src_node_knn_indices'] = src.node_knn_indices
+
+        ref_feats_c = ref.feats_c
+        src_feats_c = src.feats_c
+        output_dict['ref_feats_c_re'] = ref.re_feats_c
+        output_dict['src_feats_c_re'] = src.re_feats_c
+        ref_pc = ref_points_c / scale
+        src_pc = src_points_c / scale
+
+        with cuda_stage(recorder, "model_transformer"):
+            ref_feats_c, src_feats_c, scores_list = self.transformer(
+                ref_pc.unsqueeze(0),
+                src_pc.unsqueeze(0),
+                ref_feats_c.unsqueeze(0),
+                src_feats_c.unsqueeze(0),
+            )
+        ref_feats_c_norm = F.normalize(ref_feats_c.squeeze(0), p=2, dim=1)
+        src_feats_c_norm = F.normalize(src_feats_c.squeeze(0), p=2, dim=1)
+        output_dict['ref_feats_c'] = ref_feats_c_norm
+        output_dict['src_feats_c'] = src_feats_c_norm
+
+        ref_feats_f, src_feats_f = ref.feats_f, src.feats_f
+        m_ref_scores, m_src_scores = ref.m_scores, src.m_scores
+        re_ref_feats_f, re_src_feats_f = ref.re_feats_f, src.re_feats_f
+        output_dict['m_ref_scores'] = m_ref_scores
+        output_dict['m_src_scores'] = m_src_scores
+        output_dict['ref_feats_f'] = ref_feats_f
+        output_dict['src_feats_f'] = src_feats_f
+        output_dict['re_ref_feats_f'] = re_ref_feats_f
+        output_dict['re_src_feats_f'] = re_src_feats_f
+
+        with torch.no_grad():
+            ref_node_corr_indices, src_node_corr_indices, node_corr_scores = self.coarse_matching(
+                ref_feats_c_norm, src_feats_c_norm, ref.node_masks, src.node_masks
+            )
+            output_dict['ref_node_corr_indices'] = ref_node_corr_indices
+            output_dict['src_node_corr_indices'] = src_node_corr_indices
+
+        ref_node_corr_knn_indices = ref.node_knn_indices[ref_node_corr_indices]
+        src_node_corr_knn_indices = src.node_knn_indices[src_node_corr_indices]
+        ref_node_corr_knn_masks = ref.node_knn_masks[ref_node_corr_indices]
+        src_node_corr_knn_masks = src.node_knn_masks[src_node_corr_indices]
+        ref_node_corr_knn_points = ref.node_knn_points[ref_node_corr_indices]
+        src_node_corr_knn_points = src.node_knn_points[src_node_corr_indices]
+
+        ref_padded_feats_f = torch.cat([ref_feats_f, torch.zeros_like(ref_feats_f[:1])], dim=0)
+        src_padded_feats_f = torch.cat([src_feats_f, torch.zeros_like(src_feats_f[:1])], dim=0)
+        ref_node_corr_knn_feats = index_select(ref_padded_feats_f, ref_node_corr_knn_indices, dim=0)
+        src_node_corr_knn_feats = index_select(src_padded_feats_f, src_node_corr_knn_indices, dim=0)
+
+        m_ref_padded_scores = torch.cat([m_ref_scores, torch.zeros_like(m_ref_scores[:1])], dim=0)
+        m_src_padded_scores = torch.cat([m_src_scores, torch.zeros_like(m_src_scores[:1])], dim=0)
+        ref_node_corr_knn_scores = index_select(m_ref_padded_scores, ref_node_corr_knn_indices, dim=0)
+        src_node_corr_knn_scores = index_select(m_src_padded_scores, src_node_corr_knn_indices, dim=0)
+
+        output_dict['ref_node_corr_knn_points'] = ref_node_corr_knn_points
+        output_dict['src_node_corr_knn_points'] = src_node_corr_knn_points
+        output_dict['ref_node_corr_knn_masks'] = ref_node_corr_knn_masks
+        output_dict['src_node_corr_knn_masks'] = src_node_corr_knn_masks
+
+        re_ref_padded_feats_f = torch.cat([re_ref_feats_f, torch.zeros_like(re_ref_feats_f[:1])], dim=0)
+        re_src_padded_feats_f = torch.cat([re_src_feats_f, torch.zeros_like(re_src_feats_f[:1])], dim=0)
+        re_ref_node_corr_knn_feats = index_select(re_ref_padded_feats_f, ref_node_corr_knn_indices, dim=0)
+        re_src_node_corr_knn_feats = index_select(re_src_padded_feats_f, src_node_corr_knn_indices, dim=0)
+        output_dict['re_ref_node_corr_knn_feats'] = re_ref_node_corr_knn_feats
+        output_dict['re_src_node_corr_knn_feats'] = re_src_node_corr_knn_feats
+
+        matching_scores = self.point_matching(
+            ref_node_corr_knn_feats, src_node_corr_knn_feats,
+            ref_node_corr_knn_scores, src_node_corr_knn_scores,
+            ref_node_corr_knn_masks, src_node_corr_knn_masks)
+        output_dict['matching_scores'] = matching_scores
+        output_dict['ref_node_corr_knn_scores'] = ref_node_corr_knn_scores
+        output_dict['src_node_corr_knn_scores'] = src_node_corr_knn_scores
+
+        with torch.no_grad():
+            with cuda_stage(recorder, "model_lgr"):
+                (ref_corr_points, src_corr_points, corr_scores, estimated_transform,
+                 hypotheses, re_ref_corr_feats, re_src_corr_feats) = self.combienrefistration(
+                    ref_node_corr_knn_points,
+                    src_node_corr_knn_points,
+                    re_ref_node_corr_knn_feats,
+                    re_src_node_corr_knn_feats,
+                    ref_node_corr_knn_masks,
+                    src_node_corr_knn_masks,
+                    matching_scores,
+                    node_corr_scores,
+                    ref_feats_f,
+                    src_feats_f,
+                    ref_points_f,
+                    src_points_f,
+                )
+        output_dict['re_ref_corr_feats'] = re_ref_corr_feats
+        output_dict['re_src_corr_feats'] = re_src_corr_feats
+        output_dict['hypotheses'] = hypotheses
+        output_dict['ref_corr_points'] = ref_corr_points
+        output_dict['src_corr_points'] = src_corr_points
+        output_dict['corr_scores'] = corr_scores
+        output_dict['estimated_transform'] = estimated_transform
+        if recorder is not None:
+            recorder.flush()
         return select_output_fields(output_dict, output_fields)
 
 

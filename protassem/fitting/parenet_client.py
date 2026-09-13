@@ -21,7 +21,8 @@ import atexit
 import logging
 import subprocess
 
-from protassem.runtime.config import DEFAULT_GEOMETRY_CACHE_MB
+from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_GEOMETRY_CACHE_MB,
+                                      DEFAULT_INFERENCE_MODE, INFERENCE_MODES)
 
 log = logging.getLogger(__name__)
 
@@ -33,8 +34,11 @@ DONE_MARKER = "_PARENET_DONE"
 STOP_MARKER = "_PARENET_STOP"
 
 _SERVER = None
-# 服务端几何缓存容量（MiB，T05）；由 configure_geometry_cache() 在**启动服务前**显式设定
+# 服务端配置：几何缓存容量（T05）、推理路径与 TF32 策略（T06）；
+# 由 configure_* 在**启动服务前**显式设定（服务已在运行时只告警、不重启）
 _GEOMETRY_CACHE_MB = DEFAULT_GEOMETRY_CACHE_MB
+_INFERENCE_MODE = DEFAULT_INFERENCE_MODE
+_ALLOW_TF32 = DEFAULT_ALLOW_TF32
 
 
 def configure_geometry_cache(geometry_cache_mb):
@@ -55,6 +59,31 @@ def configure_geometry_cache(geometry_cache_mb):
     return _GEOMETRY_CACHE_MB
 
 
+def configure_allow_tf32(allow_tf32):
+    """设定服务端 TF32 策略（None = 跟随推理模式；必须在第一次请求之前调用）。"""
+    global _ALLOW_TF32
+    value = None if allow_tf32 is None else bool(allow_tf32)
+    if _SERVER is not None and _SERVER.poll() is None and value != _ALLOW_TF32:
+        log.warning("PARENet server already running with allow_tf32=%s; "
+                    "keeping it (new value %s ignored)", _ALLOW_TF32, value)
+        return _ALLOW_TF32
+    _ALLOW_TF32 = value
+    return _ALLOW_TF32
+
+
+def configure_inference_mode(inference_mode):
+    """设定服务端推理路径（joint/split；必须在第一次请求之前调用）。"""
+    global _INFERENCE_MODE
+    if inference_mode not in INFERENCE_MODES:
+        raise ValueError("未知的 inference_mode: %r" % (inference_mode,))
+    if _SERVER is not None and _SERVER.poll() is None and inference_mode != _INFERENCE_MODE:
+        log.warning("PARENet server already running with inference_mode=%s; "
+                    "keeping it (new value %s ignored)", _INFERENCE_MODE, inference_mode)
+        return _INFERENCE_MODE
+    _INFERENCE_MODE = inference_mode
+    return _INFERENCE_MODE
+
+
 def get_server():
     """Lazily start the persistent PARENet server subprocess (singleton)."""
     global _SERVER
@@ -63,14 +92,20 @@ def get_server():
 
     log_path = os.path.join(DEMO_MASK_CWD, "parenet_server.log")
     logf = open(log_path, "a", buffering=1)
+    command = [sys.executable, DEMO_MASK_PATH, "--server",
+               "--geometry-cache-mb", str(_GEOMETRY_CACHE_MB),
+               "--inference-mode", _INFERENCE_MODE]
+    if _ALLOW_TF32 is True:
+        command.append("--allow-tf32")
+    elif _ALLOW_TF32 is False:
+        command.append("--no-allow-tf32")
     _SERVER = subprocess.Popen(
-        [sys.executable, DEMO_MASK_PATH, "--server",
-         "--geometry-cache-mb", str(_GEOMETRY_CACHE_MB)],
-        stdin=subprocess.PIPE, stdout=logf, stderr=logf,
+        command, stdin=subprocess.PIPE, stdout=logf, stderr=logf,
         text=True, cwd=DEMO_MASK_CWD)
     atexit.register(shutdown_server)
-    log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, log=%s)",
-             _SERVER.pid, _GEOMETRY_CACHE_MB, log_path)
+    log.info("PARENet server started (pid=%d, geometry_cache_mb=%s, inference_mode=%s, "
+             "allow_tf32=%s, log=%s)",
+             _SERVER.pid, _GEOMETRY_CACHE_MB, _INFERENCE_MODE, _ALLOW_TF32, log_path)
     return _SERVER
 
 
@@ -120,8 +155,12 @@ class ParenetRequest:
 
 def start_request(target, source, chain_pdb, output_dir,
                   use_mask=True, configs="all",
-                  mask_radius_factor=1.35, min_point_distance_factor=0.32):
-    """Send one fitting request to the persistent server; return a handle."""
+                  mask_radius_factor=1.35, min_point_distance_factor=0.32,
+                  inference_mode=None):
+    """Send one fitting request to the persistent server; return a handle.
+
+    inference_mode：覆盖服务端默认推理路径（None = 用服务端设定）；仅用于对照实验。
+    """
     os.makedirs(output_dir, exist_ok=True)
     # clear stale markers from any previous run in this dir
     for m in (DONE_MARKER, STOP_MARKER):
@@ -139,6 +178,7 @@ def start_request(target, source, chain_pdb, output_dir,
         "configs": configs,
         "mask_radius_factor": mask_radius_factor,
         "min_point_distance_factor": min_point_distance_factor,
+        "inference_mode": inference_mode,
     })
     server.stdin.write(req + "\n")
     server.stdin.flush()

@@ -28,6 +28,11 @@ import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST_VERSION = 1
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from protassem.runtime.config import (DEFAULT_ALLOW_TF32, DEFAULT_INFERENCE_MODE,
+                                      INFERENCE_MODES)
 
 
 def sha256(path):
@@ -132,16 +137,23 @@ def summarize_predictions(pair_dir):
     return files, overlaps
 
 
-def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None):
+def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
+                 inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32):
     """按 manifest 重放固定配准（不生成掩码、不跑装配）。
 
     geometry_cache_mb：T05 单侧几何缓存容量（MiB）；0 = 关闭，None = 用运行配置默认值。
+    inference_mode  ：T06 推理路径（joint 默认 = 联合布局 + forward；split = 单侧编码 + 双侧配准）。
+    allow_tf32      ：TF32 策略；None = 跟随 inference_mode（split 强制关闭）。
     """
     from protassem.fitting.cloud_encoding import GeometryCache
     from protassem.fitting.demo_mask import run_inference
-    from protassem.runtime.config import DEFAULT_GEOMETRY_CACHE_MB
+    from protassem.runtime.config import (DEFAULT_GEOMETRY_CACHE_MB, apply_tf32_policy,
+                                          effective_allow_tf32)
     from protassem.runtime.metrics import Metrics
 
+    resolved_tf32 = effective_allow_tf32(inference_mode, allow_tf32)
+    policy = apply_tf32_policy(resolved_tf32)
+    print("inference_mode=%s allow_tf32=%s -> %s" % (inference_mode, allow_tf32, policy))
     if geometry_cache_mb is None:
         geometry_cache_mb = DEFAULT_GEOMETRY_CACHE_MB
     geometry_cache = GeometryCache(int(geometry_cache_mb) * 1024 * 1024) \
@@ -168,7 +180,8 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None):
                     chain_pdb=manifest["source"]["pdb"], output_dir=pair_dir,
                     weights=weights, use_mask=False,
                     configs=manifest["params"]["configs"], seed=manifest["seed"],
-                    geometry_cache=geometry_cache)
+                    geometry_cache=geometry_cache, allow_tf32=resolved_tf32,
+                    inference_mode=inference_mode)
             elapsed = time.perf_counter() - started
             pred_files, overlaps = summarize_predictions(pair_dir)
             records.append({
@@ -189,6 +202,8 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None):
     report = {"manifest": os.path.abspath(manifest_path), "out_dir": os.path.abspath(out_dir),
               "repeat": repeat, "records": records,
               "geometry_cache_mb": geometry_cache_mb, "geometry_cache": cache_stats,
+              "inference_mode": inference_mode, "allow_tf32": resolved_tf32,
+              "tf32_policy": policy,
               "metrics_summary": summary_path}
     with open(os.path.join(out_dir, "t00_report.json"), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
@@ -210,6 +225,13 @@ def main(argv=None):
     run.add_argument("--repeat", type=int, default=1)
     run.add_argument("--geometry-cache-mb", type=int, default=None,
                      help="单侧几何缓存容量（MiB，0 = 关闭；默认取运行配置默认值）")
+    run.add_argument("--inference-mode", choices=INFERENCE_MODES,
+                     default=DEFAULT_INFERENCE_MODE,
+                     help="joint（默认，联合布局 + forward）或 split（单侧编码 + 双侧配准）")
+    run.add_argument("--allow-tf32", dest="allow_tf32", action="store_true", default=None,
+                     help="允许 TF32（默认跟随 inference_mode；split 不允许）")
+    run.add_argument("--no-allow-tf32", dest="allow_tf32", action="store_false",
+                     help="关闭 TF32（数值与形状无关；split 必须）")
 
     args = parser.parse_args(argv)
     if args.command == "manifest":
@@ -229,9 +251,13 @@ def main(argv=None):
         return 0
 
     report = run_manifest(args.manifest, args.out_dir, args.repeat,
-                          geometry_cache_mb=args.geometry_cache_mb)
+                          geometry_cache_mb=args.geometry_cache_mb,
+                          inference_mode=args.inference_mode,
+                          allow_tf32=args.allow_tf32)
     print("report written: %s" % os.path.join(args.out_dir, "t00_report.json"))
     print("geometry cache: %s" % (report["geometry_cache"] or "关闭"))
+    print("inference_mode: %s ; allow_tf32: %s"
+          % (report["inference_mode"], report["allow_tf32"]))
     for record in report["records"]:
         print("  target %d run %d: %.2f s, %d predictions, best overlap=%s"
               % (record["target_order"], record["repeat"], record["wall_s"],
