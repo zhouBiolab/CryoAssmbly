@@ -59,6 +59,8 @@
 | 111 | 审计 P2-5 失败状态传播【已修复】 | 掩码分支异常只写日志（丢失败信息）；客户端把 `error` 与 `filtered` 一起跳过；服务端仍写 `end=ok` | 服务端：异常写入 `mask_results`、候选级失败计数、请求级状态按**明确优先级**（请求异常→error / 主动早停→cancelled / 候选失败→error / 否则 ok）；客户端：`CandidateConsumer.error_policy` **默认 `"fail"`**（消费到 `state=error` 即抛错），`"skip"` 为显式选择，`filtered` 仍只计数跳过。回归测试 8 项（服务端 3 + 客户端 5）；旧 consumer 4 项 `TypeError`、旧 demo_mask 服务端用例失败 |
 | 112 | 审计 P2-6 台账 UTF-8 半行【已修复】 | `LedgerReader.poll()` 先 `decode` 整个 chunk 再切半行 → 多字节字符被截断即 `UnicodeDecodeError` | 改为**按字节缓冲**（`split(b"\n")` 切完整行后再解码）。定向测试逐字节追加含中文/`ü` 的记录并每步 `poll()`；旧代码在该测试上抛 `UnicodeDecodeError` |
 | 113 | 审计 P2-7 动态密度版本【已修复】 | `_mask_region` 每轮覆盖同一个 `current_density.mrc`；`density_version`/`invalidate_density()` 无人调用 → 实际只靠 path+size+mtime，且 worker 内缓存主进程清不掉 | 每轮掩膜写 `current_density_mNN.mrc`（路径即版本），`current_density_mrc` 指向新文件；`_ensure_work_files` 同步版本名。定向测试：两轮后路径不同、旧版本仍在、内容互不相同；旧代码失败 |
+| 114 | 审计修复的验收【已核实】 | — | ① **默认 `test/1`**（HEAD `8f1d2ce`）：墙钟 1240 s，三个 CIF md5 与 `baseline_after_o6.md5` **逐位一致**、三条决策一致、台账 24/28/115 与消费序列 sha1 `de02d03105ebff9f` 一致、服务端 `Failed=0` → 7 项修复未改变默认路径。② **`test/2` 额外真实数据**（245 MB 图 + 三条单链 PDB，res 5.50 / contour 0.011）：exit 0、2342 s；三链整链拟合均未达标 → 各由 2 个域组装（cc 0.5610/0.5316/0.5474）并输出复合物；台账 8 请求 296 候选全 `ok`，3×`end=ok` + 5×`end=cancelled`（主动早停）；`Failed=0`。**边界**：`test/2` 是三条独立单链输入，不经过"多链 CIF → 占位 → 恢复"路径，不能替代 P1-1/P1-2 的合成定向测试；它无冻结基线，只作真实运行验证。报告 `tests/reports/2026-09-14_audit_fixes_acceptance.md` |
+| 115 | 残留范围【记录】 | — | ① 真实复合物端到端（`/xiangyux/test_data/fiting_lg/6lu9`，需另建干净目录，res 8.8 / contour 0.316）未跑，P1-1/P1-2 目前只有合成定向测试 + 多字符链号用例；② P2-5 的"候选失败即明确失败"在本次 11 个请求中未触发（`Failed=0`），如需宽松需显式 `error_policy="skip"` 或在调用点处理；③ `test/2` 墙钟 2342 s 不作性能结论 |
 
 ### v4.10 → v4.11（老卡收口：口径校正与接口定稿）
 
