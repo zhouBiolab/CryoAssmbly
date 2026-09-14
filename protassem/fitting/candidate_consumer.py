@@ -22,7 +22,7 @@ class CandidateConsumer:
 
     def __init__(self, reader, batch_size, on_batch, request_finished,
                  on_cancel=None, sleep=time.sleep, poll_interval=POLL_INTERVAL_S,
-                 describe_request=None):
+                 describe_request=None, error_policy="fail"):
         self.reader = reader
         self.batch_size = max(1, int(batch_size))
         self.on_batch = on_batch
@@ -33,6 +33,21 @@ class CandidateConsumer:
         # P1-3：可选的诊断来源（例如"服务进程已退出（returncode=…）"），让报错能区分
         # "服务死亡"与"服务端漏写 end"。
         self.describe_request = describe_request or (lambda: "")
+        # P2-5：候选级执行失败（state=error）的默认策略是**明确失败**；`filtered`
+        # 只表示"正常计算但没有有效候选"，由 on_batch 自己跳过并计数。
+        if error_policy not in ("fail", "skip"):
+            raise ValueError("未知的 error_policy: %r" % (error_policy,))
+        self.error_policy = error_policy
+
+    def _check_states(self, records):
+        """执行失败默认直接抛错：不能让"少了一些候选"悄悄变成交付结果。"""
+        if self.error_policy != "fail":
+            return
+        for record in records:
+            if record["state"] == "error":
+                raise RuntimeError("候选 %d 执行失败（state=error）：%s"
+                                   % (record["id"],
+                                      record.get("error") or "未提供原因"))
 
     def _missing_end_error(self):
         detail = ""
@@ -68,6 +83,7 @@ class CandidateConsumer:
                 if len(self.reader.ready_ids(window[0], window[-1] + 1)) < len(window):
                     break
                 records = [self.reader.candidates[cid] for cid in window]
+                self._check_states(records)          # P2-5：执行失败默认抛错
                 batch_results, hit = self.on_batch(records)
                 results.extend(batch_results)
                 batches.append({"start": window[0], "stop": window[-1] + 1,

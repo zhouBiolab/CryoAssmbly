@@ -91,7 +91,7 @@ def evaluate_like_pool(records, workers, threshold=THRESHOLD):
 
 
 def drive(schedule, end_at, request_finished_at, batch_size=10, workers=1,
-          end_status="ok", poll_interval=POLL_S):
+          end_status="ok", poll_interval=POLL_S, error_policy="fail"):
     """用虚拟时钟驱动消费者，返回 `(outcome, optimized_ids, producer)`。"""
     tmp = tempfile.TemporaryDirectory()
     path = os.path.join(tmp.name, LEDGER_NAME)
@@ -115,7 +115,8 @@ def drive(schedule, end_at, request_finished_at, batch_size=10, workers=1,
     consumer = CandidateConsumer(
         reader, batch_size, on_batch,
         request_finished=lambda: clock[0] >= producer.request_finished_at,
-        on_cancel=producer.cancel, sleep=sleep, poll_interval=poll_interval)
+        on_cancel=producer.cancel, sleep=sleep, poll_interval=poll_interval,
+        error_policy=error_policy)
     producer.advance(0.0)
     outcome = consumer.run()
     tmp.cleanup()
@@ -193,9 +194,13 @@ class CandidateOrderingTest(unittest.TestCase):
         self.assertTrue(producer.cancelled)           # 早停后取消请求
 
     def test_skipped_states_do_not_block_batches(self):
+        """filtered/error 混合时不阻塞批次；P2-5 后"跳过 error"是**显式选择**（error_policy）。
+
+        默认策略（fail）下 error 候选会抛错，见 `test_error_candidate_fails_by_default`。
+        """
         states = {3: "filtered", 7: "error", 21: "filtered"}
         schedule, end_at, finished = _schedule(mode="slow", states=states)
-        outcome, optimized, _ = drive(schedule, end_at, finished)
+        outcome, optimized, _ = drive(schedule, end_at, finished, error_policy="skip")
         self.assertEqual([(b["start"], b["stop"]) for b in outcome["batches"]],
                          [(0, 10), (10, 20), (20, 24)])
         self.assertEqual([b["skipped"] for b in outcome["batches"]], [2, 0, 1])
@@ -203,6 +208,14 @@ class CandidateOrderingTest(unittest.TestCase):
         self.assertNotIn(7, optimized)
         self.assertNotIn(21, optimized)
         self.assertEqual(len(outcome["skipped"]), 3)
+
+    def test_error_candidate_fails_by_default(self):
+        """P2-5：默认策略下，候选执行失败必须抛错（不静默跳过）。"""
+        states = {7: "error"}
+        schedule, end_at, finished = _schedule(mode="slow", states=states)
+        with self.assertRaises(RuntimeError) as caught:
+            drive(schedule, end_at, finished)
+        self.assertIn("候选 7 执行失败", str(caught.exception))
 
     def test_missing_end_raises(self):
         """句柄结束但没有任何 end 记录 → 不完整请求，必须抛错（不得静默用部分结果）。"""

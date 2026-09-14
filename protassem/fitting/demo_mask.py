@@ -593,14 +593,23 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         if waited > 0.001:
             _record_timing(output_dir, "server_tail_wait", waited, where=stage)
 
+    ledger_errors = {"count": 0, "first": None}
+
     def _publish(candidate_id, results, name=None, overlap=None, source=None):
-        """发布一个候选的终态（O6）：ok / filtered / error 三态必须显式。"""
+        """发布一个候选的终态（O6）：ok / filtered / error 三态必须显式。
+
+        P2-5：执行失败必须记 error（不能被当成 filtered 静默跳过）；
+        `ledger_errors` 汇总用于请求级结束状态。
+        """
         if name and os.path.exists(name):
             ledger.publish(candidate_id, "ok", name=name, overlap=overlap,
                            source=source)
             return
         errors = [r.get("error") for r in results if r.get("error")]
         if errors:
+            ledger_errors["count"] += 1
+            if ledger_errors["first"] is None:
+                ledger_errors["first"] = errors[0]
             ledger.publish(candidate_id, "error", source=source, error=errors[0])
         else:
             ledger.publish(candidate_id, "filtered", source=source,
@@ -637,6 +646,10 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             all_results.append(r)
                         except Exception as e:
                             log.error("Config %d-%s crashed: %s", cid, sm, e)
+                            # P2-5：执行失败必须进入本掩码的结果集，否则会被当成
+                            # "正常但没有有效候选"（filtered）而被静默跳过。
+                            mask_results.append({"error": str(e), "config_id": cid,
+                                                 "sampling_method": sm})
                 _drain_tail("mask_best")      # 消费本掩码结果前必须等尾部完成
                 best = process_single_mask_optimally(mask_results)
                 # O6：id = 掩码在 mask_data_list 中的序号（稳定生成顺序）；
@@ -709,12 +722,21 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
             tail_pipeline.close()
         except Exception as e:
             log.error("尾部流水线关闭失败：%s", e)
-        # O6：结束记录是唯一权威的结束标记；失败必须显式，不能被当成正常结束
+        # O6：结束记录是唯一权威的结束标记；失败必须显式，不能被当成正常结束。
+        # P2-5 的优先级（明确写死，不靠默认）：
+        #   1) 请求本身抛异常           -> error
+        #   2) 客户端主动早停           -> cancelled（客户端已停止消费，其后候选不再有意义）
+        #   3) 存在候选级执行失败       -> error（请求跑完了但产出不完整）
+        #   4) 其余                     -> ok
         try:
             if failure is not None:
                 ledger.finish("error", error="%s: %s" % (type(failure).__name__, failure))
             elif _stopped():
                 ledger.finish("cancelled")
+            elif ledger_errors["count"]:
+                ledger.finish("error",
+                              error="%d 个候选执行失败，首个：%s"
+                                    % (ledger_errors["count"], ledger_errors["first"]))
             else:
                 ledger.finish("ok")
         except Exception as e:

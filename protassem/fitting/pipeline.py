@@ -251,11 +251,15 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                           request_id=getattr(proc, "request_id", None))
 
     def evaluate_batch(records):
-        """批内策略不变：CC 评估 → 排序 → 逐个优化 → 首个达标即返回早停。"""
+        """批内策略不变：CC 评估 → 排序 → 逐个优化 → 首个达标即返回早停。
+
+        P2-5：`error`（执行失败）由 `CandidateConsumer` 的默认策略直接抛错（在进入本函数前），
+        这里只处理 `filtered`（正常计算但没有有效候选：计数、跳过）。
+        """
         for record in records:
             if record["state"] != "ok":
                 log.warning("候选 %d 状态 %s，跳过：%s", record["id"], record["state"],
-                            record.get("error") or record.get("reason") or "")
+                            record.get("reason") or record.get("error") or "")
         usable = [record for record in records if record["state"] == "ok"]
         if not usable:
             return [], False

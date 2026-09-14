@@ -56,6 +56,7 @@
 | 108 | 新契约的回归保护 | 旧测试断言"合并结果已是真链号" | 该测试改写为两段式契约（合并=`{A,B}`、落盘后=`{Q,R}`）；新增 `tests/test_complex_chain_space.py`（真实 `B/C`+占位 `A/B`、多字符链号、单域、无 chain_map）；**旧代码跑新测试 4 项全失败**作为修复取证 |
 | 109 | 审计 P1-3 服务死亡【已修复】 | `ParenetRequest.poll()` 只看 `_PARENET_DONE`，服务被杀/启动失败时客户端永久等待 | 句柄持有服务进程并区分"请求完成/服务已死亡/仍在运行"，新增 `describe_failure()`；消费者把诊断带进报错并**快速失败**（实测 ≤4 次轮询）。回归测试用**真实假子进程**中止，而不是手工把 `request_finished` 置 True；旧代码跑该测试 4 项 `TypeError`（无 `server=` 参数） |
 | 110 | 审计 P1-4 无掩码发布顺序【已修复】 | `use_mask=False` 分支发布候选后才 `rename_pdb_files_by_ranking`，且 tail 开启时不等尾部就发布 | 循环内只登记，`_drain_tail("rename")` + 改名完成后再按生成顺序一次性发布（名字为最终名）。定向测试直接驱动 `run_inference(use_mask=False)`（模型/预处理/单对推理为 stub、尾部流水线真实）→ 无 tail/有 tail 两种设置都满足"id 连续、全 ok、名字指向磁盘真实文件、end=ok"；**旧代码两项失败**（失效名字 / 出现 `filtered`） |
+| 111 | 审计 P2-5 失败状态传播【已修复】 | 掩码分支异常只写日志（丢失败信息）；客户端把 `error` 与 `filtered` 一起跳过；服务端仍写 `end=ok` | 服务端：异常写入 `mask_results`、候选级失败计数、请求级状态按**明确优先级**（请求异常→error / 主动早停→cancelled / 候选失败→error / 否则 ok）；客户端：`CandidateConsumer.error_policy` **默认 `"fail"`**（消费到 `state=error` 即抛错），`"skip"` 为显式选择，`filtered` 仍只计数跳过。回归测试 8 项（服务端 3 + 客户端 5）；旧 consumer 4 项 `TypeError`、旧 demo_mask 服务端用例失败 |
 
 ### v4.10 → v4.11（老卡收口：口径校正与接口定稿）
 
