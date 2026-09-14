@@ -88,7 +88,7 @@ class LedgerReader:
         self.skipped = []         # state != ok 的记录（filtered/error）
         self.end = None
         self._offset = 0
-        self._partial = ""
+        self._partial = b""      # **字节**缓冲（不能提前解码：见 poll()）
 
     def poll(self):
         """读取自上次以来的完整记录；末尾半行留在缓冲里等下次。"""
@@ -100,21 +100,23 @@ class LedgerReader:
             self._offset += len(chunk)
         if not chunk:
             return []
-        lines = (self._partial + chunk.decode("utf-8")).split("\n")
+        # 先按**字节**切出完整行，再解码：多字节（中文原因/路径）可能正好被读取边界截断，
+        # 先 decode 整个 chunk 会在半行缓冲之前就抛 UnicodeDecodeError。
+        lines = (self._partial + chunk).split(b"\n")
         self._partial = lines.pop()          # 末尾：可能是半行，也可能是空串
         records = []
-        for line in lines:
-            line = line.strip()
+        for raw in lines:
+            line = raw.strip()
             if not line:
                 continue
-            record = self._parse(line)
+            record = self._parse(line.decode("utf-8"))
             self._apply(record)
             records.append(record)
         return records
 
     def pending_partial(self):
         """当前缓冲的半行（诊断用；正常情况下为空）。"""
-        return self._partial
+        return self._partial.decode("utf-8", "replace")
 
     def ready_ids(self, start, stop):
         """[start, stop) 区间内**已到达终态**的候选 id 列表。"""

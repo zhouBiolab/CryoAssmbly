@@ -41,6 +41,26 @@ class LedgerWriterTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             LedgerReader(self.path, request_id="req-2").poll()
 
+    def test_partial_multibyte_character_is_buffered_as_bytes(self):
+        """P2-6：多字节字符被读取边界截断时，必须按字节缓冲（不能先解码）。"""
+        writer = CandidateLedgerWriter(self.dir, "req-1")
+        writer.publish(0, "ok", name="a.pdb")
+        reason = "中文原因：密度读取失败 — ünïcode"
+        record = json.dumps({"v": 1, "request_id": "req-1", "kind": "candidate",
+                             "id": 1, "state": "filtered", "reason": reason},
+                            ensure_ascii=False)
+        reader = LedgerReader(self.path, request_id="req-1")
+        self.assertEqual(len(reader.poll()), 1)
+
+        payload = (record + "\n").encode("utf-8")
+        for index in range(len(payload)):
+            with open(self.path, "ab") as handle:
+                handle.write(payload[index:index + 1])
+            reader.poll()            # 每次只多 1 字节：多字节字符必然被切断若干次
+        self.assertEqual(reader.candidates[1]["reason"], reason)
+        self.assertEqual(reader.pending_partial(), "")
+        self.assertEqual(len(reader.candidates), 2)
+
     def test_partial_line_is_buffered_until_complete(self):
         writer = CandidateLedgerWriter(self.dir, "req-1")
         writer.publish(0, "ok", name="a.pdb")
