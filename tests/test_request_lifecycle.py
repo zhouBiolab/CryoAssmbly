@@ -75,6 +75,27 @@ class RequestHandleTest(unittest.TestCase):
         handle = ParenetRequest(self.dir, "req-1")
         self.assertIsNone(handle.poll())
 
+    def test_old_poll_logic_cannot_see_a_dead_service(self):
+        """行为对照（不是接口不兼容）：旧 `poll` 只认 done 文件，服务死亡时永远返回 None。
+
+        旧逻辑在这里原样重写一遍，跑在**同一个假服务**上，与其新句柄对比：
+        旧逻辑 → None（客户端会一直等）；新句柄 → 非 None（明确结束）。
+        """
+        from protassem.fitting.parenet_client import DONE_MARKER
+
+        server = self._server()
+        handle = ParenetRequest(self.dir, "req-1", server=server)
+
+        def old_poll(output_dir):
+            done_file = os.path.join(output_dir, DONE_MARKER)
+            return 0 if os.path.exists(done_file) else None
+
+        server.terminate()
+        server.wait(timeout=10)
+        self.assertIsNone(old_poll(self.dir), "旧逻辑在服务死亡后仍判'在跑'")
+        self.assertIsNotNone(handle.poll(), "新句柄必须把服务死亡识别为结束")
+        self.assertIn("服务进程已退出", handle.describe_failure())
+
 
 class ConsumerDeadServerTest(unittest.TestCase):
 

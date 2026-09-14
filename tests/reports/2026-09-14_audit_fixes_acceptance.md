@@ -1,21 +1,35 @@
-# 审计 7 项发现的修复与验收（2026-09-14）
+# 审计发现的修复与验收（2026-09-14）
 
-分支：`feat/old-card-closeout`　审计起点：`decc52f`　修复终点：`8f1d2ce`（12:00 定时器触发后执行）
+分支：`feat/old-card-closeout`　第一轮审计起点：`decc52f`　第一轮修复终点：`8f1d2ce`；第二轮复核起点 `aee3e78`
 范围：**只做功能修复**——不新增性能优化、不动 `tail_pipeline` 默认值。
 
-## 一、修复清单（各自一次提交）
+**证据分级（第二轮复核要求补充）**：每条修复分开标注三类证据 ——
+**(a) 旧接口不兼容**（旧代码没有新参数，只能说明接口变了）、
+**(b) 旧行为缺陷复现**（旧代码在同一条用例上给出错误结果）、
+**(c) 新行为验收**（修复后的行为断言）。
 
-| 审计项 | 提交 | 修复要点 | 定向测试 | "旧代码会失败"的取证 |
+## 一、第一轮 7 项（各自一次提交）
+
+| 审计项 | 提交 | 修复要点 | 定向测试 | 证据分级 |
 |---|---|---|---|---|
-| **P1-1** 复合物逐域改善后重复恢复链号 | `f9e3ef1` | 模块开头固化三个链号空间（真实 / 占位 / 组件 ID）与"**占位→真实只在最终输出映射一次**"；`merge_domains(is_complex)` 保持占位链号；新增 `_restore_chain_ids()` 作为域链落盘唯一恢复点；`_accept_chain` 仍是链级唯一恢复点 | `tests/test_complex_chain_space.py`（真实 `B/C` + 占位 `A/B`，含多字符链号） | 旧代码：合并结果 `['B','C'] != ['A','B']`；二次映射抛 `PDBConstructionException: C defined twice`（探针先复现：真实 CIF `B/C` → 占位 `A/B` → `chain_map {A:B, B:C}`） |
-| **P1-2** 复合物只接受一个域时链号没恢复 | `f9e3ef1` | `_handle_single_domain` 从内部空间的 `fitted_pdb` 出发，按该域 `source_chain_id` 做**单条**映射（显式指定，不做 `get(id,id)` 猜测；不可能误伤其他链）；顺带修掉"把 `.pdb` 内容写进 `.cif` 名字" | 同上 + `assemble_domain_chains` 级单域用例 | 旧代码：最终链号 `['Q+R'] != ['B']` |
-| **P1-3** 服务意外退出→客户端永久等待 | `bd92f45` | 句柄持有服务进程；`poll()` 区分"请求完成 / 服务已退出 / 仍在运行"；新增 `describe_failure()`；消费者把诊断带进报错并**快速失败** | `tests/test_request_lifecycle.py`（**真实假子进程**中途 `terminate()`） | 旧代码：4 项 `TypeError`（`ParenetRequest` 根本不接受服务进程） |
-| **P1-4** 无掩码路径发布后才改名 | `9b5947f` | 循环内只登记，`_drain_tail("rename")` + `rename_pdb_files_by_ranking()` 之后再按生成顺序一次性发布（名字为最终名） | `tests/test_ledger_publish_order.py`（驱动真实 `run_inference(use_mask=False)`，尾部流水线真实） | 旧代码：无 tail 时台账名字指向失效文件；有 tail 时状态里出现 `filtered` |
-| **P2-5** 失败被静默跳过、请求仍报成功 | `4b5ad7e` | 服务端掩码分支异常写入结果集；请求级状态优先级明确（请求异常→`error`／主动早停→`cancelled`／候选失败→`error`／否则 `ok`）；客户端 `error_policy` **默认 `"fail"`**，`"skip"` 为显式选择 | `tests/test_failure_states.py`（服务端 3 + 客户端 5）+ `test_candidate_ordering.py` 新增默认策略用例 | 旧代码：客户端 4 项 `TypeError`（无 `error_policy`）；旧 `demo_mask` 服务端用例失败 |
-| **P2-6** 台账半行 UTF-8 截断 | `9b6c3c6` | `LedgerReader` 按**字节**缓冲，`split(b"\n")` 切完整行后再解码 | `test_candidate_ledger.py` 逐字节追加含中文/`ü` 的记录 | 旧代码：`UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe4 …` |
-| **P2-7** 动态密度没有版本契约 | `8f1d2ce` | 每轮掩膜写 `current_density_mNN.mrc`（**路径即版本**），主进程与共享池 worker 内缓存都自然失效；`_ensure_work_files` 同步版本名 | `tests/test_density_version.py` | 旧代码：两轮后路径相同（`current_density.mrc`），测试失败 |
+| **P1-1** 复合物逐域改善后重复恢复链号 | `f9e3ef1` | 固化三个链号空间（真实 / 占位 / 组件 ID）与"**占位→真实只在最终输出映射一次**"；`merge_domains(is_complex)` 保持占位链号；新增 `_restore_chain_ids()` 作为域链落盘唯一恢复点；`_accept_chain` 仍是链级唯一恢复点 | `tests/test_complex_chain_space.py`（真实 `B/C` + 占位 `A/B`） | **(b)** 旧代码：合并结果 `['B','C'] != ['A','B']`；二次映射抛 `PDBConstructionException: C defined twice`。**(c)** 新行为：合并=`{A,B}`、落盘后=`{B,C}`，且不抛异常 |
+| **P1-2** 复合物只接受一个域时链号没恢复 | `f9e3ef1` | `_handle_single_domain` 从内部空间 `fitted_pdb` 出发，按该域 `source_chain_id` 做**单条**映射；顺带修掉"把 `.pdb` 内容写进 `.cif` 名字" | 同上 + `assemble_domain_chains` 级单域用例 | **(b)** 旧代码：最终链号 `['Q+R'] != ['B']`。**(c)** 新行为：最终 `domain_chains/*.cif` 链号 = 归属真链号 |
+| **P1-3** 服务意外退出→客户端永久等待 | `bd92f45` | 句柄持有服务进程；`poll()` 区分"请求完成 / 服务已退出 / 仍在运行"；新增 `describe_failure()`；消费者把诊断带进报错并**快速失败** | `tests/test_request_lifecycle.py`（**真实假子进程**中途 `terminate()`） | **(a)** 旧代码：4 项 `TypeError`（旧接口不接受服务进程）—— 只说明接口变化。**(b)** 新增 `test_old_poll_logic_cannot_see_a_dead_service`：把旧 `poll` 逻辑原样重写、跑在同一个假服务上 → 返回 `None`（永远"在跑"），而新句柄返回非 None。**(c)** 新行为：死亡后 `describe_failure()` 含 returncode、消费者 ≤4 次轮询即抛错 |
+| **P1-4** 无掩码路径发布后才改名 | `9b5947f` | 循环内只登记，`_drain_tail("rename")` + `rename_pdb_files_by_ranking()` 之后再按生成顺序一次性发布 | `tests/test_ledger_publish_order.py` | **(b)** 旧代码：无 tail 时台账名字指向失效文件；有 tail 时状态里出现 `filtered`。**(c)** 新行为：两种设置下 id 连续、全 `ok`、名字指向磁盘真实文件 |
+| **P2-5** 失败被静默跳过、请求仍报成功 | `4b5ad7e` | 服务端掩码分支异常写入结果集；请求级状态优先级明确；客户端消费到 `error` 立即抛错 | `tests/test_failure_states.py` + `test_candidate_ordering.py` | **(b)** 旧服务端：`Failed: 0` 而日志有异常；旧客户端：把 `error` 当 `filtered` 跳过。**(c)** 新行为：见第二节 #1 |
+| **P2-6** 台账半行 UTF-8 截断 | `9b6c3c6` | `LedgerReader` 按**字节**缓冲，切完整行后再解码 | `test_candidate_ledger.py` 逐字节追加含中文/`ü` 的记录 | **(b)** 旧代码：`UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe4 …`。**(c)** 新行为：无异常、内容与写入一致 |
+| **P2-7** 动态密度没有版本契约 | `8f1d2ce` | 每轮掩膜写 `current_density_mNN.mrc`（**路径即版本**），主进程与共享池 worker 内缓存都自然失效 | `tests/test_density_version.py` | **(b)** 旧代码：两轮后路径相同。**(c)** 新行为：路径不同、旧版本仍在、内容互不相同 |
 
-单测：228 → **253 项全绿**。文档同步：`PROJECT_ARCHITECTURE.md` 五行、`ENGINEERING_HARDENING_PLAN.md` v4.12 第 106–113 条。
+## 一bis、第二轮复核的 4 项（提交见下）
+
+| 复核项 | 提交 | 修复要点 | 定向测试 | 证据分级 |
+|---|---|---|---|---|
+| **#1** 同一 mask 内部分评估失败仍报成功 | `28d4440` | `_publish` 改为**错误优先**；掩码分支异常写入 `mask_results` 与 `all_results`，使日志 / `Failed` / 台账口径一致 | `tests/test_masked_partial_failure.py`（新，4 项） | **(b)** 旧代码：`['ok'] != ['error']`、计数 `0 != 1`。**(c)** 新行为：部分失败→`error` + `end.status="error"`；全成功→`ok` |
+| **#2** 客户端抛错未收口请求 | `28d4440` | `run()` 包装 `_run()`：异常时先 `on_cancel()` 再 `_await_request_end()`，清理异常不得覆盖原始错误 | `test_candidate_ordering.py::test_error_candidate_cancels_the_request` | **(b)** 旧 consumer：该用例失败（未取消）。**(c)** 新行为：抛错前 `cancelled=True` 且检查过请求结束 |
+| **#3** `error_policy="skip"` 名不副实 | `28d4440` | **移除该参数**（不新增宽松策略）：候选级 `error` 一律抛错 | `test_failure_states.py::test_error_policy_is_not_a_supported_mode` | **(c)** 新行为：传该参数 `TypeError`；报告删掉"需要宽松就用 skip"的措辞（原文不准确） |
+| **#4** 评分缓存统计读旧字段 | `60ea283` | 统计写入抽成 `_record_score_cache()` / `_record_tm_cache()`，占用/峰值取**顶层共享字段** | `tests/test_score_cache_metric.py`（新，4 项） | **(b)** 旧表达式 `snapshot["density"]["bytes"]` → `KeyError: 'bytes'`，两次审计运行日志均有 `Score cache snapshot failed: 'bytes'`。**(c)** 新行为：事件写出且字段齐全 |
+
+单测：228 → **259 项全绿**（第二轮拆分测试文件后复核：`test_masked_partial_failure.py` 的 4 项从 `test_failure_states.py` 迁出，避免同一组用例被计两次）。文档同步：`PROJECT_ARCHITECTURE.md`、`ENGINEERING_HARDENING_PLAN.md`（v4.12 第 106–115 条、v4.13 第 116–119 条）。
 
 ## 二、验证 ①：默认 `test/1` 与冻结基线逐位一致
 
@@ -50,10 +64,15 @@
 
 ## 四、残留范围与开放项
 
-1. **真实复合物端到端未跑**：P1-1/P1-2 目前只有合成定向测试。若要真实数据背书，需要另建只含 `6lu9.cif` + `EMD-0979.mrc` 的干净目录（`/xiangyux/test_data/fiting_lg/6lu9`，res 8.8 / contour 0.316）——等用户点头再安排。
-2. **P2-5 的默认"明确失败"**：本次 11 个请求 `Failed=0`，未触发；但某些输入下若单个候选失败，整次请求会中止（这是定稿契约要求的）。如需更宽松，把 `error_policy` 显式设为 `skip` 或在该调用点处理。
-3. **多字符真实链号**：只有合成测试覆盖，真实数据未出现。
+1. **真实复合物端到端未跑**：P1-1/P1-2 的证据是第二节的合成定向测试（真实 `B/C` + 占位 `A/B`、多字符 `AA/BB`、单域复合物、以及"逐域改善 → `_accept_chain()` → 最终 CIF"串联用例 `test_improved_pose_survives_accept_chain_and_keeps_real_ids`）；真实数据仍需另建只含 `6lu9.cif` + `EMD-0979.mrc` 的干净目录（res 8.8 / contour 0.316）。
+2. **没有宽松模式**：候选级 `error` 一律抛错（`error_policy` 已移除）。本次 11 个请求 `Failed=0` 未触发该路径；若某类输入出现单点评估失败，整次请求会中止 —— 这是定稿契约的行为，需要容错时必须单独设计"部分成功"语义，而不是靠一个已被移除的开关。
+3. **多字符真实链号**：由 `test_multichar_real_chain_ids_survive_the_placeholder_round_trip` 覆盖（合成 CIF），真实数据未出现。
 4. `test/2` 墙钟 2342 s：地图比 `test/1` 大约 10 倍，**不作性能结论**。
+5. 第二轮复核后**尚未重跑真实全流程**（本轮只改失败路径与统计写入，按你"先修完再考虑长跑"的要求，test/1 复测见下）。
+
+## 四bis、第二轮修复后的复测（待补）
+
+本轮（`28d4440`、`60ea283`）只改失败传播与指标写入，未改变正常路径的数值路径。按验收纪律仍需一次默认 `test/1` 复测（对齐 `baseline_after_o6.md5`）与 `Failed=0` 复核；结果补记于此。
 
 ## 五、复现路径（`/xiangyux/claude_c_work/demo_reg_cases/`，不进仓库）
 

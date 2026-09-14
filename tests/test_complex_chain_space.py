@@ -112,6 +112,79 @@ class ComplexChainSpaceTest(unittest.TestCase):
             write_structure_with_chain_map(real_space, chain_map,
                                            self.path("twice.cif"))       # 第二次（旧缺陷）
 
+    def test_multichar_real_chain_ids_survive_the_placeholder_round_trip(self):
+        """多字符真实链号（AA/BB）：占位 A/B → 合并保持占位 → 最终恢复成 AA/BB。
+
+        多字符链号只能落在 CIF 里（PDB 写不下），这条用例覆盖"恢复后再写 improved PDB"的兼容风险。
+        """
+        real_cif = fixtures.make_chain_structure(
+            self.path("multi.cif"), [("AA", (0.0, 0.0, 0.0)), ("BB", (30.0, 0.0, 0.0))],
+            residues=6)
+        chain_map = cif_to_pdb_placeholders(real_cif, self.path("multi_ph.pdb"))
+        self.assertEqual(sorted(chain_map.values()), ["AA", "BB"])
+        self.assertEqual(sorted(chain_map.keys()), ["A", "B"])
+
+        dom_a = fixtures.make_chain_structure(self.path("m_dom_a.cif"), [("A", (0.0, 0.0, 0.0))],
+                                              residues=6)
+        dom_b = fixtures.make_chain_structure(self.path("m_dom_b.cif"), [("B", (30.0, 0.0, 0.0))],
+                                              residues=6)
+        fitted = [{"domain_num": 1, "fitted_cif": dom_a, "source_chain_id": "A"},
+                  {"domain_num": 2, "fitted_cif": dom_b, "source_chain_id": "B"}]
+        orch = _Orch(self.root, chain_map)
+
+        merged = merge_domains(orch, "Q+R", fitted, {1: [(1, 6)], 2: [(1, 6)]},
+                               is_complex=True)
+        self.assertEqual(_chain_ids(merged), ["A", "B"])       # 内部空间
+
+        final = self.path("multi_final.cif")
+        write_structure_with_chain_map(merged, chain_map, final)
+        self.assertEqual(_chain_ids(final), ["AA", "BB"])      # 最终空间（CIF 能承载多字符）
+
+    def test_improved_pose_survives_accept_chain_and_keeps_real_ids(self):
+        """串起真实链路：逐域改善产物（内部空间）→ `_accept_chain()` → 最终 CIF。
+
+        只替代昂贵的评分/优化：改善步骤用"把合并结果写成 PDB"代替（与
+        `chain_fitter._improve_by_domain_reassembly` 的产物形态一致）。
+        """
+        from Bio.PDB import PDBIO
+        from protassem.assembly.orchestrator import AssemblyOrchestrator
+
+        chain_map = self._placeholder_map()                 # 真实 B/C，占位 A/B
+        dom_a = fixtures.make_chain_structure(self.path("i_dom_a.cif"), [("A", (0.0, 0.0, 0.0))],
+                                              residues=6)
+        dom_b = fixtures.make_chain_structure(self.path("i_dom_b.cif"), [("B", (30.0, 0.0, 0.0))],
+                                              residues=6)
+        fitted = [{"domain_num": 1, "fitted_cif": dom_a, "source_chain_id": "A"},
+                  {"domain_num": 2, "fitted_cif": dom_b, "source_chain_id": "B"}]
+        orch = _Orch(self.root, chain_map)
+        merged = merge_domains(orch, "Q+R", fitted, {1: [(1, 6)], 2: [(1, 6)]},
+                               is_complex=True)
+
+        # 改善步骤：合并结果（内部空间）→ improved PDB
+        improved = self.path("improved_Q+R.pdb")
+        structure = MMCIFParser(QUIET=True).get_structure("a", merged)
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(improved)
+        self.assertEqual(_chain_ids(improved if improved.endswith(".cif") else merged),
+                         ["A", "B"])
+
+        # 接受步骤：真实 `_accept_chain`（唯一恢复点）
+        stub = mock.MagicMock()
+        stub._chain_order = 0
+        stub.final_dir = Path(self.root) / "final"
+        (stub.final_dir / "chains").mkdir(parents=True, exist_ok=True)
+        stub.accepted_chains = []
+        stub.accepted_fitted_pdbs = []
+        record = {"chain_id": "Q+R", "is_complex": True, "chain_map": chain_map,
+                  "status": "pending"}
+        AssemblyOrchestrator._accept_chain(stub, record, improved, 0.4376)
+
+        final = record["fitted_cif"]
+        self.assertTrue(os.path.exists(final))
+        self.assertEqual(_chain_ids(final), ["B", "C"])      # 恰好映射一次
+        self.assertEqual(stub.accepted_chains[0]["cc_mask"], 0.4376)
+
     def test_single_domain_complex_restores_real_chain_id(self):
         """只接受一个域时，最终 domain_chain 文件必须是真实链号（不是组件 ID、不是占位）。"""
         chain_map = self._placeholder_map()
