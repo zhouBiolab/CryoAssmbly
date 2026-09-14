@@ -92,18 +92,26 @@ class ComplexDomainMergeTest(unittest.TestCase):
             self.orch.domain_adjacency[COMPLEX_ID][0], is_complex=False)
         self.assertIsNone(result)
 
-    def test_merge_with_is_complex_keeps_one_chain_per_source_and_real_ids(self):
+    def test_merge_with_is_complex_keeps_one_chain_per_source_in_placeholder_space(self):
+        """P1-1 后的契约：合并结果留在**内部（占位）空间**，最终链号在落盘处恢复一次。"""
         out = domain_assembler.merge_domains(
             self.orch, COMPLEX_ID, self.fitted,
             self.orch.domain_adjacency[COMPLEX_ID][0], is_complex=True)
         self.assertIsNotNone(out)
-        self.assertEqual(self._chain_ids(out), ["Q", "R"])   # 占位 A/B -> 真 Q/R
+        self.assertEqual(self._chain_ids(out), ["A", "B"])   # 内部空间：保持占位链号
 
         from Bio.PDB import MMCIFParser
         structure = MMCIFParser(QUIET=True).get_structure("s", out)
         model = next(structure.get_models())
-        self.assertEqual(sum(1 for _ in model["Q"]), 10)
-        self.assertEqual(sum(1 for _ in model["R"]), 10)
+        self.assertEqual(sum(1 for _ in model["A"]), 10)
+        self.assertEqual(sum(1 for _ in model["B"]), 10)
+
+        # 最终输出：只映射一次 -> 真链号 Q/R
+        final = domain_assembler._restore_chain_ids(self.orch, COMPLEX_ID, out)
+        self.assertEqual(self._chain_ids(final), ["Q", "R"])
+        restored = next(MMCIFParser(QUIET=True).get_structure("s", final).get_models())
+        self.assertEqual(sum(1 for _ in restored["Q"]), 10)
+        self.assertEqual(sum(1 for _ in restored["R"]), 10)
 
     def test_real_chain_ids_are_not_mapped_twice(self):
         """已经是真链号的 source_chain_id 必须原样通过。"""
@@ -113,6 +121,26 @@ class ComplexDomainMergeTest(unittest.TestCase):
             is_complex=True)
         self.assertIsNotNone(out)
         self.assertEqual(self._chain_ids(out), ["Q", "R"])
+
+    def test_assemble_domain_chains_single_domain_restores_real_id(self):
+        """复合物只接受一个域：最终链号 = 该域来源链的真链号（不是组件 ID Q+R）。"""
+        single = self._domain(1, "B", 1, 5, 0.45)
+        # 域拟合产物在内部（占位）空间：链号 = source_chain_id
+        single["fitted_pdb"] = fixtures.make_chain_structure(
+            os.path.join(self.tmp, "single_fitted.pdb"), [("B", (0.0, 0.0, 0.0))],
+            residues=5)
+        self.orch.domain_records[COMPLEX_ID] = [single]
+        self.orch.needs_domain_assembly.append(COMPLEX_ID)
+
+        with mock.patch.object(domain_assembler, "calculate_cc_mask",
+                               return_value=0.42):
+            domain_assembler.assemble_domain_chains(self.orch)
+
+        self.assertEqual(len(self.orch.accepted_chains), 1)
+        record = self.orch.accepted_chains[0]
+        self.assertTrue(os.path.exists(record["fitted_cif"]))
+        self.assertEqual(self._chain_ids(record["fitted_cif"]), ["R"])
+        self.assertEqual(record["fitted_cif_filtered"], record["fitted_cif"])
 
     def test_assemble_domain_chains_produces_domain_chain_with_real_ids(self):
         self.orch.needs_domain_assembly.append(COMPLEX_ID)

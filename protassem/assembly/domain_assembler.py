@@ -1,4 +1,18 @@
-"""Domain chain assembly -- merge accepted domains into chain CIFs."""
+"""Domain chain assembly -- merge accepted domains into chain CIFs.
+
+链号空间约定（审计 P1-1/P1-2 后明确）
+------------------------------------
+- **内部（占位）空间**：`cif_to_pdb_placeholders()` 给出的单字符占位链号（如 A/B），
+  域 PDB、`source_chain_id`、`merge_domains()` 的输出都在这个空间；
+- **真实链号空间**：最终 CIF 里用户可见的链号（如 Q/R，或多字符）；
+- **组件 ID**：`chain_id`（如 `Q+R`），只用于内部记录与中间文件命名。
+
+规则：**占位 -> 真实的映射只在最终输出处做一次**，而且只在两个地方做：
+  1. `orchestrator._accept_chain()`（链级路径）；
+  2. 本模块的 `_restore_chain_ids()`（域链最终落盘：多域合并与单域两条路径共用）。
+`merge_domains()` 一律留在内部空间，绝不提前映射 —— 否则"逐域改善"的产物会带着真链号
+回流，再被最终输出映射第二次（真链号与占位链号有交集时撞名/报错）。
+"""
 
 import os
 import logging
@@ -7,7 +21,7 @@ import shutil
 from Bio.PDB import MMCIFParser, MMCIFIO, Structure, Model, Chain
 
 from protassem.core.scoring import calculate_cc_mask
-from protassem.core.structure import pdb_to_cif
+from protassem.core.structure import pdb_to_cif, write_structure_with_chain_map
 
 log = logging.getLogger(__name__)
 
@@ -16,6 +30,38 @@ def chain_map_of(orch, chain_id):
     """取该组件的占位链号 -> 真链号映射（原始 chain_records 是唯一来源）。"""
     record = orch.chain_record(chain_id)
     return (record.get("chain_map") or {}) if record else {}
+
+
+def _restore_chain_ids(orch, chain_id, cif_path, source_cid=None):
+    """把**内部空间**的文件写成**最终链号空间**的文件（映射一次）。
+
+    - 无 `chain_map`（非复合物）：链号即真实链号，直接返回原路径；
+    - 给了 `source_cid`（单域路径）：只改这一条来源链，显式指定、不做 `get(id, id)` 猜测，
+      因此不可能失败在其他链上、也不会二次映射；
+    - 否则（多域合并）：整个组件的占位链号一起映射。
+    """
+    chain_map = chain_map_of(orch, chain_id)
+    if not chain_map:
+        # 非复合物：链号即真实链号。源可能是 PDB（单域路径的 fitted_pdb），
+        # 落盘前统一转成 CIF（链号不变），避免把 .pdb 内容写进 .cif 名字。
+        if str(cif_path).lower().endswith(".cif"):
+            return cif_path
+        out_path = str(orch.work_dir
+                       / ("final_%s.cif" % os.path.basename(cif_path).rsplit(".", 1)[0]))
+        pdb_to_cif(cif_path, out_path, chain_id=None)
+        return out_path
+    if source_cid is not None:
+        real_cid = chain_map.get(source_cid)
+        if real_cid is None:
+            log.warning("Chain %s: source chain %s not in chain_map %s; "
+                        "keeping the id as-is", chain_id, source_cid, chain_map)
+            return cif_path
+        mapping = {source_cid: real_cid}
+    else:
+        mapping = chain_map
+    out_path = str(orch.work_dir / ("final_%s.cif" % os.path.basename(cif_path).rsplit(".", 1)[0]))
+    write_structure_with_chain_map(cif_path, mapping, out_path)
+    return out_path
 
 
 def assemble_domain_chains(orch):
@@ -28,6 +74,7 @@ def assemble_domain_chains(orch):
     每条域链同时产出两个 CIF：
       - 全量（所有已接受域）          -> 记录 fitted_cif          -> assembled_complex_all.cif
       - 过滤版（仅 cc>=complex_min_cc）-> 记录 fitted_cif_filtered -> assembled_complex.cif
+    两者都在**最终链号空间**落盘（内部空间 -> 最终只映射一次）。
     """
     for cid in dict.fromkeys(orch.needs_domain_assembly):   # 去重，避免同一域链装两遍
         chain_rec = next((c for c in orch.chain_records
@@ -58,11 +105,18 @@ def assemble_domain_chains(orch):
                                       orch.resolution, orch.contour)
         log.info("Chain %s: assembled from %d domains (cc=%.4f)",
                  cid, len(fitted), domain_cc)
+        final_cif = _restore_chain_ids(orch, cid, assembled_cif)
         filtered_cif = _filtered_domain_cif(orch, cid, fitted, ranges,
                                             assembled_cif,
                                             is_complex=is_complex)
-        _save_domain_chain(orch, cid, assembled_cif, domain_cc, fitted,
-                           filtered_cif)
+        if filtered_cif is None:
+            filtered_final = None
+        elif os.path.abspath(filtered_cif) == os.path.abspath(assembled_cif):
+            filtered_final = final_cif          # 无域被过滤：与全量同一份
+        else:
+            filtered_final = _restore_chain_ids(orch, cid, filtered_cif)
+        _save_domain_chain(orch, cid, final_cif, domain_cc, fitted,
+                           filtered_final)
 
 
 def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
@@ -71,6 +125,9 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
 
     For complexes with complex_domain_opt, creates multi-chain CIF
     using source_chain_id.  out_cif 可指定输出路径（缺省落到 work_dir）。
+
+    **输出保持在内部（占位）链号空间**；最终链号的恢复由调用方在落盘处做一次
+    （`_restore_chain_ids()` 或 `orchestrator._accept_chain()`）。
     """
     out_cif = out_cif or str(orch.work_dir / ("assembled_%s.cif" % chain_id))
     try:
@@ -86,7 +143,6 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
         model_obj = Model.Model(0)
 
         if is_complex:
-            chain_map = chain_map_of(orch, chain_id)
             chains_map = {}
             serial = 1
             for seg in segments:
@@ -95,9 +151,8 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
                     continue
                 src_cid = seg["drec"].get("source_chain_id", chain_id)
                 if src_cid not in chains_map:
-                    # 源链号在 CIF 输入时是占位空间（A/B），写出前映射回真链号（Q/R）；
-                    # chain_map 的键只含占位链号，真链号原样通过，不会二次映射。
-                    chains_map[src_cid] = Chain.Chain(chain_map.get(src_cid, src_cid))
+                    # 内部空间：**保持占位链号**（见模块开头"链号空间约定"）
+                    chains_map[src_cid] = Chain.Chain(src_cid)
                 chain_obj = chains_map[src_cid]
                 parser = MMCIFParser(QUIET=True)
                 ds = parser.get_structure("d", cif)
@@ -149,7 +204,7 @@ def merge_domains(orch, chain_id, fitted_domains, domain_ranges,
 
 def _filtered_domain_cif(orch, chain_id, fitted_domains, ranges, full_cif,
                          is_complex=False):
-    """过滤版域链 CIF：仅保留 cc_mask >= complex_min_cc 的域。
+    """过滤版域链 CIF：仅保留 cc_mask >= complex_min_cc 的域（仍在内部空间）。
 
     返回：
       - full_cif：无域被过滤（复用全量，省一次合并）
@@ -168,7 +223,12 @@ def _filtered_domain_cif(orch, chain_id, fitted_domains, ranges, full_cif,
 
 
 def _handle_single_domain(orch, chain_id, chain_rec, domain_rec):
-    """Single accepted domain is the chain's contribution."""
+    """Single accepted domain is the chain's contribution.
+
+    P1-2：只接受一个域时也必须恢复链号 —— 域 CIF 是以**组件 ID**（如 `Q+R`）落盘的中间产物，
+    直接复制到最终目录会让它成为最终结构的链号。这里从内部空间的位姿出发，
+    按该域的来源链**映射一次**（复合物），非复合物保持链号。
+    """
     d_file = domain_rec.get("fitted_cif") or domain_rec.get("fitted_pdb")
     if not d_file or not os.path.exists(d_file):
         log.info("Chain %s: single domain file missing; chain dropped",
@@ -176,10 +236,14 @@ def _handle_single_domain(orch, chain_id, chain_rec, domain_rec):
         return
     d_cc = calculate_cc_mask(orch.original_density_mrc, d_file,
                              orch.resolution, orch.contour)
+    # 源位姿优先取内部空间的 fitted_pdb（其链号是 source_chain_id）；domain_cif 只作兜底
+    source = domain_rec.get("fitted_pdb") or d_file
+    final_file = _restore_chain_ids(orch, chain_id, source,
+                                    source_cid=domain_rec.get("source_chain_id"))
     # 单域：该域 cc 达标则过滤版=全量，否则过滤版为空（链不进过滤复合物）
-    filtered = (d_file if domain_rec.get("cc_mask", d_cc) >= orch.complex_min_cc
+    filtered = (final_file if domain_rec.get("cc_mask", d_cc) >= orch.complex_min_cc
                 else None)
-    _save_domain_chain(orch, chain_id, d_file, d_cc, [domain_rec], filtered)
+    _save_domain_chain(orch, chain_id, final_file, d_cc, [domain_rec], filtered)
 
 
 def _save_domain_chain(orch, chain_id, cif_file, cc, fitted_domains,
