@@ -22,7 +22,7 @@ class CandidateConsumer:
 
     def __init__(self, reader, batch_size, on_batch, request_finished,
                  on_cancel=None, sleep=time.sleep, poll_interval=POLL_INTERVAL_S,
-                 describe_request=None, error_policy="fail"):
+                 describe_request=None):
         self.reader = reader
         self.batch_size = max(1, int(batch_size))
         self.on_batch = on_batch
@@ -33,16 +33,14 @@ class CandidateConsumer:
         # P1-3：可选的诊断来源（例如"服务进程已退出（returncode=…）"），让报错能区分
         # "服务死亡"与"服务端漏写 end"。
         self.describe_request = describe_request or (lambda: "")
-        # P2-5：候选级执行失败（state=error）的默认策略是**明确失败**；`filtered`
-        # 只表示"正常计算但没有有效候选"，由 on_batch 自己跳过并计数。
-        if error_policy not in ("fail", "skip"):
-            raise ValueError("未知的 error_policy: %r" % (error_policy,))
-        self.error_policy = error_policy
 
     def _check_states(self, records):
-        """执行失败默认直接抛错：不能让"少了一些候选"悄悄变成交付结果。"""
-        if self.error_policy != "fail":
-            return
+        """执行失败直接抛错（P2-5）：不能让"少了一些候选"悄悄变成交付结果。
+
+        不提供宽松模式：服务端在存在候选级失败时会把 `end.status` 写成 `error`，
+        客户端无论如何都会抛错，所以"跳过 error 继续跑"无法构成真正的宽松策略；
+        真需要容错，应在具体调用点显式设计部分成功语义。
+        """
         for record in records:
             if record["state"] == "error":
                 raise RuntimeError("候选 %d 执行失败（state=error）：%s"
@@ -59,7 +57,27 @@ class CandidateConsumer:
         return RuntimeError("%s：%s" % (message, detail) if detail else message)
 
     def run(self):
-        """消费全部候选；返回批次摘要（调用方据此决定是否 final_select）。"""
+        """消费全部候选；返回批次摘要（调用方据此决定是否 final_select）。
+
+        审计#2：任何异常（候选失败、缺 end、服务死亡…）都要先**收口本请求** ——
+        取消并等它结束 —— 再传播原始异常。独立调用方捕获异常后继续工作时，
+        不能让 PARENet 服务仍在处理一个已经失败的请求；清理本身的异常不得覆盖最初错误。
+        """
+        try:
+            return self._run()
+        except BaseException:
+            try:
+                self.on_cancel()
+            except Exception:
+                pass
+            try:
+                self._await_request_end()
+            except Exception:
+                pass
+            raise
+
+    def _run(self):
+        """消费主循环（异常处理见 run()）。"""
         batches = []
         results = []
         next_id = 0

@@ -598,22 +598,23 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     def _publish(candidate_id, results, name=None, overlap=None, source=None):
         """发布一个候选的终态（O6）：ok / filtered / error 三态必须显式。
 
-        P2-5：执行失败必须记 error（不能被当成 filtered 静默跳过）；
-        `ledger_errors` 汇总用于请求级结束状态。
+        P2-5 + 审计#1：**先看执行错误，再看成功文件**。同一个 mask 里只要有一个评估抛异常，
+        就不能因为另一个评估成功而把该候选记成 ok —— 否则日志里有异常、`Failed` 却是 0、
+        台账还报 ok，三处互相矛盾。`ledger_errors` 汇总用于请求级结束状态。
         """
-        if name and os.path.exists(name):
-            ledger.publish(candidate_id, "ok", name=name, overlap=overlap,
-                           source=source)
-            return
         errors = [r.get("error") for r in results if r.get("error")]
         if errors:
             ledger_errors["count"] += 1
             if ledger_errors["first"] is None:
                 ledger_errors["first"] = errors[0]
             ledger.publish(candidate_id, "error", source=source, error=errors[0])
-        else:
-            ledger.publish(candidate_id, "filtered", source=source,
-                           reason="no valid prediction")
+            return
+        if name and os.path.exists(name):
+            ledger.publish(candidate_id, "ok", name=name, overlap=overlap,
+                           source=source)
+            return
+        ledger.publish(candidate_id, "filtered", source=source,
+                       reason="no valid prediction")
 
     failure = None
     try:
@@ -646,6 +647,12 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             all_results.append(r)
                         except Exception as e:
                             log.error("Config %d-%s crashed: %s", cid, sm, e)
+                            # 审计#1：异常必须进入本掩码的结果集与全局结果集 ——
+                            # 否则"日志有异常、Failed 计数却是 0、台账还报 ok"三处互相矛盾。
+                            failure_record = {"error": str(e), "config_id": cid,
+                                              "sampling_method": sm}
+                            mask_results.append(failure_record)
+                            all_results.append(failure_record)
                             # P2-5：执行失败必须进入本掩码的结果集，否则会被当成
                             # "正常但没有有效候选"（filtered）而被静默跳过。
                             mask_results.append({"error": str(e), "config_id": cid,
