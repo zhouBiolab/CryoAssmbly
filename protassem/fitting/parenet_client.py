@@ -178,18 +178,48 @@ def shutdown_server():
 
 
 class ParenetRequest:
-    """Handle for one in-flight request; mimics a Popen (poll/terminate)."""
+    """Handle for one in-flight request; mimics a Popen (poll/terminate).
 
-    def __init__(self, output_dir, request_id=None):
+    P1-3：句柄同时持有**服务进程**。只看 `_PARENET_DONE` 无法区分"请求还在跑"与
+    "服务已经死了、来不及写 done"——后者会让客户端永久等待。
+    """
+
+    def __init__(self, output_dir, request_id=None, server=None):
         self.output_dir = output_dir
         self.request_id = request_id
+        self.server = server
         self.done_file = os.path.join(output_dir, DONE_MARKER)
         self.stop_file = os.path.join(output_dir, STOP_MARKER)
         self.ledger_path = os.path.join(output_dir, LEDGER_NAME)
 
     def poll(self):
-        """None while running, 0 once the server signalled completion."""
-        return 0 if os.path.exists(self.done_file) else None
+        """None while running；请求完成（done 文件）返回 0；服务已退出返回非 0。"""
+        if os.path.exists(self.done_file):
+            return 0
+        return None if self.server_alive() else self._server_returncode()
+
+    def server_alive(self):
+        """服务进程是否仍在运行（无进程可查时按"存活"处理，保持旧行为）。"""
+        if self.server is None:
+            return True
+        return self.server.poll() is None
+
+    def request_completed(self):
+        """服务端是否已明确写下本请求的完成标记。"""
+        return os.path.exists(self.done_file)
+
+    def describe_failure(self):
+        """服务死亡时的诊断文本（供消费者报错用）。"""
+        if self.request_completed() or self.server_alive():
+            return ""
+        return ("PARENet 服务进程已退出（returncode=%s）且未写 %s"
+                % (self._server_returncode(), DONE_MARKER))
+
+    def _server_returncode(self):
+        if self.server is None:
+            return 1
+        code = self.server.poll()
+        return 1 if code is None else code
 
     def terminate(self):
         """Ask the server to stop the current request early (file signal)."""
@@ -243,4 +273,4 @@ def start_request(target, source, chain_pdb, output_dir,
     server.stdin.flush()
     log.info("PARENet request: %s (request_id=%s)",
              os.path.basename(str(source)), request_id)
-    return ParenetRequest(output_dir, request_id)
+    return ParenetRequest(output_dir, request_id, server=server)

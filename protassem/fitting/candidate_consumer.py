@@ -21,7 +21,8 @@ class CandidateConsumer:
     """按固定 ID 区间消费台账；`on_batch(records)` 返回 `(results, hit_threshold)`。"""
 
     def __init__(self, reader, batch_size, on_batch, request_finished,
-                 on_cancel=None, sleep=time.sleep, poll_interval=POLL_INTERVAL_S):
+                 on_cancel=None, sleep=time.sleep, poll_interval=POLL_INTERVAL_S,
+                 describe_request=None):
         self.reader = reader
         self.batch_size = max(1, int(batch_size))
         self.on_batch = on_batch
@@ -29,6 +30,18 @@ class CandidateConsumer:
         self.on_cancel = on_cancel or (lambda: None)
         self.sleep = sleep
         self.poll_interval = poll_interval
+        # P1-3：可选的诊断来源（例如"服务进程已退出（returncode=…）"），让报错能区分
+        # "服务死亡"与"服务端漏写 end"。
+        self.describe_request = describe_request or (lambda: "")
+
+    def _missing_end_error(self):
+        detail = ""
+        try:
+            detail = str(self.describe_request() or "")
+        except Exception:
+            detail = ""
+        message = "请求已结束但没有台账 end 记录（不完整请求）"
+        return RuntimeError("%s：%s" % (message, detail) if detail else message)
 
     def run(self):
         """消费全部候选；返回批次摘要（调用方据此决定是否 final_select）。"""
@@ -84,7 +97,7 @@ class CandidateConsumer:
             if self.request_finished():
                 missing_end_polls += 1
                 if missing_end_polls > END_GRACE_POLLS:
-                    raise RuntimeError("请求已结束但没有台账 end 记录（不完整请求）")
+                    raise self._missing_end_error()
             else:
                 missing_end_polls = 0
             self.sleep(self.poll_interval)
@@ -109,6 +122,6 @@ class CandidateConsumer:
                 self.sleep(self.poll_interval)
                 self.reader.poll()
                 if self.reader.end is None:
-                    raise RuntimeError("请求已结束但没有台账 end 记录（不完整请求）")
+                    raise self._missing_end_error()
                 continue
             self.sleep(self.poll_interval)

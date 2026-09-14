@@ -293,7 +293,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     consumer = CandidateConsumer(
         reader, batch_size, evaluate_batch,
         request_finished=lambda: proc.poll() is not None,
-        on_cancel=lambda: _kill(proc))
+        on_cancel=lambda: _kill(proc),
+        describe_request=lambda: _describe_request(proc))
 
     _stream_started = time.perf_counter()
     outcome = consumer.run()
@@ -552,6 +553,14 @@ def _kill(proc):
         proc.terminate()
     except Exception:
         pass
+
+
+def _describe_request(proc):
+    """请求结束但台账缺 end 时的诊断（P1-3）：区分"服务死亡"与"服务端漏写 end"。"""
+    try:
+        return proc.describe_failure()
+    except Exception:
+        return ""
 
 
 def _fail():
