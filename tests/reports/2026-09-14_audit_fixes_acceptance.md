@@ -70,9 +70,22 @@
 4. `test/2` 墙钟 2342 s：地图比 `test/1` 大约 10 倍，**不作性能结论**。
 5. 第二轮复核后**尚未重跑真实全流程**（本轮只改失败路径与统计写入，按你"先修完再考虑长跑"的要求，test/1 复测见下）。
 
-## 四bis、第二轮修复后的复测（待补）
+## 四bis、第二轮修复后的复测（`7517f11`）
 
-本轮（`28d4440`、`60ea283`）只改失败传播与指标写入，未改变正常路径的数值路径。按验收纪律仍需一次默认 `test/1` 复测（对齐 `baseline_after_o6.md5`）与 `Failed=0` 复核；结果补记于此。
+本轮只改失败传播与指标写入，未改数值路径；仍按验收纪律跑了默认 `test/1`（13:51–14:12）：
+
+| 项 | 结果 |
+|---|---|
+| 墙钟 / `pipeline_total` | 1258 s / 1248.91 s（在 1211–1330 s 波动带内） |
+| 三个 CIF md5 | `76638d0f…` / `76638d0f…` / `bd281f40…` = **`baseline_after_o6.md5`** |
+| 决策 | A 拒 0.4192、B 受 0.4235、A 两域 0.4430（逐条一致） |
+| 台账 / 消费序列 | 3 请求 24/28/115、58 个候选、sha1 `de02d03105ebff9f`（一致） |
+| 服务端失败计数 | 三个请求均 `Failed: 0` |
+| **`score_cache` 指标事件** | **本次真实写出**（修复前被 KeyError 吞掉）：`score_cache_mb=128, entries=52, bytes=110.5 MB, peak_bytes=127.8 MiB, evictions=28, density_hits=72, density_misses=4, structure_hits=0, structure_misses=76`；日志中**没有** `Score cache snapshot failed` |
+| `tm_cache` 指标事件 | 写出：`mode=auto, hits=4, misses=0, writes=0, rows=12` |
+| 未归因时间 | 2.02 s |
+
+→ 第二轮 4 项修复**没有改变默认路径产物**，且审计#4 的症状在真实运行里已消失。
 
 ## 五、复现路径（`/xiangyux/claude_c_work/demo_reg_cases/`，不进仓库）
 
