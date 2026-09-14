@@ -55,6 +55,7 @@
 | 107 | 审计 P1-2 单域复合物链号【已修复】 | 单域路径直接把域 CIF（链号=组件 ID `Q+R`）复制到最终目录 | 单域路径从**内部空间**的 `fitted_pdb` 出发、映射一次；补"复合物只保留一个域"的测试（`assemble_domain_chains` 级 + `_handle_single_domain` 级） |
 | 108 | 新契约的回归保护 | 旧测试断言"合并结果已是真链号" | 该测试改写为两段式契约（合并=`{A,B}`、落盘后=`{Q,R}`）；新增 `tests/test_complex_chain_space.py`（真实 `B/C`+占位 `A/B`、多字符链号、单域、无 chain_map）；**旧代码跑新测试 4 项全失败**作为修复取证 |
 | 109 | 审计 P1-3 服务死亡【已修复】 | `ParenetRequest.poll()` 只看 `_PARENET_DONE`，服务被杀/启动失败时客户端永久等待 | 句柄持有服务进程并区分"请求完成/服务已死亡/仍在运行"，新增 `describe_failure()`；消费者把诊断带进报错并**快速失败**（实测 ≤4 次轮询）。回归测试用**真实假子进程**中止，而不是手工把 `request_finished` 置 True；旧代码跑该测试 4 项 `TypeError`（无 `server=` 参数） |
+| 110 | 审计 P1-4 无掩码发布顺序【已修复】 | `use_mask=False` 分支发布候选后才 `rename_pdb_files_by_ranking`，且 tail 开启时不等尾部就发布 | 循环内只登记，`_drain_tail("rename")` + 改名完成后再按生成顺序一次性发布（名字为最终名）。定向测试直接驱动 `run_inference(use_mask=False)`（模型/预处理/单对推理为 stub、尾部流水线真实）→ 无 tail/有 tail 两种设置都满足"id 连续、全 ok、名字指向磁盘真实文件、end=ok"；**旧代码两项失败**（失效名字 / 出现 `filtered`） |
 
 ### v4.10 → v4.11（老卡收口：口径校正与接口定稿）
 

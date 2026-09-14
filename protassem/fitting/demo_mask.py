@@ -658,7 +658,7 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                 log.info("  %d. %s overlap=%.6f", i, pdb, r.get("overlap", 0))
         else:
             logged = 0
-            candidate_id = 0
+            pending = []          # (source, result) 按生成顺序；**改名之后**才发布
             for cid in config_ids:
                 if _stopped():
                     break
@@ -677,11 +677,9 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                     except Exception as e:
                         log.error("Config %d-%s crashed: %s", cid, sm, e)
                         r = {"error": str(e)}
-                    # O6：无掩码分支用自己的稳定生成顺序分配整数 id（config 外层、sampling 内层）
-                    _publish(candidate_id, [r],
-                             name=r.get("pred_pdb_path"), overlap=r.get("overlap"),
-                             source={"config": cid, "sampling": sm})
-                    candidate_id += 1
+                    # O6：无掩码分支用自己的稳定生成顺序（config 外层、sampling 内层）编号；
+                    # P1-4：这里只登记，发布推迟到 rename 之后（见循环外）
+                    pending.append(({"config": cid, "sampling": sm}, r))
                 _drain_tail("ranking")        # 排名与日志都要读结果
                 while logged < len(all_results):
                     done = all_results[logged]
@@ -694,7 +692,12 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
             successful = [r for r in all_results if not r.get("error")
                           and r.get("overlap") is not None]
             if successful:
-                rename_pdb_files_by_ranking(successful)
+                rename_pdb_files_by_ranking(successful)   # 会回写 pred_pdb_path
+            # P1-4：发布必须发生在**尾部任务完成且最终命名之后** —— 台账里的名字此后不再变化；
+            # 旧实现边算边发布，改名后台账指向失效文件，tail 开启时还可能把未写出的候选记成 filtered。
+            for candidate_id, (candidate_source, result) in enumerate(pending):
+                _publish(candidate_id, [result], name=result.get("pred_pdb_path"),
+                         overlap=result.get("overlap"), source=candidate_source)
 
         # summary（读结果前必须等尾部完成）
         _drain_tail("summary")
