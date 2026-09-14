@@ -55,6 +55,7 @@
 | 116 | 第二轮审计#1 掩码内部分失败被记成功【已修复】 | `_publish` **先判成功文件、后判错误**：同一 mask 里 voxel 成功、fps 抛异常时发布 `ok`；异常也不进 `all_results` → 日志有异常而 `Failed` 恒为 0，三处口径互相矛盾 | `_publish` 改为**错误优先**（有 `error` 记录即发布 `error`，不看成功文件）；掩码分支把异常写入 `mask_results` 与 `all_results`，使日志 / `Failed` / 台账一致。定向测试 `tests/test_masked_partial_failure.py`（全成功 / 部分失败 / 全部失败 / 计数一致，直接驱动 `run_inference(use_mask=True)`）；**旧代码跑新测试失败**：`['ok'] != ['error']`、计数 `0 != 1` |
 | 117 | 第二轮审计#2 客户端抛错未收口请求【已修复】 | `_check_states` 直接抛异常，既不调用取消也不等请求结束；独立调用方捕获后继续工作时，服务可能仍在处理已失败的请求（atexit 不能代替请求级收口） | `run()` 包装 `_run()`：任何异常先 `on_cancel()`、再 `_await_request_end()`，两者自身的异常都不得覆盖原始错误，然后原样抛出。定向测试断言抛错前 `cancelled=True` 且确实检查过"请求已结束"；旧 consumer 该用例失败 |
 | 118 | 第二轮审计#3 `error_policy="skip"` 名不副实【已修复】 | `skip` 只跳过候选级错误，而服务端在存在候选级失败时写 `end.status=error` → 客户端随后仍然抛错；报告却把它宣传成"需要宽松就用它" | **移除该参数**（用户已确认不新增宽松策略）：候选级 `error` 一律抛错；`test_error_policy_is_not_a_supported_mode` 断言传该参数会 `TypeError`；报告与架构文档删除有关"宽松运行"的措辞 |
+| 119 | 第二轮审计#4 评分缓存统计丢失【已修复】 | `pipeline.py` 读 `snapshot["density"]["bytes"]/["peak_bytes"]`，而共享预算改造后这两个字段已移到顶层 → 真实运行日志 `Score cache snapshot failed: 'bytes'`，`score_cache` 指标事件直接丢失（两次审计运行都可复现） | 统计写入抽成 `_record_score_cache()` / `_record_tm_cache()`：占用/峰值/条目/淘汰取**顶层共享字段**，密度与结构各自保留命中/未命中计数。定向测试 `tests/test_score_cache_metric.py`（真实 snapshot → 指标写入、契约守护、TM 事件、缓存关闭时也记录）；行为复现：旧表达式 `snapshot["density"]["bytes"]` → `KeyError: 'bytes'`，真实运行日志里确有该告警 |
 
 ### v4.11 → v4.12（审计后的功能修复）
 

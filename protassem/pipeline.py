@@ -74,6 +74,48 @@ def _validate_inputs(density_mrc, structure_files, resolution, contour, voxel_si
         raise ValueError("voxel_size must be a positive number, got %r" % (voxel_size,))
 
 
+def _record_score_cache(metrics):
+    """把父进程侧的评分缓存统计写进运行指标（审计#4）。
+
+    `bytes`/`peak_bytes`/`entries`/`evictions` 是**共享预算**的顶层字段；`density`/`structure`
+    只保留各自的命中/未命中计数。写成独立函数是为了能直接测"真实 snapshot → 指标写入"，
+    而不是只测缓存内部（旧实现读了已搬走的 `density["bytes"]`，真实运行里静默失败）。
+    """
+    try:
+        from protassem.core.scoring import score_cache_snapshot
+        snapshot = score_cache_snapshot()
+        metrics.record("score_cache", 0.0, parent_side=True,
+                       score_cache_mb=snapshot["score_cache_mb"],
+                       entries=snapshot["entries"],
+                       bytes=snapshot["bytes"],
+                       peak_bytes=snapshot["peak_bytes"],
+                       evictions=snapshot["evictions"],
+                       density_hits=snapshot["density"]["hits"],
+                       density_misses=snapshot["density"]["misses"],
+                       structure_hits=snapshot["structure"]["hits"],
+                       structure_misses=snapshot["structure"]["misses"])
+        log.info("Score cache (parent side): %s", snapshot)
+    except Exception as exc:
+        log.warning("Score cache snapshot failed: %s", exc)
+
+
+def _record_tm_cache(metrics):
+    """把父进程侧的 TM 缓存统计写进运行指标（P5；worker 只跑 USalign，不写库）。"""
+    try:
+        from protassem.core.similarity import tm_cache_snapshot
+        snapshot = tm_cache_snapshot()
+        metrics.record("tm_cache", 0.0,
+                       mode=snapshot.get("tm_cache_mode"),
+                       hits=snapshot.get("hits"),
+                       misses=snapshot.get("misses"),
+                       writes=snapshot.get("writes"),
+                       rows=snapshot.get("rows"),
+                       memory_entries=snapshot.get("memory_entries"))
+        log.info("TM cache (parent side): %s", snapshot)
+    except Exception as exc:
+        log.warning("TM cache snapshot failed: %s", exc)
+
+
 def run_pipeline(density_mrc, structure_files, resolution, contour,
                  output_dir=None, voxel_size=2.0, log_file=None,
                  assembly_kwargs=None, runtime_config=None):
@@ -316,34 +358,8 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         log.info("Assembly finished (no complex produced)")
 
     metrics.record("pipeline_total", time.perf_counter() - pipeline_started)
-    # 老卡收口 P4：父进程侧的评分缓存统计（worker 进程各自持有缓存，不在此聚合）
-    try:
-        from protassem.core.scoring import score_cache_snapshot
-        snapshot = score_cache_snapshot()
-        metrics.record("score_cache", 0.0, parent_side=True,
-                       density_hits=snapshot["density"]["hits"],
-                       density_misses=snapshot["density"]["misses"],
-                       density_bytes=snapshot["density"]["bytes"],
-                       density_peak_bytes=snapshot["density"]["peak_bytes"],
-                       structure_hits=snapshot["structure"]["hits"],
-                       structure_misses=snapshot["structure"]["misses"])
-        log.info("Score cache (parent side): %s", snapshot)
-    except Exception as exc:
-        log.warning("Score cache snapshot failed: %s", exc)
-    # 老卡收口 P5：TM 缓存统计（父进程查询/写入；worker 只跑 USalign，不写库）
-    try:
-        from protassem.core.similarity import tm_cache_snapshot
-        tm_snapshot = tm_cache_snapshot()
-        metrics.record("tm_cache", 0.0,
-                       mode=tm_snapshot.get("tm_cache_mode"),
-                       hits=tm_snapshot.get("hits"),
-                       misses=tm_snapshot.get("misses"),
-                       writes=tm_snapshot.get("writes"),
-                       rows=tm_snapshot.get("rows"),
-                       memory_entries=tm_snapshot.get("memory_entries"))
-        log.info("TM cache (parent side): %s", tm_snapshot)
-    except Exception as exc:
-        log.warning("TM cache snapshot failed: %s", exc)
+    _record_score_cache(metrics)
+    _record_tm_cache(metrics)
     summary_path = metrics.write_summary()
     log.info("Performance summary: %s", summary_path)
 
