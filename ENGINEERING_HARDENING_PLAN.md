@@ -58,6 +58,7 @@
 | 110 | 审计 P1-4 无掩码发布顺序【已修复】 | `use_mask=False` 分支发布候选后才 `rename_pdb_files_by_ranking`，且 tail 开启时不等尾部就发布 | 循环内只登记，`_drain_tail("rename")` + 改名完成后再按生成顺序一次性发布（名字为最终名）。定向测试直接驱动 `run_inference(use_mask=False)`（模型/预处理/单对推理为 stub、尾部流水线真实）→ 无 tail/有 tail 两种设置都满足"id 连续、全 ok、名字指向磁盘真实文件、end=ok"；**旧代码两项失败**（失效名字 / 出现 `filtered`） |
 | 111 | 审计 P2-5 失败状态传播【已修复】 | 掩码分支异常只写日志（丢失败信息）；客户端把 `error` 与 `filtered` 一起跳过；服务端仍写 `end=ok` | 服务端：异常写入 `mask_results`、候选级失败计数、请求级状态按**明确优先级**（请求异常→error / 主动早停→cancelled / 候选失败→error / 否则 ok）；客户端：`CandidateConsumer.error_policy` **默认 `"fail"`**（消费到 `state=error` 即抛错），`"skip"` 为显式选择，`filtered` 仍只计数跳过。回归测试 8 项（服务端 3 + 客户端 5）；旧 consumer 4 项 `TypeError`、旧 demo_mask 服务端用例失败 |
 | 112 | 审计 P2-6 台账 UTF-8 半行【已修复】 | `LedgerReader.poll()` 先 `decode` 整个 chunk 再切半行 → 多字节字符被截断即 `UnicodeDecodeError` | 改为**按字节缓冲**（`split(b"\n")` 切完整行后再解码）。定向测试逐字节追加含中文/`ü` 的记录并每步 `poll()`；旧代码在该测试上抛 `UnicodeDecodeError` |
+| 113 | 审计 P2-7 动态密度版本【已修复】 | `_mask_region` 每轮覆盖同一个 `current_density.mrc`；`density_version`/`invalidate_density()` 无人调用 → 实际只靠 path+size+mtime，且 worker 内缓存主进程清不掉 | 每轮掩膜写 `current_density_mNN.mrc`（路径即版本），`current_density_mrc` 指向新文件；`_ensure_work_files` 同步版本名。定向测试：两轮后路径不同、旧版本仍在、内容互不相同；旧代码失败 |
 
 ### v4.10 → v4.11（老卡收口：口径校正与接口定稿）
 

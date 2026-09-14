@@ -719,7 +719,13 @@ class AssemblyOrchestrator:
                                     self.current_density_mrc, new_txt, new_mrc)
         if ok and os.path.exists(new_txt) and os.path.exists(new_mrc):
             shutil.copy2(new_txt, self.current_target_txt)
-            shutil.copy2(new_mrc, self.current_density_mrc)
+            # P2-7：动态密度**每轮换新文件名**（路径即版本）。评分缓存按 路径+size+mtime
+            # 建键；继续覆盖同一个 current_density.mrc 时，mtime 粒度不够就可能命中旧密度，
+            # 而共享池 worker 里的缓存主进程清不掉。换名后主进程与所有 worker 都不会读到旧版本。
+            versioned_mrc = str(self.work_dir
+                                / ("current_density_m%02d.mrc" % self._mask_iter))
+            shutil.copy2(new_mrc, versioned_mrc)
+            self.current_density_mrc = versioned_mrc
             try:
                 with open(self.current_target_txt) as _f:
                     _n = max(0, (sum(1 for _ in _f) - 5)) // 2
@@ -817,7 +823,8 @@ class AssemblyOrchestrator:
             log.warning("current_target.txt missing, re-copying from original")
             shutil.copy2(self.original_target_txt, self.current_target_txt)
         if not os.path.exists(self.current_density_mrc):
-            log.warning("current_density.mrc missing, re-copying from original")
+            log.warning("%s missing, re-copying from original",
+                        os.path.basename(self.current_density_mrc))
             shutil.copy2(self.original_density_mrc, self.current_density_mrc)
 
     def _target_has_points(self):
