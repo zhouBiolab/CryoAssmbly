@@ -2,8 +2,8 @@
 
 用"假生产者 + 虚拟时钟"驱动真 `CandidateConsumer` 与真 `LedgerReader`：
 发布时机（快/慢/随机/结束早于最后一批）、worker 数（1/2/10，模拟完成顺序打乱、
-结果仍按输入顺序归并）、状态（ok/filtered/error）、结束态（ok/error/cancelled）、
-分数并列 —— 这些场景必须给出**同一候选 id 序列与同一早停决策**。
+结果仍按输入顺序归并）、状态（ok/filtered/error；掩码级评估失败按 reason 跳过，
+ID 与批次位置不变）、结束态（ok/error/cancelled）、分数并列 —— 这些场景必须给出**同一候选 id 序列与同一早停决策**。
 """
 
 import json
@@ -13,14 +13,14 @@ import tempfile
 import unittest
 
 from protassem.fitting.candidate_consumer import CandidateConsumer
-from protassem.fitting.candidate_ledger import (LEDGER_NAME, CandidateLedgerWriter,
-                                                LedgerReader)
+from protassem.fitting.candidate_ledger import (LEDGER_NAME, MASK_ERROR_REASON,
+                                                CandidateLedgerWriter, LedgerReader)
 
 POLL_S = 2.5
 THRESHOLD = 0.4200
 
 
-def _candidate_record(candidate_id, overlap, state="ok"):
+def _candidate_record(candidate_id, overlap, state="ok", reason=None):
     record = {"v": 1, "request_id": "req", "kind": "candidate",
               "id": candidate_id, "state": state}
     if state == "ok":
@@ -30,6 +30,8 @@ def _candidate_record(candidate_id, overlap, state="ok"):
         record["error"] = "worker crashed"
     else:
         record["reason"] = "no valid prediction"
+    if reason is not None:
+        record["reason"] = reason
     return record
 
 
@@ -123,10 +125,11 @@ def drive(schedule, end_at, request_finished_at, batch_size=10, workers=1,
 
 
 def _schedule(count=24, overlaps=None, mode="fast", publish_end_at=0.0,
-              end_at=None, request_finished_at=None, states=None):
+              end_at=None, request_finished_at=None, states=None, reasons=None):
     """构造 (publish_time, record) 列表。"""
     overlaps = overlaps or [0.30 + 0.002 * i for i in range(count)]
     states = states or {}
+    reasons = reasons or {}
     rng = random.Random(7)
     schedule = []
     for cid in range(count):
@@ -137,7 +140,8 @@ def _schedule(count=24, overlaps=None, mode="fast", publish_end_at=0.0,
         else:
             moment = publish_end_at * rng.random()
         schedule.append((moment, _candidate_record(cid, overlaps[cid],
-                                                   states.get(cid, "ok"))))
+                                                   states.get(cid, "ok"),
+                                                   reasons.get(cid))))
     schedule.sort(key=lambda item: item[0])
     last = max(item[0] for item in schedule)
     end_at = last + 0.1 if end_at is None else end_at
@@ -204,8 +208,8 @@ class CandidateOrderingTest(unittest.TestCase):
         self.assertNotIn(21, optimized)
         self.assertEqual(len(outcome["skipped"]), 2)
 
-    def test_error_candidate_cancels_the_request(self):
-        """P2-5 + 审计#2：候选执行失败必须抛错，并且抛错前**取消并结束该请求**。"""
+    def test_error_candidate_raises_without_cancel(self):
+        """执行失败必须抛错；异常路径不再取消/等待请求（本轮简化，只保留正常早停取消）。"""
         states = {7: "error"}
         schedule, end_at, finished = _schedule(mode="slow", states=states)
         tmp = tempfile.TemporaryDirectory()
@@ -213,28 +217,49 @@ class CandidateOrderingTest(unittest.TestCase):
         producer = FakeProducer(path, schedule, end_at, finished)
         reader = LedgerReader(path, request_id="req")
         clock = [0.0]
-        finished_calls = []
 
         def sleep(seconds):
             clock[0] += seconds
             producer.advance(clock[0])
 
-        def request_finished():
-            finished_calls.append(clock[0])
-            return clock[0] >= producer.request_finished_at
-
         consumer = CandidateConsumer(
             reader, 10, lambda records: ([], False),
-            request_finished=request_finished, on_cancel=producer.cancel,
-            sleep=sleep, poll_interval=POLL_S)
+            request_finished=lambda: clock[0] >= producer.request_finished_at,
+            on_cancel=producer.cancel, sleep=sleep, poll_interval=POLL_S)
         producer.advance(0.0)
         with self.assertRaises(RuntimeError) as caught:
             consumer.run()
         tmp.cleanup()
         self.assertIn("候选 7 执行失败", str(caught.exception))
-        self.assertTrue(producer.cancelled, "抛错前必须取消请求")
-        self.assertGreater(len(finished_calls), 0,
-                           "抛错前必须确认请求结束（_await_request_end）")
+        self.assertFalse(producer.cancelled, "异常路径不再取消请求")
+
+    def test_mask_evaluation_failure_is_skipped(self):
+        """`reason=MASK_ERROR_REASON` 的 error 候选跳过：ID 与批次区间不变，不进优化。
+
+        与 `filtered` 同样只计数跳过；区别是它带 reason，说明该 mask 内所有评估都失败。
+        """
+        states = {7: "error"}
+        schedule, end_at, finished = _schedule(mode="slow", states=states,
+                                               reasons={7: MASK_ERROR_REASON})
+        outcome, optimized, _ = drive(schedule, end_at, finished)
+        self.assertEqual([(b["start"], b["stop"]) for b in outcome["batches"]],
+                         [(0, 10), (10, 20), (20, 24)])
+        self.assertEqual([b["skipped"] for b in outcome["batches"]], [1, 0, 0])
+        self.assertEqual(outcome["skipped_mask_errors"], 1)
+        self.assertNotIn(7, optimized)
+
+    def test_skipped_mask_errors_count_only_consumed_range(self):
+        """`skipped_mask_errors` 只统计已消费范围内的记录（早停后不再计入）。"""
+        states = {3: "error", 15: "error"}
+        schedule, end_at, finished = _schedule(mode="slow", states=states,
+                                               reasons={3: MASK_ERROR_REASON,
+                                                        15: MASK_ERROR_REASON},
+                                               overlaps=[0.50] * 24)
+        outcome, _optimized, _ = drive(schedule, end_at, finished)
+        # 第一个批次里候选 3 就达标早停；候选 15 在 [10, 20) 内但从未被消费
+        self.assertTrue(outcome["early_stop"])
+        self.assertEqual(outcome["consumed"], 10)
+        self.assertEqual(outcome["skipped_mask_errors"], 1)
 
     def test_missing_end_raises(self):
         """句柄结束但没有任何 end 记录 → 不完整请求，必须抛错（不得静默用部分结果）。"""

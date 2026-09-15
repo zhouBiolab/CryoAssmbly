@@ -13,6 +13,8 @@
 
 import time
 
+from protassem.fitting.candidate_ledger import MASK_ERROR_REASON
+
 POLL_INTERVAL_S = 2.5
 END_GRACE_POLLS = 2
 
@@ -33,19 +35,25 @@ class CandidateConsumer:
         # P1-3：可选的诊断来源（例如"服务进程已退出（returncode=…）"），让报错能区分
         # "服务死亡"与"服务端漏写 end"。
         self.describe_request = describe_request or (lambda: "")
+        # 已消费范围内被跳过的掩码级评估失败数量（见 _check_states）。
+        self.skipped_mask_errors = 0
 
     def _check_states(self, records):
-        """执行失败直接抛错（P2-5）：不能让"少了一些候选"悄悄变成交付结果。
+        """掩码级评估失败跳过，其余执行失败抛错。
 
-        不提供宽松模式：服务端在存在候选级失败时会把 `end.status` 写成 `error`，
-        客户端无论如何都会抛错，所以"跳过 error 继续跑"无法构成真正的宽松策略；
-        真需要容错，应在具体调用点显式设计部分成功语义。
+        `reason=MASK_ERROR_REASON` 表示该候选所属的 mask 内所有评估都失败：它保留原有的
+        id 与批次位置（批次区间不变），只是不参与 CC 评估与局部优化；服务端不会因此把
+        请求级结束状态写成 `error`。其余执行失败（服务/台账/非掩码路径）仍然抛错，
+        不能让"少了一些候选"悄悄变成交付结果。
         """
         for record in records:
-            if record["state"] == "error":
-                raise RuntimeError("候选 %d 执行失败（state=error）：%s"
-                                   % (record["id"],
-                                      record.get("error") or "未提供原因"))
+            if record["state"] != "error":
+                continue
+            if record.get("reason") == MASK_ERROR_REASON:
+                self.skipped_mask_errors += 1
+                continue
+            raise RuntimeError("候选 %d 执行失败（state=error）：%s"
+                               % (record["id"], record.get("error") or "未提供原因"))
 
     def _missing_end_error(self):
         detail = ""
@@ -59,25 +67,9 @@ class CandidateConsumer:
     def run(self):
         """消费全部候选；返回批次摘要（调用方据此决定是否 final_select）。
 
-        审计#2：任何异常（候选失败、缺 end、服务死亡…）都要先**收口本请求** ——
-        取消并等它结束 —— 再传播原始异常。独立调用方捕获异常后继续工作时，
-        不能让 PARENet 服务仍在处理一个已经失败的请求；清理本身的异常不得覆盖最初错误。
+        异常（候选失败、缺 end、服务死亡…）原样传播，不做额外的取消或等待；
+        只有**正常早停**会取消请求并确认其结束。
         """
-        try:
-            return self._run()
-        except BaseException:
-            try:
-                self.on_cancel()
-            except Exception:
-                pass
-            try:
-                self._await_request_end()
-            except Exception:
-                pass
-            raise
-
-    def _run(self):
-        """消费主循环（异常处理见 run()）。"""
         batches = []
         results = []
         next_id = 0
@@ -101,7 +93,7 @@ class CandidateConsumer:
                 if len(self.reader.ready_ids(window[0], window[-1] + 1)) < len(window):
                     break
                 records = [self.reader.candidates[cid] for cid in window]
-                self._check_states(records)          # P2-5：执行失败默认抛错
+                self._check_states(records)     # 掩码级评估失败在这里跳过
                 batch_results, hit = self.on_batch(records)
                 results.extend(batch_results)
                 batches.append({"start": window[0], "stop": window[-1] + 1,
@@ -139,6 +131,7 @@ class CandidateConsumer:
 
         return {"batches": batches, "results": results, "early_stop": early_stop,
                 "skipped": list(self.reader.skipped), "consumed": next_id,
+                "skipped_mask_errors": self.skipped_mask_errors,
                 "waited_s": waited_s}
 
     def _await_request_end(self):

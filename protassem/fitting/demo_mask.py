@@ -33,7 +33,8 @@ import pareconv.utils.data_mask as data_mask_module
 from protassem.fitting.parenet.config import make_cfg
 from protassem.fitting.parenet.model import create_model, INFERENCE_OUTPUT_FIELDS
 from protassem.core.points_txt import read_point_cloud_file
-from protassem.fitting.candidate_ledger import CandidateLedgerWriter
+from protassem.fitting.candidate_ledger import (CandidateLedgerWriter,
+                                                MASK_ERROR_REASON)
 from protassem.fitting.cloud_encoding import (acquire_geometry, join_geometries,
                                               EncodingCache, GeometryCache)
 from protassem.fitting.parenet.model import model_fingerprint
@@ -594,24 +595,34 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
             _record_timing(output_dir, "server_tail_wait", waited, where=stage)
 
     ledger_errors = {"count": 0, "first": None}
+    skipped_mask_errors = 0
 
-    def _publish(candidate_id, results, name=None, overlap=None, source=None):
+    def _publish(candidate_id, results, name=None, overlap=None, source=None,
+                 mask_level=False):
         """发布一个候选的终态（O6）：ok / filtered / error 三态必须显式。
 
-        P2-5 + 审计#1：**先看执行错误，再看成功文件**。同一个 mask 里只要有一个评估抛异常，
-        就不能因为另一个评估成功而把该候选记成 ok —— 否则日志里有异常、`Failed` 却是 0、
-        台账还报 ok，三处互相矛盾。`ledger_errors` 汇总用于请求级结束状态。
+        **有成功候选就发布 ok** —— 同一个 mask 内个别评估抛异常不再掩盖已经得到的成功
+        结果；失败记录仍保留在结果集里参与统计。没有成功候选且有执行错误时发布 error：
+        `mask_level=True`（掩码级评估）带 `reason=MASK_ERROR_REASON`，客户端跳过它且不会
+        让请求级结束状态变成 error；其余执行失败计入 `ledger_errors`，请求级仍报 error。
         """
+        nonlocal skipped_mask_errors
         errors = [r.get("error") for r in results if r.get("error")]
-        if errors:
-            ledger_errors["count"] += 1
-            if ledger_errors["first"] is None:
-                ledger_errors["first"] = errors[0]
-            ledger.publish(candidate_id, "error", source=source, error=errors[0])
-            return
         if name and os.path.exists(name):
             ledger.publish(candidate_id, "ok", name=name, overlap=overlap,
                            source=source)
+            return
+        if errors:
+            if mask_level:
+                skipped_mask_errors += 1
+                ledger.publish(candidate_id, "error", source=source,
+                               error=errors[0], reason=MASK_ERROR_REASON)
+            else:
+                ledger_errors["count"] += 1
+                if ledger_errors["first"] is None:
+                    ledger_errors["first"] = errors[0]
+                ledger.publish(candidate_id, "error", source=source,
+                               error=errors[0])
             return
         ledger.publish(candidate_id, "filtered", source=source,
                        reason="no valid prediction")
@@ -647,16 +658,12 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                             all_results.append(r)
                         except Exception as e:
                             log.error("Config %d-%s crashed: %s", cid, sm, e)
-                            # 审计#1：异常必须进入本掩码的结果集与全局结果集 ——
-                            # 否则"日志有异常、Failed 计数却是 0、台账还报 ok"三处互相矛盾。
+                            # 异常在掩码结果集与全局结果集**各记一次**（不重复追加）：
+                            # 台账里的候选终态由 _publish 统一决定。
                             failure_record = {"error": str(e), "config_id": cid,
                                               "sampling_method": sm}
                             mask_results.append(failure_record)
                             all_results.append(failure_record)
-                            # P2-5：执行失败必须进入本掩码的结果集，否则会被当成
-                            # "正常但没有有效候选"（filtered）而被静默跳过。
-                            mask_results.append({"error": str(e), "config_id": cid,
-                                                 "sampling_method": sm})
                 _drain_tail("mask_best")      # 消费本掩码结果前必须等尾部完成
                 best = process_single_mask_optimally(mask_results)
                 # O6：id = 掩码在 mask_data_list 中的序号（稳定生成顺序）；
@@ -666,7 +673,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                          overlap=(best or {}).get("overlap"),
                          source={"mask": mask_name,
                                  "config": (best or {}).get("config_id"),
-                                 "sampling": (best or {}).get("sampling_method")})
+                                 "sampling": (best or {}).get("sampling_method")},
+                         mask_level=True)
                 if best:
                     optimal_results.append(best)
 
@@ -730,11 +738,13 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         except Exception as e:
             log.error("尾部流水线关闭失败：%s", e)
         # O6：结束记录是唯一权威的结束标记；失败必须显式，不能被当成正常结束。
-        # P2-5 的优先级（明确写死，不靠默认）：
-        #   1) 请求本身抛异常           -> error
-        #   2) 客户端主动早停           -> cancelled（客户端已停止消费，其后候选不再有意义）
-        #   3) 存在候选级执行失败       -> error（请求跑完了但产出不完整）
-        #   4) 其余                     -> ok
+        # 优先级（明确写死，不靠默认）：
+        #   1) 请求本身抛异常               -> error
+        #   2) 客户端主动早停               -> cancelled（客户端已停止消费，其后候选不再有意义）
+        #   3) 存在**非掩码级**候选执行失败 -> error（请求跑完了但产出不完整）
+        #   4) 其余                         -> ok
+        # 掩码级评估失败在 _publish 里带 reason=MASK_ERROR_REASON 发布，客户端跳过它，
+        # 因此不进入 ledger_errors，也不改变本状态。
         try:
             if failure is not None:
                 ledger.finish("error", error="%s: %s" % (type(failure).__name__, failure))

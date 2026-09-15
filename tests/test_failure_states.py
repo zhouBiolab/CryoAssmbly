@@ -1,10 +1,14 @@
 """失败状态传播测试（审计 P2-5）。
 
-契约：
+契约（**非掩码路径**，即 `use_mask=False`）：
   - 正常计算但没有有效候选 -> `filtered`（计数、跳过，不算失败）；
   - 执行失败               -> `error`（默认**明确失败**：客户端消费到就抛错）；
   - 客户端主动早停         -> 请求级 `cancelled`；
   - 存在候选级 `error` 时请求级**不得**写 `ok`。
+
+掩码路径的评估失败另见 `test_masked_partial_failure.py`：同一 mask 内**有成功候选**
+就按原规则选最优发布 `ok`；**全部失败**时带 `reason=MASK_ERROR_REASON` 发布 `error`，
+客户端跳过它且请求级结束状态不受影响。
 
 服务端部分用 stub 直接驱动 `run_inference(use_mask=False)`（与 P1-4 同样的接线），
 客户端部分直接驱动 `CandidateConsumer` + 台账文件。

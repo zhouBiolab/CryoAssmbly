@@ -7,6 +7,8 @@
 - end 记录：`{"v","request_id","kind":"end","status","count","error"}`；
 - 服务端发布顺序：候选文件**完整写出且不再改名/删除** → 追加记录 → `flush + fsync`；
 - `state`：`ok`（有效候选）/ `filtered`（正常计算但无有效候选）/ `error`（执行失败）；
+- `error` 的 `reason`：只有 `MASK_ERROR_REASON` 需要客户端特殊处理 —— 掩码级评估失败可跳过
+  （保留 id 与批次位置），其余执行失败一律抛错；
 - `end.status`：`ok` / `error`（必须带 `error`）/ `cancelled`（客户端主动早停，属正常控制流）；
 - 客户端只消费**完整行**：读到文件末尾的半行时等待后续数据，不判损坏。
 
@@ -21,6 +23,13 @@ LEDGER_NAME = "candidates.jsonl"
 
 CANDIDATE_STATES = ("ok", "filtered", "error")
 END_STATUSES = ("ok", "error", "cancelled")
+
+# 掩码级评估失败的 reason。语义：
+#   服务端：同一个 mask 内没有成功候选时发布 `error` 并带此 reason；若同一 mask 内有成功候选，
+#           则按原规则选最优发布 `ok`，失败只留在结果集里参与统计。
+#   客户端：带此 reason 的 `error` 候选跳过（不送入 CC 与局部优化），保留原 id 与批次位置；
+#           它也不使请求级结束状态变成 `error`。
+MASK_ERROR_REASON = "mask_evaluations_failed"
 
 
 class CandidateLedgerWriter:

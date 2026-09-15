@@ -253,8 +253,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     def evaluate_batch(records):
         """批内策略不变：CC 评估 → 排序 → 逐个优化 → 首个达标即返回早停。
 
-        P2-5：`error`（执行失败）由 `CandidateConsumer` 的默认策略直接抛错（在进入本函数前），
-        这里只处理 `filtered`（正常计算但没有有效候选：计数、跳过）。
+        `CandidateConsumer` 在进入本函数前已经处理了 `error`：掩码级评估失败被跳过，
+        其余执行失败直接抛错。这里只处理 `filtered`（正常计算但没有有效候选：计数、跳过）。
         """
         for record in records:
             if record["state"] != "ok":
@@ -307,8 +307,9 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                     task_id=task_id)
     _METRICS.record("gpu_wait", outcome["waited_s"], task_id=task_id)
     if outcome["skipped"]:
-        log.warning("候选台账含 %d 个非 ok 候选（filtered/error），已跳过",
-                    len(outcome["skipped"]))
+        log.warning("候选台账含 %d 个非 ok 候选（filtered/error），已跳过；"
+                    "其中已消费范围内的掩码级评估失败 %d 个",
+                    len(outcome["skipped"]), outcome["skipped_mask_errors"])
 
     if outcome["early_stop"]:
         best_result = early_stop_result[0]
