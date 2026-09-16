@@ -12,6 +12,7 @@ from scipy.ndimage import map_coordinates
 from protassem.core.scoring import calculate_cc_mask, read_mrc_full, _pearson
 from protassem.core.constants import atomic_number_dict, VDW_RADII
 from protassem.core.numba_kernels import add_gaussian_to_grid, add_sphere_mask
+from protassem.runtime.execution import ExecutionContext
 
 log = logging.getLogger(__name__)
 
@@ -294,7 +295,7 @@ def local_optimize(structure_file, density_mrc, output_file,
                    metrics=None, context=None):
     """Local optimization.
 
-    1. ALWAYS run multi-copy density gradient (parallel if num_processes > 1)
+    1. ALWAYS run multi-copy density gradient (parallel via `context` when it has >1 worker)
     2. If best copy CC dropped vs initial -> also run scipy CC-objective opt
     3. Select highest-CC candidate (original + copies + scipy)
     4. Fine density optimization (fewer steps) on the selected best
@@ -395,12 +396,23 @@ if __name__ == "__main__":
     p.add_argument("--contour", type=float, default=0.0)
     p.add_argument("--max_iterations", type=int, default=2000)
     p.add_argument("--initial_step_size", type=float, default=1.25)
-    p.add_argument("--num_processes", type=int, default=1)
+    p.add_argument("--num_processes", type=int, default=1,
+                   help="并行副本数（1 = 串行；>1 走 ExecutionContext 共享池）")
+    p.add_argument("--pool_start_method", default=None,
+                   help="进程池启动方式：默认 None = 系统默认（Linux 为 fork）")
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    ok, _, _ = local_optimize(a.structure_file, a.mrc_file, a.output_file,
-                              a.resolution, a.contour,
-                              a.max_iterations, a.initial_step_size,
-                              a.num_processes)
+    # P3 之后并行度改由 ExecutionContext 表达：此处是本模块的独立入口，自己建上下文并释放。
+    # worker 函数 `_density_copy_worker` 是模块级可序列化对象，满足共享池的契约。
+    context = ExecutionContext(pool_workers=a.num_processes,
+                               start_method=a.pool_start_method)
+    try:
+        ok, _, _ = local_optimize(a.structure_file, a.mrc_file, a.output_file,
+                                  a.resolution, a.contour,
+                                  max_iterations=a.max_iterations,
+                                  initial_step_size=a.initial_step_size,
+                                  context=context)
+    finally:
+        context.close()
     sys.exit(0 if ok else 1)

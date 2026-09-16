@@ -164,7 +164,7 @@ def _cand_worker(arg):
     try:
         seed_cc = calculate_cc_mask(density, seed, res, cont)
         ok, pk, ck = local_optimize(seed, density, out_pdb, res, cont,
-                                    num_processes=1, initial_cc=seed_cc)
+                                    context=None, initial_cc=seed_cc)
         return (cid, donor_cid, (pk if ok else seed), (ck if ok else seed_cc))
     except Exception as e:
         sys.stderr.write("cand %s<-%s failed: %s\n" % (cid, donor_cid, e))
@@ -224,7 +224,7 @@ def _fill_worker(arg):
     try:
         opt_out = os.path.join(fill_dir, "%s_opt.pdb" % cid)
         ok, pk, ck = local_optimize(merged, density, opt_out, res, cont,
-                                    num_processes=1, initial_cc=merged_cc)
+                                    context=None, initial_cc=merged_cc)
         return (cid, pk if ok else merged, ck if ok else merged_cc, n_added)
     except Exception:
         return (cid, merged, merged_cc, n_added)
