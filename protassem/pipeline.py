@@ -79,17 +79,20 @@ def _normalize_density(density_mrc, output_dir):
     """把实验密度图的 header 原点化成与读法约定无关的形式，返回下游应使用的路径。
 
     输入已是规范形式（``nstart`` 全为 0）时原样返回，不复制文件。口径、为什么
-    统一在文件侧而不改 `Sample` 或 `core.scoring`，以及残余风险见
-    `protassem.core.mrc_origin`。
+    统一在文件侧而不改 `Sample` 或 `core.scoring`、以及"origin 停在显示位置"
+    这条规则的理由与残余假设，见 `protassem.core.mrc_origin`。
     """
     result = normalize_density_map(
         density_mrc,
         os.path.join(output_dir, "density", os.path.basename(density_mrc)))
     if result.path != density_mrc:
-        log.info("Density origin normalized: %s -> %s (nstart %s -> 0)",
-                 tuple(round(float(v), 3) for v in result.previous_origin),
+        # 只报事实：Sample 的锚点从旧值移到显示原点，nstart 归零；图的渲染位置不变
+        log.info("Density origin normalized: sample anchor %s -> %s, "
+                 "nstart %s -> 0 (display origin %s unchanged)",
+                 tuple(round(float(v), 3) for v in result.sample_anchor),
                  tuple(round(float(v), 3) for v in result.origin),
-                 tuple(int(v) for v in result.nstart))
+                 tuple(int(v) for v in result.nstart),
+                 tuple(round(float(v), 3) for v in result.previous_origin))
     return result.path
 
 
