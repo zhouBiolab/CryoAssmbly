@@ -292,7 +292,7 @@ def _density_copy_worker(arg):
 def local_optimize(structure_file, density_mrc, output_file,
                    resolution, contour=0.0, max_iterations=2000,
                    initial_step_size=1.25, initial_cc=None,
-                   metrics=None, context=None):
+                   context=None):
     """Local optimization.
 
     1. ALWAYS run multi-copy density gradient (parallel via `context` when it has >1 worker)

@@ -85,7 +85,7 @@ def fit_chain_item(orch, rec, state):
         early_stop_threshold=base_threshold,
         original_density_mrc=orch.original_density_mrc,
         num_processes=orch.num_processes, batch_size=orch.batch_size,
-        metrics=orch.metrics, context=orch.context)
+        context=orch.context)
 
     if not fit_result["success"] or not fit_result.get("final_pdb"):
         rec["status"] = "failed"
@@ -182,7 +182,7 @@ def try_domains_via_chain_pose(orch, chain_rec, fitted_chain_pdb):
         ok, opt_path, opt_cc = local_optimize(
             transformed, orch.current_density_mrc, opt_pdb,
             orch.resolution, orch.contour,
-            initial_cc=init_cc, metrics=orch.metrics, context=orch.context)
+            initial_cc=init_cc, context=orch.context)
         if ok and opt_path:
             final_pdb, final_cc = opt_path, opt_cc
         else:
@@ -229,7 +229,7 @@ def try_improve_chain_with_domains(orch, chain_rec, fitted_pdb, original_cc):
         ok, opt_path, opt_cc = local_optimize(
             transformed, orch.current_density_mrc, opt_pdb,
             orch.resolution, orch.contour,
-            initial_cc=transformed_cc, metrics=orch.metrics,
+            initial_cc=transformed_cc,
             context=orch.context)
         if ok and opt_path and opt_cc > transformed_cc:
             final = opt_path

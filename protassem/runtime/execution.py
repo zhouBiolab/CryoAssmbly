@@ -11,10 +11,9 @@ from protassem.runtime.pool import close_pool, open_pool
 
 
 class ExecutionContext:
-    """持有 metrics 与一个惰性共享池；作为运行级资源句柄在调用链上显式传递。"""
+    """持有一个惰性共享池；作为运行级资源句柄在调用链上显式传递。"""
 
-    def __init__(self, metrics=None, pool_workers=1, start_method=None):
-        self.metrics = metrics
+    def __init__(self, pool_workers=1, start_method=None):
         self.pool_workers = max(1, int(pool_workers or 1))
         self.start_method = start_method
         self._pool = None
@@ -32,13 +31,12 @@ class ExecutionContext:
         """释放共享池（幂等）；应在运行的 finally 中调用。"""
         if self._pool is None:
             return
-        close_pool(self.metrics, self._pool, "shared")
+        close_pool(self._pool)
         self._pool = None
 
     def _shared_pool(self):
         if self._pool is None:
-            self._pool = open_pool(self.metrics, self.pool_workers, "shared",
-                                   self.start_method)
+            self._pool = open_pool(self.pool_workers, self.start_method)
         return self._pool
 
     def __enter__(self):

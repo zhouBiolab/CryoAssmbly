@@ -10,14 +10,12 @@ import sys
 import shutil
 import logging
 import math
-import time
 from datetime import datetime
 
 from protassem.core.io import find_files, read_param_file
 from protassem.core.mrc_origin import normalize_density_map
 from protassem.runtime.config import apply_seed
 from protassem.runtime.execution import ExecutionContext
-from protassem.runtime.metrics import Metrics
 from protassem.core.structure import read_chain_ids, split_structure_to_chains
 from protassem.voxelize.mol_to_mrc import pdb2vol
 from protassem.sampling.sampler import sample_density_map
@@ -96,48 +94,6 @@ def _normalize_density(density_mrc, output_dir):
     return result.path
 
 
-def _record_score_cache(metrics):
-    """把父进程侧的评分缓存统计写进运行指标（审计#4）。
-
-    `bytes`/`peak_bytes`/`entries`/`evictions` 是**共享预算**的顶层字段；`density`/`structure`
-    只保留各自的命中/未命中计数。写成独立函数是为了能直接测"真实 snapshot → 指标写入"，
-    而不是只测缓存内部（旧实现读了已搬走的 `density["bytes"]`，真实运行里静默失败）。
-    """
-    try:
-        from protassem.core.scoring import score_cache_snapshot
-        snapshot = score_cache_snapshot()
-        metrics.record("score_cache", 0.0, parent_side=True,
-                       score_cache_mb=snapshot["score_cache_mb"],
-                       entries=snapshot["entries"],
-                       bytes=snapshot["bytes"],
-                       peak_bytes=snapshot["peak_bytes"],
-                       evictions=snapshot["evictions"],
-                       density_hits=snapshot["density"]["hits"],
-                       density_misses=snapshot["density"]["misses"],
-                       structure_hits=snapshot["structure"]["hits"],
-                       structure_misses=snapshot["structure"]["misses"])
-        log.info("Score cache (parent side): %s", snapshot)
-    except Exception as exc:
-        log.warning("Score cache snapshot failed: %s", exc)
-
-
-def _record_tm_cache(metrics):
-    """把父进程侧的 TM 缓存统计写进运行指标（P5；worker 只跑 USalign，不写库）。"""
-    try:
-        from protassem.core.similarity import tm_cache_snapshot
-        snapshot = tm_cache_snapshot()
-        metrics.record("tm_cache", 0.0,
-                       mode=snapshot.get("tm_cache_mode"),
-                       hits=snapshot.get("hits"),
-                       misses=snapshot.get("misses"),
-                       writes=snapshot.get("writes"),
-                       rows=snapshot.get("rows"),
-                       memory_entries=snapshot.get("memory_entries"))
-        log.info("TM cache (parent side): %s", snapshot)
-    except Exception as exc:
-        log.warning("TM cache snapshot failed: %s", exc)
-
-
 def run_pipeline(density_mrc, structure_files, resolution, contour,
                  output_dir=None, voxel_size=2.0, log_file=None,
                  assembly_kwargs=None, runtime_config=None):
@@ -204,13 +160,12 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         log.info("Parent RNG seeded: %s", apply_seed(runtime_config.seed))
         # 老卡收口 P4：评分缓存预算（密度上下文 + 结构坐标；worker 通过环境变量继承）
         from protassem.core.scoring import apply_score_cache
-        log.info("Score cache: %s", apply_score_cache(runtime_config.score_cache_mb))
+        apply_score_cache(runtime_config.score_cache_mb)
+        log.info("Score cache budget: %d MiB", runtime_config.score_cache_mb)
         # 老卡收口 P5：TM 缓存（SQLite；父进程查询/写入，worker 只跑 USalign）
         from protassem.core.similarity import configure_tm_cache
-        log.info("TM cache: %s", configure_tm_cache(runtime_config.tm_cache))
-
-    metrics = Metrics(os.path.join(output_dir, "metrics"))
-    pipeline_started = time.perf_counter()
+        configure_tm_cache(runtime_config.tm_cache)
+        log.info("TM cache mode: %s", runtime_config.tm_cache)
 
     log.info("Density map : %s", density_mrc)
     log.info("Structures  : %d files", len(structure_files))
@@ -220,7 +175,6 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     # 必须晚于 _validate_inputs / os.makedirs（非法输入不建输出目录），早于 Step 1/2/3。
     density_mrc = _normalize_density(density_mrc, output_dir)
 
-    _t_standardize = time.perf_counter()
     # ---- Step 0: Standardize input structures ----
     # Read chain IDs from inside each file; keep multi-chain files as whole units.
     # If chain IDs collide across inputs, remap collisions to unique IDs (keep
@@ -307,8 +261,6 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
                      os.path.basename(std_path), new_cid)
     structure_files = standardized_files
 
-    metrics.record("standardize", time.perf_counter() - _t_standardize)
-    _t_voxelize = time.perf_counter()
     # ---- Step 1: Voxelize ----
     log.info("=" * 60)
     log.info("Step 1: Voxelization")
@@ -322,8 +274,6 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         pdb2vol(f, resolution, output_mrc=out)
         sim_mrcs.append(out)
 
-    metrics.record("voxelization", time.perf_counter() - _t_voxelize)
-    _t_sampling = time.perf_counter()
     # ---- Step 2: Sampling ----
     log.info("=" * 60)
     log.info("Step 2: Sampling")
@@ -344,7 +294,6 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
         source_txts.append(txt)
         shutil.copy2(structure_files[i], src_dir)
 
-    metrics.record("sampling", time.perf_counter() - _t_sampling)
     log.info("Step 1 & 2 done.")
 
     # ---- Step 3: Assembly ----
@@ -360,10 +309,9 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
              kw.get("similarity_threshold", 0.85))
 
     assembly_dir = os.path.join(output_dir, "assembly")
-    _t_assembly = time.perf_counter()
     pool_workers = int(kw.get("num_processes", 1))
     start_method = runtime_config.pool_start_method if runtime_config else None
-    context = ExecutionContext(metrics=metrics, pool_workers=pool_workers,
+    context = ExecutionContext(pool_workers=pool_workers,
                                start_method=start_method)
     try:
         complex_cif = run_assembly(
@@ -373,24 +321,16 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
             resolution=resolution,
             contour=contour,
             output_dir=assembly_dir,
-            metrics=metrics,
             context=context,
             **kw,
         )
     finally:
         context.close()
-    metrics.record("assembly_total", time.perf_counter() - _t_assembly)
     log.info("=" * 60)
     if complex_cif:
         log.info("Assembly complete: %s", complex_cif)
     else:
         log.info("Assembly finished (no complex produced)")
-
-    metrics.record("pipeline_total", time.perf_counter() - pipeline_started)
-    _record_score_cache(metrics)
-    _record_tm_cache(metrics)
-    summary_path = metrics.write_summary()
-    log.info("Performance summary: %s", summary_path)
 
     return {
         "target_txt": target_txt,

@@ -117,7 +117,6 @@ class InferenceMemoryContractTest(unittest.TestCase):
         self.assertEqual(1, len(calls))
         keywords = {keyword.arg for keyword in calls[0].keywords}
         self.assertIn("output_fields", keywords)
-        self.assertIn("timing", keywords)
 
     def test_demo_mask_does_not_import_release_cuda(self):
         imported = set()

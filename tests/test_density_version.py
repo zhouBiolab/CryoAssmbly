@@ -25,9 +25,6 @@ class _Stub:
         self.original_target_txt = str(Path(root) / "orig_target.txt")
         self.original_density_mrc = str(Path(root) / "orig_density.mrc")
         self._mask_iter = 0
-        self.metrics = mock.MagicMock()
-        self.metrics.stage.return_value.__enter__ = lambda self_: None
-        self.metrics.stage.return_value.__exit__ = lambda *args: False
         for path in (self.current_target_txt, self.current_density_mrc,
                      self.original_target_txt, self.original_density_mrc):
             with open(path, "w") as handle:

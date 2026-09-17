@@ -22,7 +22,6 @@ from pareconv.modules.registration import HypothesisProposer, combineRegisraitio
 from protassem.fitting.chunked_registration import build_registration
 from protassem.fitting.parenet.backbone import PAREConvFPN
 from protassem.fitting.cloud_encoding import backbone_input, node_partition
-from protassem.runtime.cuda_timing import CudaStageRecorder, cuda_stage
 
 # 推理链路（demo_mask.process_single_pair）只消费最终位姿与两侧点数；
 # 训练/诊断路径传 output_fields=None，保持返回全部字段的旧行为。
@@ -170,13 +169,10 @@ class PARE_Net(nn.Module):
     )
 
 
-    def forward(self, data_dict, timing=None, output_fields=None):
-        """timing: 可选的 sink(name, seconds)；用于分阶段计时（T02）。
-
-        output_fields: 需要回传的字段名（None = 全部）。只影响返回内容，
+    def forward(self, data_dict, output_fields=None):
+        """output_fields: 需要回传的字段名（None = 全部）。只影响返回内容，
         不改变任何计算；传入 INFERENCE_OUTPUT_FIELDS 时中间张量在返回后即可释放。
         """
-        recorder = CudaStageRecorder(timing) if timing is not None else None
         output_dict = {}
         # Downsample point clouds
         #print("data_dict keys:", data_dict.keys())
@@ -217,13 +213,12 @@ class PARE_Net(nn.Module):
         output_dict['src_points'] = src_points
 
         # 1. Generate ground truth node correspondences
-        with cuda_stage(recorder, "model_node_partition"):
-            _, ref_node_masks, ref_node_knn_indices, ref_node_knn_masks = point_to_node_partition(
-                ref_points_f, ref_points_c, self.num_points_in_patch
-            )  # ref_N_c,  [ref_N_c, 64],  [ref_N_c, 64],
-            _, src_node_masks, src_node_knn_indices, src_node_knn_masks = point_to_node_partition(
-                src_points_f, src_points_c, self.num_points_in_patch
-            )
+        _, ref_node_masks, ref_node_knn_indices, ref_node_knn_masks = point_to_node_partition(
+            ref_points_f, ref_points_c, self.num_points_in_patch
+        )  # ref_N_c,  [ref_N_c, 64],  [ref_N_c, 64],
+        _, src_node_masks, src_node_knn_indices, src_node_knn_masks = point_to_node_partition(
+            src_points_f, src_points_c, self.num_points_in_patch
+        )
         '''
         # 1.1 Generate ground truth node correspondences
         _, ref_node_masks_shot, ref_node_knn_indices_shot, ref_node_knn_masks_shot = point_to_node_partition(
@@ -273,8 +268,7 @@ class PARE_Net(nn.Module):
             output_dict['gt_node_corr_overlaps'] = gt_node_corr_overlaps
 
         # 2. PARE-Conv Encoder
-        with cuda_stage(recorder, "model_backbone"):
-            re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(data_dict)
+        re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(data_dict)
         #print("re_feats_f", re_feats_f.shape, feats_f.shape, re_feats_c.shape, feats_c.shape)
         #points1 = data_dict['points'][0][:, :3].detach()
         #print("points1",points1)
@@ -317,13 +311,12 @@ class PARE_Net(nn.Module):
         #ref_pc = ref_points_centered /scale
         #src_pc = src_points_centered /scale
 
-        with cuda_stage(recorder, "model_transformer"):
-            ref_feats_c, src_feats_c, scores_list = self.transformer(
-                ref_pc.unsqueeze(0),
-                src_pc.unsqueeze(0),
-                ref_feats_c.unsqueeze(0),
-                src_feats_c.unsqueeze(0),
-            )
+        ref_feats_c, src_feats_c, scores_list = self.transformer(
+            ref_pc.unsqueeze(0),
+            src_pc.unsqueeze(0),
+            ref_feats_c.unsqueeze(0),
+            src_feats_c.unsqueeze(0),
+        )
         #print("ref_feats_c",ref_feats_c.shape)
         #print("src_feats_c",src_feats_c.shape)
         #print("ref_feats_css", ref_feats_c.squeeze(0).shape)
@@ -517,21 +510,20 @@ class PARE_Net(nn.Module):
 
      
         with torch.no_grad():
-            with cuda_stage(recorder, "model_lgr"):
-                ref_corr_points, src_corr_points, corr_scores, estimated_transform, hypotheses, re_ref_corr_feats, re_src_corr_feats, =  self.combienrefistration(
-                    ref_node_corr_knn_points,
-                    src_node_corr_knn_points,
-                    re_ref_node_corr_knn_feats,
-                    re_src_node_corr_knn_feats,
-                    ref_node_corr_knn_masks,
-                    src_node_corr_knn_masks,
-                    matching_scores,
-                    node_corr_scores,
-                    ref_feats_f,
-                    src_feats_f,
-                    ref_points_f,
-                    src_points_f,
-                )
+            ref_corr_points, src_corr_points, corr_scores, estimated_transform, hypotheses, re_ref_corr_feats, re_src_corr_feats, =  self.combienrefistration(
+                ref_node_corr_knn_points,
+                src_node_corr_knn_points,
+                re_ref_node_corr_knn_feats,
+                re_src_node_corr_knn_feats,
+                ref_node_corr_knn_masks,
+                src_node_corr_knn_masks,
+                matching_scores,
+                node_corr_scores,
+                ref_feats_f,
+                src_feats_f,
+                ref_points_f,
+                src_points_f,
+            )
 
 
         output_dict['re_ref_corr_feats'] = re_ref_corr_feats
@@ -542,8 +534,6 @@ class PARE_Net(nn.Module):
         output_dict['corr_scores'] = corr_scores
         output_dict['estimated_transform'] = estimated_transform
         output_dict['transform'] = transform
-        if recorder is not None:
-            recorder.flush()   # 同步一次后回放各阶段耗时
         return select_output_fields(output_dict, output_fields)
 
     # ==================================================================
@@ -554,23 +544,20 @@ class PARE_Net(nn.Module):
     # 两者的数值等价性由 tools/check_encoding_split.py 逐层校验（统一验收容差
     # 特征 atol=1e-6 / rtol=1e-5；位姿与候选身份要求一致）。
 
-    def encode_cloud(self, geometry, scale, timing=None):
+    def encode_cloud(self, geometry, scale):
         """单侧编码：backbone + 节点分区，只依赖本侧几何与共享 scale。
 
         geometry: CloudGeometry（T04/T05，本侧局部索引）
         scale   : 两侧共享的归一化尺度（联合布局时的同一个标量）
         返回 EncodedCloud（可独立缓存；不含任何跨侧交互量）。
         """
-        recorder = CudaStageRecorder(timing) if timing is not None else None
         device = next(self.parameters()).device
 
-        with cuda_stage(recorder, "model_backbone"):
-            re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(
-                backbone_input(geometry, scale, device=device))
-        with cuda_stage(recorder, "model_node_partition"):
-            partition = geometry.node_partition
-            if partition is None:
-                partition = node_partition(geometry, self.num_points_in_patch)
+        re_feats_f, feats_f, re_feats_c, feats_c, m_scores = self.backbone(
+            backbone_input(geometry, scale, device=device))
+        partition = geometry.node_partition
+        if partition is None:
+            partition = node_partition(geometry, self.num_points_in_patch)
 
         points = geometry.points[0][:, :3].detach()
         points_f = geometry.points[1][:, :3].detach()
@@ -578,8 +565,6 @@ class PARE_Net(nn.Module):
         # 细节点邻域点（含 padding 哨兵点，与 forward 里的 ref_padded_points_f 一致）
         padded_points_f = torch.cat([points_f, torch.zeros_like(points_f[:1])], dim=0)
         node_knn_points = index_select(padded_points_f, partition.knn_indices, dim=0)
-        if recorder is not None:
-            recorder.flush()
 
         return EncodedCloud(
             points=points, points_f=points_f, points_c=points_c,
@@ -590,7 +575,7 @@ class PARE_Net(nn.Module):
             scale=torch.as_tensor(scale, device=device),
             geometry_key=geometry.fingerprint())
 
-    def register_pair(self, target_encoded, source_encoded, timing=None, output_fields=None):
+    def register_pair(self, target_encoded, source_encoded, output_fields=None):
         """双侧配准：cross-attention → 粗匹配 → 点匹配 → LGR 假设与选优。
 
         target_encoded / source_encoded: 两侧的 EncodedCloud（scale 必须一致）。
@@ -599,7 +584,6 @@ class PARE_Net(nn.Module):
         """
         if self.training:
             raise RuntimeError("register_pair 只用于推理；训练请用 forward()")
-        recorder = CudaStageRecorder(timing) if timing is not None else None
         output_dict = {}
         ref = target_encoded
         src = source_encoded
@@ -626,13 +610,12 @@ class PARE_Net(nn.Module):
         ref_pc = ref_points_c / scale
         src_pc = src_points_c / scale
 
-        with cuda_stage(recorder, "model_transformer"):
-            ref_feats_c, src_feats_c, scores_list = self.transformer(
-                ref_pc.unsqueeze(0),
-                src_pc.unsqueeze(0),
-                ref_feats_c.unsqueeze(0),
-                src_feats_c.unsqueeze(0),
-            )
+        ref_feats_c, src_feats_c, scores_list = self.transformer(
+            ref_pc.unsqueeze(0),
+            src_pc.unsqueeze(0),
+            ref_feats_c.unsqueeze(0),
+            src_feats_c.unsqueeze(0),
+        )
         ref_feats_c_norm = F.normalize(ref_feats_c.squeeze(0), p=2, dim=1)
         src_feats_c_norm = F.normalize(src_feats_c.squeeze(0), p=2, dim=1)
         output_dict['ref_feats_c'] = ref_feats_c_norm
@@ -693,22 +676,21 @@ class PARE_Net(nn.Module):
         output_dict['src_node_corr_knn_scores'] = src_node_corr_knn_scores
 
         with torch.no_grad():
-            with cuda_stage(recorder, "model_lgr"):
-                (ref_corr_points, src_corr_points, corr_scores, estimated_transform,
-                 hypotheses, re_ref_corr_feats, re_src_corr_feats) = self.combienrefistration(
-                    ref_node_corr_knn_points,
-                    src_node_corr_knn_points,
-                    re_ref_node_corr_knn_feats,
-                    re_src_node_corr_knn_feats,
-                    ref_node_corr_knn_masks,
-                    src_node_corr_knn_masks,
-                    matching_scores,
-                    node_corr_scores,
-                    ref_feats_f,
-                    src_feats_f,
-                    ref_points_f,
-                    src_points_f,
-                )
+            (ref_corr_points, src_corr_points, corr_scores, estimated_transform,
+             hypotheses, re_ref_corr_feats, re_src_corr_feats) = self.combienrefistration(
+                ref_node_corr_knn_points,
+                src_node_corr_knn_points,
+                re_ref_node_corr_knn_feats,
+                re_src_node_corr_knn_feats,
+                ref_node_corr_knn_masks,
+                src_node_corr_knn_masks,
+                matching_scores,
+                node_corr_scores,
+                ref_feats_f,
+                src_feats_f,
+                ref_points_f,
+                src_points_f,
+            )
         output_dict['re_ref_corr_feats'] = re_ref_corr_feats
         output_dict['re_src_corr_feats'] = re_src_corr_feats
         output_dict['hypotheses'] = hypotheses
@@ -716,8 +698,6 @@ class PARE_Net(nn.Module):
         output_dict['src_corr_points'] = src_corr_points
         output_dict['corr_scores'] = corr_scores
         output_dict['estimated_transform'] = estimated_transform
-        if recorder is not None:
-            recorder.flush()
         return select_output_fields(output_dict, output_fields)
 
 

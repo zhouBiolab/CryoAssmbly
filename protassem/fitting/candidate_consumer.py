@@ -75,7 +75,6 @@ class CandidateConsumer:
         next_id = 0
         early_stop = False
         missing_end_polls = 0
-        waited_s = 0.0
 
         while True:
             self.reader.poll()
@@ -127,12 +126,10 @@ class CandidateConsumer:
             else:
                 missing_end_polls = 0
             self.sleep(self.poll_interval)
-            waited_s += self.poll_interval
 
         return {"batches": batches, "results": results, "early_stop": early_stop,
                 "skipped": list(self.reader.skipped), "consumed": next_id,
-                "skipped_mask_errors": self.skipped_mask_errors,
-                "waited_s": waited_s}
+                "skipped_mask_errors": self.skipped_mask_errors}
 
     def _await_request_end(self):
         """客户端主动早停后：确认请求真的结束了，才允许复用/改写目录或输入。"""

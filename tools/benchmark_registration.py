@@ -155,7 +155,6 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
     from protassem.fitting.parenet.model import model_fingerprint
     from protassem.runtime.config import (DEFAULT_ENCODING_CACHE_MB, DEFAULT_GEOMETRY_CACHE_MB,
                                           apply_tf32_policy, effective_allow_tf32)
-    from protassem.runtime.metrics import Metrics
 
     resolved_tf32 = effective_allow_tf32(inference_mode, allow_tf32)
     policy = apply_tf32_policy(resolved_tf32)
@@ -181,42 +180,34 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
     print("hypothesis_chunk: %d" % int(hypothesis_chunk))
 
     os.makedirs(out_dir, exist_ok=True)
-    metrics = Metrics(output_dir=os.path.join(out_dir, "metrics"),
-                      run_id="t00_" + datetime.datetime.now().strftime("%H%M%S"))
     records = []
     for repeat_index in range(repeat):
         for target in manifest["targets"]:
             pair_dir = os.path.join(out_dir, "target_%d_run_%d"
                                     % (target["order"], repeat_index + 1))
             os.makedirs(pair_dir, exist_ok=True)
-            started = time.perf_counter()
-            with metrics.stage("registration", target_order=target["order"],
-                               repeat=repeat_index + 1):
-                run_inference(
-                    target=target["txt"], source=manifest["source"]["txt"],
-                    chain_pdb=manifest["source"]["pdb"], output_dir=pair_dir,
-                    weights=weights, use_mask=False,
-                    configs=manifest["params"]["configs"], seed=manifest["seed"],
-                    geometry_cache=geometry_cache, allow_tf32=resolved_tf32,
-                    inference_mode=inference_mode, encoding_cache=encoding_cache,
-                    hypothesis_chunk=hypothesis_chunk,
-                    tail_pipeline_enabled=tail_pipeline)
-            elapsed = time.perf_counter() - started
+            run_inference(
+                target=target["txt"], source=manifest["source"]["txt"],
+                chain_pdb=manifest["source"]["pdb"], output_dir=pair_dir,
+                weights=weights, use_mask=False,
+                configs=manifest["params"]["configs"], seed=manifest["seed"],
+                geometry_cache=geometry_cache, allow_tf32=resolved_tf32,
+                inference_mode=inference_mode, encoding_cache=encoding_cache,
+                hypothesis_chunk=hypothesis_chunk,
+                tail_pipeline_enabled=tail_pipeline)
             pred_files, overlaps = summarize_predictions(pair_dir)
             records.append({
                 "target_order": target["order"], "repeat": repeat_index + 1,
                 "target_points": target["point_count"],
                 "source_points": manifest["source"]["point_count"],
                 "configs": manifest["params"]["configs"],
-                "wall_s": round(elapsed, 3),
                 "predictions": len(pred_files),
                 "overlaps": sorted(round(value, 6) for value in overlaps),
                 "best_overlap": max(overlaps) if overlaps else None,
             })
-            print("target %d run %d: %.2f s, %d predictions, best overlap=%s"
-                  % (target["order"], repeat_index + 1, elapsed, len(pred_files),
+            print("target %d run %d: %d predictions, best overlap=%s"
+                  % (target["order"], repeat_index + 1, len(pred_files),
                      max(overlaps) if overlaps else None))
-    summary_path = metrics.write_summary()
     cache_stats = geometry_cache.snapshot() if geometry_cache is not None else None
     report = {"manifest": os.path.abspath(manifest_path), "out_dir": os.path.abspath(out_dir),
               "repeat": repeat, "records": records,
@@ -225,8 +216,7 @@ def run_manifest(manifest_path, out_dir, repeat, geometry_cache_mb=None,
               "tf32_policy": policy, "encoding_cache_mb": encoding_cache_mb,
               "hypothesis_chunk": int(hypothesis_chunk),
               "tail_pipeline": bool(tail_pipeline),
-              "encoding_cache": encoding_cache.snapshot() if encoding_cache else None,
-              "metrics_summary": summary_path}
+              "encoding_cache": encoding_cache.snapshot() if encoding_cache else None}
     with open(os.path.join(out_dir, "t00_report.json"), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
     return report
@@ -294,8 +284,8 @@ def main(argv=None):
     print("inference_mode: %s ; allow_tf32: %s"
           % (report["inference_mode"], report["allow_tf32"]))
     for record in report["records"]:
-        print("  target %d run %d: %.2f s, %d predictions, best overlap=%s"
-              % (record["target_order"], record["repeat"], record["wall_s"],
+        print("  target %d run %d: %d predictions, best overlap=%s"
+              % (record["target_order"], record["repeat"],
                  record["predictions"], record["best_overlap"]))
     return 0
 

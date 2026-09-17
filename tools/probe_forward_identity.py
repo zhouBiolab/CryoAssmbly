@@ -19,7 +19,6 @@ import hashlib
 import json
 import os
 import random
-import time
 
 import numpy as np
 
@@ -103,11 +102,9 @@ def main(argv=None):
         data_dict["points"], data_dict["lengths"],
         cfg.backbone.num_stages, cfg.backbone.num_neighbors))
     torch.cuda.synchronize()
-    started = time.perf_counter()
     with torch.no_grad():
         output_dict = model(data_dict)
     torch.cuda.synchronize()
-    elapsed = time.perf_counter() - started
 
     os.makedirs(args.out_dir, exist_ok=True)
     arrays = {}
@@ -136,7 +133,6 @@ def main(argv=None):
         "config_id": args.config_id,
         "sampling": args.sampling,
         "seed": manifest["seed"],
-        "forward_seconds": round(elapsed, 4),
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(0),
         "model_module": os.path.abspath(model_module.__file__),
@@ -146,7 +142,7 @@ def main(argv=None):
     with open(os.path.join(args.out_dir, "forward_outputs.json"), "w",
               encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
-    print("wrote %s (%d fields, forward %.4f s)" % (args.out_dir, len(fields), elapsed))
+    print("wrote %s (%d fields)" % (args.out_dir, len(fields)))
     print("model module: %s" % summary["model_module"])
     return 0
 

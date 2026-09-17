@@ -400,15 +400,11 @@ def geometry_cache_key(points, features, voxel_sizes, sampling_method, num_neigh
 
 @dataclass
 class AcquireResult:
-    """一次几何获取的结果与分项耗时（秒）。"""
+    """一次几何获取的结果。"""
 
     geometry: CloudGeometry
     hit: bool
     cacheable: bool
-    collate_seconds: float = 0.0
-    neighbors_seconds: float = 0.0
-    store_seconds: float = 0.0
-    hit_seconds: float = 0.0
 
 
 class GeometryCache:
@@ -454,32 +450,18 @@ def acquire_geometry(cache, points, features, voxel_sizes, sampling_method, num_
     if cache is not None and cacheable:
         key = geometry_cache_key(points, features, voxel_sizes, sampling_method,
                                  num_neighbors, centroid)
-        started = time.perf_counter()
         cached = cache.get(key)
         if cached is not None:
-            geometry = geometry_to(cached, device)
-            return AcquireResult(geometry=geometry, hit=True, cacheable=cacheable,
-                                 hit_seconds=time.perf_counter() - started)
+            return AcquireResult(geometry=geometry_to(cached, device),
+                                 hit=True, cacheable=cacheable)
 
-    started = time.perf_counter()
     geometry = build_stage_points(points, features, voxel_sizes, sampling_method,
                                   centroid=centroid, device=device)
-    collate_seconds = time.perf_counter() - started
-
-    started = time.perf_counter()
     build_neighbors(geometry, num_neighbors)
-    neighbors_seconds = time.perf_counter() - started
-
-    store_seconds = 0.0
     if key is not None:
-        started = time.perf_counter()
         cache.put(key, geometry)
-        store_seconds = time.perf_counter() - started
 
-    return AcquireResult(geometry=geometry, hit=False, cacheable=cacheable,
-                         collate_seconds=collate_seconds,
-                         neighbors_seconds=neighbors_seconds,
-                         store_seconds=store_seconds)
+    return AcquireResult(geometry=geometry, hit=False, cacheable=cacheable)
 
 
 # ======================================================================

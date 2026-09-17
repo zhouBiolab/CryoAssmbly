@@ -22,7 +22,6 @@ from tqdm import tqdm
 from typing import Union, Tuple, List
 import re
 import json
-import time
 
 # Add project root so protassem package is importable when run as subprocess
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -256,90 +255,28 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
         ref_geometry = ref_acquired.geometry
         src_geometry = src_acquired.geometry
 
-        _record_timing(output_dir, "server_collate",
-                       ref_acquired.collate_seconds + src_acquired.collate_seconds,
-                       config_id=config_id, sampling=sampling_method)
-        _record_timing(output_dir, "server_neighbors",
-                       ref_acquired.neighbors_seconds + src_acquired.neighbors_seconds)
-        _record_timing(output_dir, "server_cache_hit",
-                       ref_acquired.hit_seconds + src_acquired.hit_seconds,
-                       tgt_hit=ref_acquired.hit, src_hit=src_acquired.hit,
-                       cacheable=ref_acquired.cacheable)
-        _record_timing(output_dir, "server_cache_store",
-                       ref_acquired.store_seconds + src_acquired.store_seconds)
-
         # T06：inference_mode="split" 时走单侧编码（可缓存）+ 双侧配准；"joint" 时走旧联合布局 + forward
-        timing_sink = lambda stage, seconds: _record_timing(  # noqa: E731
-            output_dir, stage, seconds, config_id=config_id, sampling=sampling_method)
         joint_reference = inference_mode == "joint"
         data_dict = None
         if joint_reference:
-            _t_stage = time.perf_counter()
             data_dict = join_geometries(
                 ref_geometry, src_geometry, scale=scale,
                 transform=torch.from_numpy(np.eye(4, dtype=np.float32)))
-            _record_timing(output_dir, "server_join", time.perf_counter() - _t_stage)
-
-        # T02：输入指纹与有效参数（用于判断缓存可复用比例）
-        import struct
-        _record_timing(output_dir, "server_pair_info", 0.0,
-                       config_id=config_id, sampling=sampling_method,
-                       effective_sampling=effective_sampling,
-                       voxel_sizes=[float(value) for value in voxel_sizes],
-                       src_points=int(src_data.points.shape[0]),
-                       tgt_points=int(tgt_data.points.shape[0]),
-                       ref_radius=float(np.linalg.norm(ref_norm, axis=1).max()),
-                       src_radius=float(np.linalg.norm(src_norm, axis=1).max()),
-                       scale=float(scale),
-                       scale_bits=struct.pack(">f", float(scale)).hex(),
-                       inference_mode=inference_mode,
-                       collate_stage_points=[int(item.shape[0]) for item in
-                                             ref_geometry.points])
 
         if joint_reference:
-            _t_stage = time.perf_counter()
-            output_dict = model(data_dict, output_fields=INFERENCE_OUTPUT_FIELDS,
-                                timing=timing_sink)
-            _record_timing(output_dir, "server_forward", time.perf_counter() - _t_stage)
+            output_dict = model(data_dict, output_fields=INFERENCE_OUTPUT_FIELDS)
         else:
-            _t_stage = time.perf_counter()
-            ref_encoded = model.encode_cloud(ref_geometry, scale, timing=timing_sink)
-            _record_timing(output_dir, "server_encode_tgt", time.perf_counter() - _t_stage,
-                           config_id=config_id, sampling=sampling_method)
+            ref_encoded = model.encode_cloud(ref_geometry, scale)
             # T07：源编码命中则跳过源 backbone（目标编码不缓存，只保留当前掩码结果）
-            src_encoded, src_hit = None, False
+            src_encoded = None
             if encoding_cache is not None and encoding_cache.enabled:
-                _t_stage = time.perf_counter()
                 src_encoded = encoding_cache.get(src_geometry, scale)
-                src_hit = src_encoded is not None
-                _record_timing(output_dir, "server_encode_cache",
-                               time.perf_counter() - _t_stage, src_hit=src_hit)
             if src_encoded is None:
-                _t_stage = time.perf_counter()
-                src_encoded = model.encode_cloud(src_geometry, scale, timing=timing_sink)
-                _record_timing(output_dir, "server_encode_src",
-                               time.perf_counter() - _t_stage,
-                               config_id=config_id, sampling=sampling_method,
-                               cached=False)
+                src_encoded = model.encode_cloud(src_geometry, scale)
                 if encoding_cache is not None and encoding_cache.enabled:
-                    _t_stage = time.perf_counter()
                     encoding_cache.put(src_geometry, scale, src_encoded)
-                    _record_timing(output_dir, "server_encode_store",
-                                   time.perf_counter() - _t_stage)
-            _t_stage = time.perf_counter()
             output_dict = model.register_pair(
-                ref_encoded, src_encoded, output_fields=INFERENCE_OUTPUT_FIELDS,
-                timing=timing_sink)
-            _record_timing(output_dir, "server_register", time.perf_counter() - _t_stage,
-                           src_cache_hit=src_hit)
-
-        # 后处理计时必须从模型结束处开始，否则会与 server_forward 重叠相加（T02 偏差处理）
-        _t_stage = time.perf_counter()
-        _record_timing(output_dir, "server_mem_peak", 0.0,
-                       allocated=torch.cuda.memory_allocated(),
-                       reserved=torch.cuda.memory_reserved(),
-                       max_allocated=torch.cuda.max_memory_allocated(),
-                       max_reserved=torch.cuda.max_memory_reserved())
+                ref_encoded, src_encoded, output_fields=INFERENCE_OUTPUT_FIELDS)
 
         T_est = output_dict["estimated_transform"]
         pred_R = T_est[:3, :3].cpu().numpy()
@@ -350,16 +287,11 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
 
         def finish_pair():
             """T09 尾部任务：后处理 + 写盘（确定性，不消耗随机数）。"""
-            _t_tail = time.perf_counter()
             src4 = apply_transformation(src_for_ov, pred_R, pred_t)
             _, _, corr = compute_overlap(ref_for_ov, src4, 1.5)
             # 分母用完整（未掩码）目标点云 ref_for_ov，而非源点云
             overlap_value = corr.shape[1] / len(ref_for_ov) \
                 if corr is not None and corr.size else 0.0
-            _record_timing(output_dir, "server_postprocess",
-                           time.perf_counter() - _t_tail)
-
-            _t_tail = time.perf_counter()
             if chain_pdb_path and os.path.exists(chain_pdb_path):
                 try:
                     pred_pdb = generate_output_pdb_path(
@@ -371,8 +303,6 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
                     result["pred_pdb_path"] = pred_pdb
                 except Exception as e:
                     log.warning("PDB transform failed: %s", e)
-            _record_timing(output_dir, "server_write_pred",
-                           time.perf_counter() - _t_tail)
             result.update({"overlap": overlap_value,
                            "ref_points": ref_count, "src_points": src_count})
 
@@ -384,10 +314,6 @@ def process_single_pair(src_data, tgt_data, source_path, target_path,
 
         # T03：不再递归 release_cuda（把每个张量都拷成 numpy）也不再逐对 empty_cache——
         # data_dict/output_dict 是本函数局部变量，返回即结束引用，显存由缓存分配器复用。
-        _record_timing(output_dir, "server_mem_after", 0.0,
-                       allocated=torch.cuda.memory_allocated(),
-                       reserved=torch.cuda.memory_reserved(),
-                       config_id=config_id, sampling=sampling_method)
 
     except Exception as e:
         result["error"] = str(e)
@@ -548,10 +474,8 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
         config_ids = [int(x) for x in configs.split(",")]
 
     # preprocess
-    _t_stage = time.perf_counter()
     src_data = preprocess_point_cloud_data(source, point_limit=point_limit)
     tgt_data = preprocess_point_cloud_data(target, point_limit=point_limit)
-    _record_timing(output_dir, "server_preprocess", time.perf_counter() - _t_stage)
 
     # masks
     masks, masks_save_path, mask_data_list = None, None, []
@@ -562,19 +486,14 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
             "min_point_distance_factor": min_point_distance_factor,
             "verbose": True, "save_masks": True,
         }
-        _t_stage = time.perf_counter()
         masks, masks_save_path = generate_masks_once(
             source, target, mask_params, output_dir, source, target)
-        _record_timing(output_dir, "server_masks", time.perf_counter() - _t_stage)
-        _t_stage = time.perf_counter()
         for mf in find_mask_files(os.path.join(output_dir, "temp")):
             try:
                 md = preprocess_point_cloud_data(mf, point_limit=None, is_mask_file=True)
                 mask_data_list.append((mf, md))
             except Exception:
                 continue
-        _record_timing(output_dir, "server_mask_preprocess",
-                       time.perf_counter() - _t_stage)
 
     def _stopped():
         return stop_file is not None and os.path.exists(stop_file)
@@ -583,16 +502,9 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
     all_results = []
     # T09：尾部流水线（深度 1）。所有"消费结果"的位置必须先 wait()，见下面各点
     tail_pipeline = TailPipeline(enabled=tail_pipeline_enabled, name="parenet-tail")
-    tail_wait_seconds = 0.0
 
     def _drain_tail(stage):
-        nonlocal tail_wait_seconds
-        _t_wait = time.perf_counter()
         tail_pipeline.wait()
-        waited = time.perf_counter() - _t_wait
-        tail_wait_seconds += waited
-        if waited > 0.001:
-            _record_timing(output_dir, "server_tail_wait", waited, where=stage)
 
     ledger_errors = {"count": 0, "first": None}
     skipped_mask_errors = 0
@@ -758,10 +670,6 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
                 ledger.finish("ok")
         except Exception as e:
             log.error("候选台账结束记录写入失败：%s", e)
-    if tail_pipeline.enabled:
-        _record_timing(output_dir, "server_tail_stats", 0.0,
-                       submitted=tail_pipeline.submitted, completed=tail_pipeline.completed,
-                       waited_seconds=round(tail_wait_seconds, 6))
     ok = [r for r in all_results if not r.get("error") and r.get("overlap") is not None]
     fail = [r for r in all_results if r.get("error")]
     log.info("Total: %d, Success: %d, Failed: %d", len(all_results), len(ok), len(fail))
@@ -775,23 +683,6 @@ def run_inference(target, source, chain_pdb, output_dir, weights,
 # ======================================================================
 # Persistent server: load model once, serve stdin JSON requests
 # ======================================================================
-
-def _record_timing(output_dir, stage, elapsed_s, **fields):
-    """把服务端阶段耗时追加到请求输出目录的 server_timing.jsonl。
-
-    父进程（客户端）另有一套计时，两者覆盖的时间区间会重叠，报告中分别展示、
-    不做相加。写计时失败不影响推理本身。
-    """
-    row = {"pid": os.getpid(), "stage": stage,
-           "elapsed_s": round(float(elapsed_s), 6), "timestamp": time.time()}
-    row.update(fields)
-    try:
-        with open(os.path.join(output_dir, "server_timing.jsonl"), "a",
-                  encoding="utf-8") as handle:
-            handle.write(json.dumps(row) + "\n")
-    except OSError as exc:
-        log.warning("server timing write failed: %s", exc)
-
 
 def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                  inference_mode=DEFAULT_INFERENCE_MODE, allow_tf32=DEFAULT_ALLOW_TF32,
@@ -824,7 +715,6 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
              "allow_tf32=%s, encoding_cache_mb=%s, hypothesis_chunk=%d)",
              os.getpid(), geometry_cache_mb, inference_mode, resolved_tf32,
              encoding_cache_mb if encoding_cache is not None else 0, int(hypothesis_chunk))
-    _last_request_end = time.perf_counter()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -837,9 +727,6 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
         output_dir = req["output_dir"]
         done_file = os.path.join(output_dir, "_PARENET_DONE")
         stop_file = os.path.join(output_dir, "_PARENET_STOP")
-        _request_started = time.perf_counter()
-        _record_timing(output_dir, "server_queue_wait",
-                       _request_started - _last_request_end)
         try:
             run_inference(
                 target=req["target"], source=req["source"],
@@ -864,15 +751,6 @@ def _server_loop(weights, geometry_cache_mb=DEFAULT_GEOMETRY_CACHE_MB,
                     f.write("done\n")
             except Exception:
                 pass
-        _last_request_end = time.perf_counter()
-        _record_timing(output_dir, "server_request_total",
-                       _last_request_end - _request_started)
-        if geometry_cache is not None:
-            _record_timing(output_dir, "server_cache_stats", 0.0,
-                           **geometry_cache.snapshot())
-        if encoding_cache is not None:
-            _record_timing(output_dir, "server_encoding_cache_stats", 0.0,
-                           **encoding_cache.snapshot())
 
 
 def main():

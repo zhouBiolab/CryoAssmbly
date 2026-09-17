@@ -284,8 +284,7 @@ class AcquireGeometryTest(unittest.TestCase):
         self.assertFalse(first.hit)
         second = self.acquire()
         self.assertTrue(second.hit)
-        self.assertGreater(second.hit_seconds, 0.0)
-        self.assertEqual(0.0, second.collate_seconds)
+        self.assertTrue(second.hit)
         self.assertEqual(first.geometry.fingerprint(), second.geometry.fingerprint())
         for left, right in zip(first.geometry.points, second.geometry.points):
             self.assertTrue(torch.equal(left, right))

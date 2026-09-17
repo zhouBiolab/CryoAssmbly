@@ -1,43 +1,62 @@
-"""进程池辅助测试：池启动/关闭事件被记录，异常路径也释放。"""
+"""进程池原语测试：创建/回收、worker 数下限保护、异常路径也释放。"""
 
-import os
-import tempfile
+import multiprocessing
 import unittest
 
-from protassem.runtime.metrics import Metrics
-from protassem.runtime.pool import timed_pool
+from protassem.runtime.pool import close_pool, open_pool, worker_count
 
 
-class TimedPoolTest(unittest.TestCase):
+def _double(value):
+    """模块级 worker（可被 spawn 序列化）。"""
+    return value * 2
 
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.tmp = self._tmp.name
 
-    def test_records_start_and_close_and_runs_tasks(self):
-        metrics = Metrics(output_dir=self.tmp, run_id="pool-1")
-        with timed_pool(metrics, 2, "unit_pool") as pool:
-            results = pool.map(abs, [-1, -2, -3])
-        self.assertEqual(results, [1, 2, 3])
-        stages = [row["stage"] for row in metrics.records]
-        self.assertEqual(stages, ["pool_start", "pool_close"])
-        self.assertEqual(metrics.records[0]["pool"], "unit_pool")
-        self.assertEqual(metrics.records[0]["workers"], 2)
-        self.assertEqual(metrics.records[0]["start_method"], "default")
+def _boom(value):
+    """模块级 worker：故意失败，用于异常回收路径。"""
+    raise RuntimeError("worker failure: %s" % value)
 
-    def test_pool_is_released_when_block_raises(self):
-        metrics = Metrics(output_dir=None, run_id="pool-2")
-        with self.assertRaises(ValueError):
-            with timed_pool(metrics, 1, "boom_pool") as pool:
-                pool.map(abs, [-1])
-                raise ValueError("intentional")
-        self.assertEqual([row["stage"] for row in metrics.records],
-                         ["pool_start", "pool_close"])
 
-    def test_metrics_is_optional(self):
-        with timed_pool(None, 1, "no_metrics") as pool:
-            self.assertEqual(pool.map(abs, [-5]), [5])
+def _active_child_pids():
+    return {child.pid for child in multiprocessing.active_children()}
+
+
+class WorkerCountTest(unittest.TestCase):
+    """worker 数下限保护：0 / None 都钳到 1。"""
+
+    def test_never_returns_zero(self):
+        self.assertEqual(worker_count(0), 1)
+        self.assertEqual(worker_count(None), 1)
+        self.assertEqual(worker_count(4), 4)
+
+
+class PoolPrimitivesTest(unittest.TestCase):
+
+    def test_open_and_close_pool(self):
+        pool = open_pool(2)
+        self.assertEqual(pool.map(_double, [2, 3]), [4, 6])
+        close_pool(pool)
+
+    def test_single_worker_pool_runs_tasks(self):
+        pool = open_pool(1)
+        self.assertEqual(pool.map(abs, [-5]), [5])
+        close_pool(pool)
+
+    def test_spawn_context_is_honoured(self):
+        pool = open_pool(2, "spawn")
+        self.assertEqual(pool.map(_double, [3]), [6])
+        close_pool(pool)
+
+
+class PoolRecoveryTest(unittest.TestCase):
+    """异常路径的资源回收：worker 抛异常后池必须能被回收干净。"""
+
+    def test_worker_exception_propagates_and_children_are_reaped(self):
+        before = _active_child_pids()
+        pool = open_pool(2)
+        with self.assertRaises(RuntimeError):
+            pool.map(_boom, [1, 2], chunksize=1)
+        close_pool(pool)
+        self.assertEqual(_active_child_pids() - before, set())
 
 
 if __name__ == "__main__":
