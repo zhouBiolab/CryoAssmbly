@@ -18,8 +18,8 @@ import shutil
 import logging
 import threading
 import subprocess
-from protassem.runtime.metrics import Metrics, worker_count
 from protassem.runtime.execution import ExecutionContext
+from protassem.runtime.pool import worker_count
 
 from protassem.core.scoring import calculate_cc_mask
 from protassem.fitting.candidate_consumer import CandidateConsumer
@@ -32,8 +32,12 @@ log = logging.getLogger(__name__)
 # process count for parallel CC / local-optimize copies (set by run_fitting)
 _NUM_PROCESSES = 1
 # how many new pred files to accumulate before a monitor evaluation (set by run_fitting)
-_BATCH_SIZE = 20
-_METRICS = None
+_BATCH_SIZE = 8
+
+# 局部优化的 CC 触发下限（链 / 域共用）。
+# 高分辨率密度图上轻微偏移就会让 CC 塌到很低，低初始 CC 的候选经局部优化仍可能
+# 达标；该下限只用来挡掉"完全没有信号"的退化候选，不是质量门槛。
+LOCAL_OPT_CC_FLOOR = 0.03
 # O6：请求身份计数器（同一进程内单调递增 → 两次运行的台账 request_id 序列一致）
 _REQUEST_SEQ = 0
 
@@ -62,7 +66,7 @@ DEMO_MASK_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 def run_fitting(target_txt, source, density_mrc, resolution, contour,
                 output_dir, mode="chain", chain_pdb=None,
                 early_stop_threshold=0.54, original_density_mrc=None,
-                num_processes=1, batch_size=20, metrics=None, context=None):
+                num_processes=1, batch_size=8, context=None):
     """Unified entry point for chain and domain fitting.
 
     Args:
@@ -81,30 +85,25 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
     Returns:
         dict: success (bool), final_pdb (str|None), cc_mask (float)
     """
-    global _NUM_PROCESSES, _BATCH_SIZE, _METRICS
+    global _NUM_PROCESSES, _BATCH_SIZE
     _NUM_PROCESSES = worker_count(num_processes)
     _BATCH_SIZE = batch_size
     os.makedirs(output_dir, exist_ok=True)
     orig_mrc = original_density_mrc or density_mrc
-    _METRICS = metrics or Metrics(os.path.join(output_dir, "metrics"))
     # P3：优先复用运行级共享池；独立调用 run_fitting 时自建并在返回前释放。
     owns_context = context is None
-    exec_context = context or ExecutionContext(metrics=_METRICS,
-                                               pool_workers=_NUM_PROCESSES)
-    stage_context = _METRICS.stage("fit_request", mode=mode)
+    exec_context = context or ExecutionContext(pool_workers=_NUM_PROCESSES)
     try:
-        with stage_context:
-            if mode == "chain":
-                return _fit_chain(target_txt, source, density_mrc, resolution,
-                                  contour, output_dir, early_stop_threshold,
-                                  orig_mrc, exec_context)
-            return _fit_domain(target_txt, source, density_mrc, resolution,
-                               contour, output_dir, chain_pdb,
-                               early_stop_threshold, orig_mrc, exec_context)
+        if mode == "chain":
+            return _fit_chain(target_txt, source, density_mrc, resolution,
+                              contour, output_dir, early_stop_threshold,
+                              orig_mrc, exec_context)
+        return _fit_domain(target_txt, source, density_mrc, resolution,
+                           contour, output_dir, chain_pdb,
+                           early_stop_threshold, orig_mrc, exec_context)
     finally:
         if owns_context:
             exec_context.close()
-        _METRICS.write_summary()
 
 
 # ======================================================================
@@ -114,13 +113,12 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
 def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
                output_dir, stop_threshold, orig_mrc, context):
     """Chain fitting: iterate over source files sorted by point count."""
-    with _METRICS.stage("analyze_sources"):
-        candidates = _analyze_source_files(source_dir)
+    candidates = _analyze_source_files(source_dir)
     if not candidates:
         log.error("No source files found in %s", source_dir)
         return _fail()
 
-    cc_threshold = 0.20
+    cc_threshold = LOCAL_OPT_CC_FLOOR
     max_attempts = min(8, len(candidates))
     log.info("Chain fitting: %d candidates, max %d attempts", len(candidates), max_attempts)
 
@@ -140,8 +138,7 @@ def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
             cc_threshold, stop_threshold, orig_mrc, context)
 
         if result["success"]:
-            with _METRICS.stage("save_result"):
-                final_pdb = _save_final_result(result, attempt_dir, pdb_path)
+            final_pdb = _save_final_result(result, attempt_dir, pdb_path)
             cc = _verify_cc(final_pdb, orig_mrc, resolution, contour)
             return {"success": True, "final_pdb": final_pdb, "cc_mask": cc}
 
@@ -161,9 +158,9 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
         log.error("No chain PDB found for domain fitting")
         return _fail()
 
-    # local-optimization trigger threshold (flat 0.25 for domains).
-    # The early-stop threshold (stop_threshold) is NOT resolution-adjusted.
-    cc_threshold = 0.25
+    # 局部优化触发下限（链/域共用 LOCAL_OPT_CC_FLOOR）。
+    # 早停阈值（stop_threshold）不做分辨率调整。
+    cc_threshold = LOCAL_OPT_CC_FLOOR
 
     result = _fit_single(
         target_txt, source_txt, pdb_path, output_dir,
@@ -171,8 +168,7 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
         cc_threshold, stop_threshold, orig_mrc, context)
 
     if result["success"]:
-        with _METRICS.stage("save_result"):
-            final_pdb = _save_final_result(result, output_dir, pdb_path)
+        final_pdb = _save_final_result(result, output_dir, pdb_path)
         cc = _verify_cc(final_pdb, orig_mrc, resolution, contour)
         return {"success": True, "final_pdb": final_pdb, "cc_mask": cc}
 
@@ -217,12 +213,11 @@ def _start_parenet(target, source, chain_pdb, output_dir):
     task_id = os.path.basename(output_dir)
     _REQUEST_SEQ += 1
     request_id = "%s-%d" % (task_id, _REQUEST_SEQ)
-    with _METRICS.stage("request_submit", task_id=task_id):
-        return start_request(target, source, chain_pdb, output_dir,
-                             use_mask=True, configs="all",
-                             mask_radius_factor=1.35,
-                             min_point_distance_factor=0.32,
-                             request_id=request_id)
+    return start_request(target, source, chain_pdb, output_dir,
+                         use_mask=True, configs="all",
+                         mask_radius_factor=1.35,
+                         min_point_distance_factor=0.32,
+                         request_id=request_id)
 
 
 # ======================================================================
@@ -241,10 +236,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
     if batch_size is None:
         batch_size = _BATCH_SIZE
     task_id = os.path.basename(os.path.dirname(reg_dir))
-    loop_started = time.perf_counter()
     all_results = []
     candidates = []
-    first_pred = [None]
     early_stop_result = [None]
 
     reader = LedgerReader(os.path.join(reg_dir, LEDGER_NAME),
@@ -263,13 +256,9 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         usable = [record for record in records if record["state"] == "ok"]
         if not usable:
             return [], False
-        if first_pred[0] is None:
-            first_pred[0] = time.perf_counter() - loop_started
-            _METRICS.record("first_pred", first_pred[0], task_id=task_id)
 
         files = [os.path.join(reg_dir, record["name"]) for record in usable]
-        with _METRICS.stage("cc_batch", candidate_count=len(files)):
-            batch_results = _batch_cc(files, density_mrc, resolution, contour, context)
+        batch_results = _batch_cc(files, density_mrc, resolution, contour, context)
         for record, result in zip(usable, batch_results):
             result["candidate_id"] = record["id"]
             if record.get("overlap") is not None:
@@ -280,12 +269,10 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                        if r["cc_mask"] is not None and r["cc_mask"] > cc_threshold],
                       key=lambda r: (-r["cc_mask"], r["candidate_id"]))
         for r in high:
-            with _METRICS.stage("local_optimize",
-                                candidate_count=len(candidates) + 1):
-                opt = _optimize_candidate(
-                    r["pdb_file"], density_mrc, resolution, contour,
-                    temp_dir, len(candidates) + 1, known_cc=r["cc_mask"],
-                    context=context)
+            opt = _optimize_candidate(
+                r["pdb_file"], density_mrc, resolution, contour,
+                temp_dir, len(candidates) + 1, known_cc=r["cc_mask"],
+                context=context)
             if opt["success"]:
                 opt["candidate_id"] = r["candidate_id"]
                 candidates.append(opt)
@@ -300,12 +287,8 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         on_cancel=lambda: _kill(proc),
         describe_request=lambda: _describe_request(proc))
 
-    _stream_started = time.perf_counter()
     outcome = consumer.run()
     # O6：这里记录的是**整个候选流消费时长**（旧实现的 candidate_scan 只表示 glob 轮询耗时）
-    _METRICS.record("candidate_stream", time.perf_counter() - _stream_started,
-                    task_id=task_id)
-    _METRICS.record("gpu_wait", outcome["waited_s"], task_id=task_id)
     if outcome["skipped"]:
         log.warning("候选台账含 %d 个非 ok 候选（filtered/error），已跳过；"
                     "其中已消费范围内的掩码级评估失败 %d 个",
@@ -315,10 +298,9 @@ def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
         best_result = early_stop_result[0]
     else:
         # final_select 只在"全部批次消费完且未早停"时执行（规则与原实现一致）
-        with _METRICS.stage("final_select", task_id=task_id):
-            best_result = _select_final_result(
-                all_results, candidates, density_mrc, resolution, contour,
-                stop_threshold, temp_dir, context=context)
+        best_result = _select_final_result(
+            all_results, candidates, density_mrc, resolution, contour,
+            stop_threshold, temp_dir, context=context)
 
     if best_result is None and all_results:
         valid_r = [r for r in all_results if r["cc_mask"] is not None]
@@ -402,8 +384,7 @@ def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
         orig_cc = known_cc
     else:
         try:
-            with _METRICS.stage("cc_candidate_initial", task_id=str(candidate_id)):
-                orig_cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+            orig_cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
         except Exception:
             orig_cc = 0.0
 
@@ -415,8 +396,7 @@ def _optimize_candidate(pdb_file, density_mrc, resolution, contour,
     # local_optimize returns the final CC -> no recompute here
     ok, opt_pdb, opt_cc = local_optimize(pdb_file, density_mrc, out_pdb,
                                          resolution, contour,
-                                         initial_cc=orig_cc,
-                                         metrics=_METRICS, context=context)
+                                         initial_cc=orig_cc, context=context)
     if not ok or not opt_pdb or not os.path.exists(opt_pdb):
         log.warning("Candidate #%d [src: %s]: local optimization failed",
                     candidate_id, os.path.basename(pdb_file))
@@ -482,8 +462,7 @@ def _verify_cc(pdb_file, density_mrc, resolution, contour):
     if not pdb_file or not os.path.exists(pdb_file):
         return 0.0
     try:
-        with _METRICS.stage("cc_verify"):
-            cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
+        cc = calculate_cc_mask(density_mrc, pdb_file, resolution, contour)
         log.info("Verified CC_mask (original density): %.6f", cc)
         return cc
     except Exception as e:
