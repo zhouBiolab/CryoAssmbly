@@ -69,8 +69,12 @@ def make_fake_sample_bin(path, exit_code=0, output=None, stderr_text=""):
 
 
 def make_mrc(path, shape=(8, 8, 8), voxel_size=2.0, origin=(1.0, 2.0, 3.0),
-             value=5.0):
-    """Write a small MRC map (filled inner block) and return its path."""
+             value=5.0, nstart=(0, 0, 0)):
+    """Write a small MRC map (filled inner block) and return its path.
+
+    ``nstart`` is applied after ``update_header_from_data()``, which resets
+    nxstart/nystart/nzstart to 0.
+    """
     data = np.zeros(shape, dtype=np.float32)
     data[2:-2, 2:-2, 2:-2] = value
     with mrcfile.new(path, overwrite=True) as mrc:
@@ -80,6 +84,9 @@ def make_mrc(path, shape=(8, 8, 8), voxel_size=2.0, origin=(1.0, 2.0, 3.0),
         mrc.header.origin.y = origin[1]
         mrc.header.origin.z = origin[2]
         mrc.update_header_from_data()
+        mrc.header.nxstart = nstart[0]
+        mrc.header.nystart = nstart[1]
+        mrc.header.nzstart = nstart[2]
         mrc.update_header_stats()
     return path
 

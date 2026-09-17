@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 
 from protassem.core.io import find_files, read_param_file
+from protassem.core.mrc_origin import normalize_density_map
 from protassem.runtime.config import apply_seed
 from protassem.runtime.execution import ExecutionContext
 from protassem.runtime.metrics import Metrics
@@ -74,6 +75,24 @@ def _validate_inputs(density_mrc, structure_files, resolution, contour, voxel_si
         raise ValueError("voxel_size must be a positive number, got %r" % (voxel_size,))
 
 
+def _normalize_density(density_mrc, output_dir):
+    """把实验密度图的 header 原点化成与读法约定无关的形式，返回下游应使用的路径。
+
+    输入已是规范形式（``nstart`` 全为 0）时原样返回，不复制文件。口径、为什么
+    统一在文件侧而不改 `Sample` 或 `core.scoring`，以及残余风险见
+    `protassem.core.mrc_origin`。
+    """
+    result = normalize_density_map(
+        density_mrc,
+        os.path.join(output_dir, "density", os.path.basename(density_mrc)))
+    if result.path != density_mrc:
+        log.info("Density origin normalized: %s -> %s (nstart %s -> 0)",
+                 tuple(round(float(v), 3) for v in result.previous_origin),
+                 tuple(round(float(v), 3) for v in result.origin),
+                 tuple(int(v) for v in result.nstart))
+    return result.path
+
+
 def _record_score_cache(metrics):
     """把父进程侧的评分缓存统计写进运行指标（审计#4）。
 
@@ -122,7 +141,10 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     """Run the full three-step pipeline.
 
     Args:
-        density_mrc: path to experimental density map (.mrc)
+        density_mrc: path to experimental density map (.mrc). Its header origin is
+            normalized (``nstart`` folded into ``origin``) before Step 1; when that
+            changes anything, the copy under ``<output_dir>/density/`` is used from
+            then on and the original file is left untouched.
         structure_files: list of structure file paths (.pdb/.cif)
         resolution: map resolution in angstroms
         contour: density contour level
@@ -190,6 +212,10 @@ def run_pipeline(density_mrc, structure_files, resolution, contour,
     log.info("Density map : %s", density_mrc)
     log.info("Structures  : %d files", len(structure_files))
     log.info("Resolution  : %s, Contour: %s, Voxel: %.2f", resolution, contour, voxel_size)
+
+    # Step 0 之前的唯一 MRC 处理：把 nstart 折进 origin，使采样端与评分端同框。
+    # 必须晚于 _validate_inputs / os.makedirs（非法输入不建输出目录），早于 Step 1/2/3。
+    density_mrc = _normalize_density(density_mrc, output_dir)
 
     _t_standardize = time.perf_counter()
     # ---- Step 0: Standardize input structures ----
