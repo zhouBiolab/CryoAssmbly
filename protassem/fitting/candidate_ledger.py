@@ -1,6 +1,6 @@
 """候选台账（O6）：请求级、追加写、按稳定整数 ID 标识候选。
 
-协议（`ENGINEERING_HARDENING_PLAN.md` 附录 D.1）：
+协议（内部文档 ENGINEERING_HARDENING_PLAN.md 附录 D.1；（注：该文档仅在开发服务器保留，未随仓库发布））：
 
 - 每个请求一份 `<request_out>/candidates.jsonl`；每行一条**完整** JSON 记录（以换行结束）；
 - candidate 记录：`{"v","request_id","kind":"candidate","id","state","name","overlap","source","error","reason"}`；

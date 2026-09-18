@@ -1,6 +1,6 @@
 # protassem -- 蛋白质结构组装流水线
 
-English documentation: [README_EN.md](README_EN.md)
+**简体中文** | [English](README_EN.md)
 
 输入实验密度图 + 若干链的结构文件，自动完成 **体素化 -> 点云采样 -> PARENet 配准拟合 -> 统一队列组装 -> 精修**，
 输出组装好的复合物 CIF。
@@ -196,7 +196,7 @@ python main.py <data_dir> --no-domain-split A,B --log
 4. **域链合并**：所有域拟合完后，按残基序合并回链
 5. **复合物构建**：合并已接受的链/域链 → assembled_complex_all.cif（完整）+ assembled_complex.cif（域级过滤）
 
-详细算法见 [ALGORITHM.md](ALGORITHM.md)，架构细节见 [PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md)。
+详细算法见 [ALGORITHM.md](ALGORITHM.md)。
 
 ---
 
@@ -208,9 +208,7 @@ demo_reg/
 +-- compute_cc_mask.py               独立算 cc_mask
 +-- check_clash.py                   CA 重叠检测
 +-- geo_sym_refine.py                独立同源 refine CLI
-+-- geo_test.py                      对称 refine 评测
 +-- requirements.txt
-+-- PROJECT_ARCHITECTURE.md          架构与调用关系
 +-- ALGORITHM.md                     Step 3 组装算法详解
 |
 +-- protassem/
@@ -278,12 +276,6 @@ python compute_cc_mask.py <结构.pdb/cif> <密度.mrc> <分辨率> [contour]
 ```bash
 python geo_sym_refine.py <case_dir>
 python geo_sym_refine.py --complex a.cif --density b.mrc --resolution 3.5
-```
-
-### 对称 refine 评测
-```bash
-python geo_test.py <case_dir>
-python geo_test.py <case_dir> --after symmetrized.cif
 ```
 
 ### CA 重叠检测

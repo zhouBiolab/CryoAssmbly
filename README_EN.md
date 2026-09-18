@@ -1,6 +1,6 @@
 # protassem -- Protein Structure Assembly Pipeline
 
-中文说明：[README.md](README.md)
+**English** | [简体中文](README.md)
 
 Given an experimental density map and one or more chain structures, protassem
 performs voxelisation, point-cloud sampling, PARE-Net registration and fitting,
@@ -66,12 +66,16 @@ The PARE-Net checkpoint `epoch-18.pth.tar` is included under
 
 ### Quick test
 
+The repository does not ship with sample data (`example2` is not part of it).
+Point the entry point at any data directory containing a density map (`.mrc`),
+structure files (`.pdb`/`.cif`), `resolution.txt` and `contour_level.txt`:
+
 ```bash
 cd /xiangyux/claude_c_work/demo_reg
-python main.py example2 --log
+python main.py <data_dir> --log
 ```
 
-The output is written to `example2/output/`:
+The output is written to `<data_dir>/output/`:
 
 ```text
 example2/output/
@@ -209,8 +213,7 @@ gyration, with larger components considered first:
 5. Build both the complete accepted assembly and a component-filtered final
    complex.
 
-See [ALGORITHM.md](ALGORITHM.md) for the algorithm description and
-[PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md) for the software structure.
+See [ALGORITHM.md](ALGORITHM.md) for the algorithm description.
 
 ## Repository structure
 
@@ -220,10 +223,8 @@ demo_reg/
 |-- compute_cc_mask.py              standalone CC-mask calculation
 |-- check_clash.py                  CA-overlap detection
 |-- geo_sym_refine.py               homologous-chain refinement CLI
-|-- geo_test.py                     symmetric-refinement evaluation
 |-- requirements.txt
 |-- ALGORITHM.md
-|-- PROJECT_ARCHITECTURE.md
 |-- protassem/
     |-- pipeline.py                 top-level pipeline orchestration
     |-- core/                       shared structure and scoring utilities
@@ -259,13 +260,6 @@ Run homologous refinement independently:
 ```bash
 python geo_sym_refine.py <case_dir>
 python geo_sym_refine.py --complex a.cif --density b.mrc --resolution 3.5
-```
-
-Evaluate symmetric refinement:
-
-```bash
-python geo_test.py <case_dir>
-python geo_test.py <case_dir> --after symmetrized.cif
 ```
 
 Check CA overlap:

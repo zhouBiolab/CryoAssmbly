@@ -1,6 +1,6 @@
 """候选消费（O6）：批次成员由**固定 ID 区间**决定，与文件出现时机无关。
 
-规则（`ENGINEERING_HARDENING_PLAN.md` 附录 D.1.2）：
+规则（内部文档 ENGINEERING_HARDENING_PLAN.md 附录 D.1.2；（注：该文档仅在开发服务器保留，未随仓库发布））：
 
 1. 批次 = `[0, batch_size)`、`[batch_size, 2·batch_size)`…（`batch_size` 取 `--batch-size`）；
    **不得**用"本次轮询发现的文件集合"当批次；

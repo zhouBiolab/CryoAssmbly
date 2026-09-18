@@ -18,7 +18,6 @@ checkpoints/
 
 # 真实测试数据与运行产物（只入库生成器、输入清单与精简报告）
 test/
-tests/data/
 
 .vscode/
 .idea/
@@ -29,3 +28,26 @@ tests/data/
 build/
 dist/
 *.egg-info/
+
+# ---------------------------------------------------------------------------
+# 开发/测试资产：仅在开发服务器保留，不随仓库发布
+# ---------------------------------------------------------------------------
+tests/
+tools/
+protassem/sampling/extract_points/
+init_modeling.py
+geo_test.py
+
+# ---------------------------------------------------------------------------
+# 内部开发文档（任务卡/审计/架构台账）：不随仓库发布
+# 面向用户的文档是 README.md / README_EN.md / ALGORITHM.md
+# ---------------------------------------------------------------------------
+PROJECT_ARCHITECTURE.md
+ENGINEERING_HARDENING_PLAN.md
+INFERENCE_ENGINEERING_PLAN.md
+MASK_REGISTRATION_OPTIMIZATION_TASKS.md
+RUNTIME_ASSEMBLY_LOGIC_REVIEW.md
+STEP4_ASSEMBLY_NOTES.md
+TASK_INDEX.md
+SOURCE_POINT_CLOUD_EXACT_CACHE_TASKS.md
+组装算法逻辑.md
