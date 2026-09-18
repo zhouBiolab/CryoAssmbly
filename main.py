@@ -50,6 +50,11 @@ def build_parser():
                         help="并行进程数（CC 计算 / 局部优化）")
     parser.add_argument("--batch-size", type=int, default=8, metavar="N",
                         help="监控循环每攒多少 pred 做一次评估（每批立刻逐个局部优化）")
+    # PARENet 掩码参数：掩码半径 = 回转半径 × 该因子；最小点间距 = 掩码半径 × 该因子
+    parser.add_argument("--mask-radius-factor", type=float, default=1.35,
+                        metavar="F", help="PARENet 掩码半径因子（回转半径的倍数）")
+    parser.add_argument("--min-point-distance-factor", type=float, default=0.32,
+                        metavar="F", help="掩码内最小点间距因子（掩码半径的倍数）")
     parser.add_argument("--complex-domain-opt", action="store_true",
                         help="复合物域优化：拆内部链 -> 域分割 -> 逐域微调 -> 按链合并比较 CC")
     parser.add_argument("--no-improve-accepted", dest="improve_accepted",
@@ -114,6 +119,8 @@ def assembly_kwargs_from(args):
         "refine_tm": args.refine_tm,
         "num_processes": args.num_processes,
         "batch_size": args.batch_size,
+        "mask_radius_factor": args.mask_radius_factor,
+        "min_point_distance_factor": args.min_point_distance_factor,
         "homo_chain_refine": args.homo_chain_refine,
         "pre_screen": args.pre_screen,
         "pre_screen_by_domain": args.pre_screen_by_domain,

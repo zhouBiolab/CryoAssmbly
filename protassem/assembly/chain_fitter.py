@@ -85,6 +85,8 @@ def fit_chain_item(orch, rec, state):
         early_stop_threshold=base_threshold,
         original_density_mrc=orch.original_density_mrc,
         num_processes=orch.num_processes, batch_size=orch.batch_size,
+        mask_radius_factor=orch.mask_radius_factor,
+        min_point_distance_factor=orch.min_point_distance_factor,
         context=orch.context)
 
     if not fit_result["success"] or not fit_result.get("final_pdb"):

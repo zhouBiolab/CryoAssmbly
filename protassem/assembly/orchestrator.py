@@ -44,7 +44,9 @@ class AssemblyOrchestrator:
                  complex_threshold=0.35, complex_domain_opt=False,
                  improve_accepted=True, domain_opt=True,
                  save_all_attempts=False, cleanup=False, num_processes=1,
-                 batch_size=8, complex_min_cc=0.15, do_refine=True,
+                 batch_size=8, mask_radius_factor=1.35,
+                 min_point_distance_factor=0.32,
+                 complex_min_cc=0.15, do_refine=True,
                  refine_tm=0.75, homo_chain_refine=False,
                  no_domain_split_chains=frozenset(),
                  pre_screen=True, pre_screen_by_domain=False,
@@ -68,6 +70,8 @@ class AssemblyOrchestrator:
         self.do_cleanup = cleanup
         self.num_processes = num_processes
         self.batch_size = batch_size
+        self.mask_radius_factor = mask_radius_factor
+        self.min_point_distance_factor = min_point_distance_factor
         self.complex_min_cc = complex_min_cc
         self.do_refine = do_refine
         self.refine_tm = refine_tm
@@ -432,7 +436,6 @@ class AssemblyOrchestrator:
         if not self.chain_records:
             return
 
-        from multiprocessing import Pool
         from protassem.assembly.assembly_opt import ca_overlap, ca_count
 
         args_list = [
@@ -524,8 +527,6 @@ class AssemblyOrchestrator:
         A chain without any accepted domain remains pending and therefore follows
         the normal whole-chain fitting path.
         """
-        from multiprocessing import Pool
-
         domains = [
             drec for rec in self.chain_records
             for drec in self.domain_records.get(rec["chain_id"], [])

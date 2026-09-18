@@ -29,11 +29,6 @@ from protassem.fitting.parenet_client import start_request
 
 log = logging.getLogger(__name__)
 
-# process count for parallel CC / local-optimize copies (set by run_fitting)
-_NUM_PROCESSES = 1
-# how many new pred files to accumulate before a monitor evaluation (set by run_fitting)
-_BATCH_SIZE = 8
-
 # 局部优化的 CC 触发下限（链 / 域共用）。
 # 高分辨率密度图上轻微偏移就会让 CC 塌到很低，低初始 CC 的候选经局部优化仍可能
 # 达标；该下限只用来挡掉"完全没有信号"的退化候选，不是质量门槛。
@@ -66,7 +61,9 @@ DEMO_MASK_CWD = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 def run_fitting(target_txt, source, density_mrc, resolution, contour,
                 output_dir, mode="chain", chain_pdb=None,
                 early_stop_threshold=0.54, original_density_mrc=None,
-                num_processes=1, batch_size=8, context=None):
+                num_processes=1, batch_size=8,
+                mask_radius_factor=1.35, min_point_distance_factor=0.32,
+                context=None):
     """Unified entry point for chain and domain fitting.
 
     Args:
@@ -80,27 +77,33 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
         chain_pdb: parent chain PDB (required for domain mode)
         early_stop_threshold: optimized CC threshold for early stop
         original_density_mrc: original unmasked density map for final eval
-        metrics: 运行级 Metrics（P2）；None 时在本请求输出目录下自建
+        num_processes: worker count; only used when `context` is not given
+        batch_size: candidate ids per monitoring window
+        mask_radius_factor: PARENet mask radius as a scale of the gyration radius
+        min_point_distance_factor: PARENet minimum point spacing, in mask radii
 
     Returns:
         dict: success (bool), final_pdb (str|None), cc_mask (float)
     """
-    global _NUM_PROCESSES, _BATCH_SIZE
-    _NUM_PROCESSES = worker_count(num_processes)
-    _BATCH_SIZE = batch_size
     os.makedirs(output_dir, exist_ok=True)
     orig_mrc = original_density_mrc or density_mrc
     # P3：优先复用运行级共享池；独立调用 run_fitting 时自建并在返回前释放。
     owns_context = context is None
-    exec_context = context or ExecutionContext(pool_workers=_NUM_PROCESSES)
+    exec_context = context or ExecutionContext(
+        pool_workers=worker_count(num_processes))
     try:
         if mode == "chain":
             return _fit_chain(target_txt, source, density_mrc, resolution,
                               contour, output_dir, early_stop_threshold,
-                              orig_mrc, exec_context)
+                              orig_mrc, exec_context, batch_size=batch_size,
+                              mask_radius_factor=mask_radius_factor,
+                              min_point_distance_factor=min_point_distance_factor)
         return _fit_domain(target_txt, source, density_mrc, resolution,
                            contour, output_dir, chain_pdb,
-                           early_stop_threshold, orig_mrc, exec_context)
+                           early_stop_threshold, orig_mrc, exec_context,
+                           batch_size=batch_size,
+                           mask_radius_factor=mask_radius_factor,
+                           min_point_distance_factor=min_point_distance_factor)
     finally:
         if owns_context:
             exec_context.close()
@@ -111,7 +114,8 @@ def run_fitting(target_txt, source, density_mrc, resolution, contour,
 # ======================================================================
 
 def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
-               output_dir, stop_threshold, orig_mrc, context):
+               output_dir, stop_threshold, orig_mrc, context, *,
+               batch_size, mask_radius_factor, min_point_distance_factor):
     """Chain fitting: iterate over source files sorted by point count."""
     candidates = _analyze_source_files(source_dir)
     if not candidates:
@@ -135,7 +139,9 @@ def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
         result = _fit_single(
             target_txt, cand["file_path"], pdb_path, attempt_dir,
             density_mrc, resolution, contour, pdb_path,
-            cc_threshold, stop_threshold, orig_mrc, context)
+            cc_threshold, stop_threshold, orig_mrc, context,
+            batch_size=batch_size, mask_radius_factor=mask_radius_factor,
+            min_point_distance_factor=min_point_distance_factor)
 
         if result["success"]:
             final_pdb = _save_final_result(result, attempt_dir, pdb_path)
@@ -151,7 +157,8 @@ def _fit_chain(target_txt, source_dir, density_mrc, resolution, contour,
 # ======================================================================
 
 def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
-                output_dir, chain_pdb, stop_threshold, orig_mrc, context):
+                output_dir, chain_pdb, stop_threshold, orig_mrc, context, *,
+                batch_size, mask_radius_factor, min_point_distance_factor):
     """Domain fitting: single source file."""
     pdb_path = chain_pdb or _find_pdb_for_txt(source_txt, os.path.dirname(source_txt))
     if not pdb_path:
@@ -165,7 +172,9 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
     result = _fit_single(
         target_txt, source_txt, pdb_path, output_dir,
         density_mrc, resolution, contour, pdb_path,
-        cc_threshold, stop_threshold, orig_mrc, context)
+        cc_threshold, stop_threshold, orig_mrc, context,
+        batch_size=batch_size, mask_radius_factor=mask_radius_factor,
+        min_point_distance_factor=min_point_distance_factor)
 
     if result["success"]:
         final_pdb = _save_final_result(result, output_dir, pdb_path)
@@ -181,19 +190,22 @@ def _fit_domain(target_txt, source_txt, density_mrc, resolution, contour,
 
 def _fit_single(target_txt, source_txt, chain_pdb, output_dir,
                 density_mrc, resolution, contour, pdb_for_naming,
-                cc_threshold, stop_threshold, orig_mrc, context):
+                cc_threshold, stop_threshold, orig_mrc, context, *,
+                batch_size, mask_radius_factor, min_point_distance_factor):
     """Run PARENet + monitoring + optimization for one source file."""
     reg_dir = os.path.join(output_dir, "registration")
     temp_dir = os.path.join(output_dir, "temp_candidates")
     os.makedirs(reg_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
-    proc = _start_parenet(target_txt, source_txt, chain_pdb, reg_dir)
+    proc = _start_parenet(target_txt, source_txt, chain_pdb, reg_dir,
+                          mask_radius_factor=mask_radius_factor,
+                          min_point_distance_factor=min_point_distance_factor)
 
     monitor_result = _monitor_and_evaluate(
         reg_dir, density_mrc, resolution, contour,
         chain_pdb, cc_threshold, stop_threshold, temp_dir, proc,
-        context=context)
+        batch_size=batch_size, context=context)
 
     best = monitor_result.get("best_result")
     if best and best.get("success"):
@@ -201,13 +213,15 @@ def _fit_single(target_txt, source_txt, chain_pdb, output_dir,
     return {"success": False}
 
 
-def _start_parenet(target, source, chain_pdb, output_dir):
+def _start_parenet(target, source, chain_pdb, output_dir, *,
+                   mask_radius_factor, min_point_distance_factor):
     """Send a fitting request to the persistent PARENet server.
 
     Returns a request handle (poll()/terminate()) compatible with the monitor.
     推理路径由服务端配置（`parenet_client.configure_inference_mode`，来自 RuntimeConfig）；
     这里不额外覆盖。
     O6：为每个请求生成 `request_id`（任务 + 进程内序号），台账据此判定归属。
+    掩码参数来自 CLI（--mask-radius-factor / --min-point-distance-factor）。
     """
     global _REQUEST_SEQ
     task_id = os.path.basename(output_dir)
@@ -215,8 +229,8 @@ def _start_parenet(target, source, chain_pdb, output_dir):
     request_id = "%s-%d" % (task_id, _REQUEST_SEQ)
     return start_request(target, source, chain_pdb, output_dir,
                          use_mask=True, configs="all",
-                         mask_radius_factor=1.35,
-                         min_point_distance_factor=0.32,
+                         mask_radius_factor=mask_radius_factor,
+                         min_point_distance_factor=min_point_distance_factor,
                          request_id=request_id)
 
 
@@ -226,15 +240,13 @@ def _start_parenet(target, source, chain_pdb, output_dir):
 
 def _monitor_and_evaluate(reg_dir, density_mrc, resolution, contour,
                           chain_pdb, cc_threshold, stop_threshold,
-                          temp_dir, proc, batch_size=None, context=None):
+                          temp_dir, proc, *, batch_size, context=None):
     """按候选台账消费（O6）：固定 ID 区间批次 + 批内原策略 + 首个达标即早停。
 
     与旧实现的唯一区别是**候选顺序不再由文件出现时机决定**：
     批次成员 = `[0, batch_size)`、`[batch_size, 2·batch_size)`…（`end` 到达后处理末尾不足额批），
     批内仍按 (CC 降序, 候选 id) 逐个局部优化，第一个达到 `stop_threshold` 的候选触发早停。
     """
-    if batch_size is None:
-        batch_size = _BATCH_SIZE
     task_id = os.path.basename(os.path.dirname(reg_dir))
     all_results = []
     candidates = []

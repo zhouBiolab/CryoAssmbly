@@ -271,6 +271,8 @@ def start_request(target, source, chain_pdb, output_dir,
         request["request_id"] = str(request_id)
     server.stdin.write(json.dumps(request) + "\n")
     server.stdin.flush()
-    log.info("PARENet request: %s (request_id=%s)",
-             os.path.basename(str(source)), request_id)
+    log.info("PARENet request: %s (request_id=%s, mask_radius_factor=%.2f, "
+             "min_point_distance_factor=%.2f)",
+             os.path.basename(str(source)), request_id,
+             mask_radius_factor, min_point_distance_factor)
     return ParenetRequest(output_dir, request_id, server=server)
