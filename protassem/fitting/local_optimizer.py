@@ -1,17 +1,16 @@
 """Local rigid-body optimization for CC_mask maximization.
 
-Algorithm: coarse density gradient (6 copies) -> CC check -> scipy fallback -> fine -> check.
+Algorithm: multi-copy density gradient ascent (6 initial step sizes, parallel)
+-> CC check -> fine refinement -> revert if it drops. The selected result is
+compared against the unmodified input pose, so optimization can only improve.
 Uses core/ modules. No duplicates. Can be imported or run as CLI.
 """
-import os, sys, copy, shutil, logging, argparse, warnings
+import os, sys, shutil, logging, argparse, warnings
 import numpy as np
-from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 from scipy.ndimage import map_coordinates
 
-from protassem.core.scoring import calculate_cc_mask, read_mrc_full, _pearson
-from protassem.core.constants import atomic_number_dict, VDW_RADII
-from protassem.core.numba_kernels import add_gaussian_to_grid, add_sphere_mask
+from protassem.core.scoring import calculate_cc_mask, read_mrc_full
 from protassem.runtime.execution import ExecutionContext
 
 log = logging.getLogger(__name__)
@@ -100,12 +99,6 @@ class StructureData:
         c = self.get_coordinates()
         center = np.mean(c, axis=0)
         self.set_coordinates(np.dot(c - center, R.T) + center + t)
-
-    def copy(self):
-        s = StructureData.__new__(StructureData)
-        s.filepath = self.filepath
-        s.atoms = copy.deepcopy(self.atoms)
-        return s
 
     def write_pdb(self, path):
         with open(path, "w") as f:
@@ -284,81 +277,6 @@ class DensityFitter:
         return out
 
 
-class ScipyFitter:
-    """L-BFGS-B CC_mask optimizer (fallback when density method drops CC)."""
-
-    def __init__(self, structure, dmap, resolution):
-        self.structure = structure
-        self.dmap = dmap
-        self.best_cc = -np.inf
-        self.best_coords = None
-        sf = 1.0 / (np.pi * np.sqrt(2.0))
-        self.sigma_vox = np.array([resolution * sf / dmap.voxel_size[i] for i in range(3)])
-        self.norm = np.power(2 * np.pi, -1.5) * np.power(resolution * sf, -3)
-
-    def fit(self, max_iter=1500, num_copies=4):
-        orig = copy.deepcopy(self.structure.atoms)
-        best_cc, best_atoms = -np.inf, None
-        for _ in range(num_copies):
-            self.structure.atoms = copy.deepcopy(orig)
-            self.best_cc = -np.inf
-            self.best_coords = None
-            init = np.random.normal(0, 0.02, 6)
-            init[:3] *= 0.1
-            minimize(self._obj, init, method="L-BFGS-B",
-                     bounds=[(-np.pi / 4, np.pi / 4)] * 3 + [(-20, 20)] * 3,
-                     options={"maxiter": max_iter, "ftol": 5e-3,
-                              "gtol": 5e-2, "eps": 5e-3, "disp": False})
-            if self.best_cc > best_cc:
-                best_cc = self.best_cc
-                best_atoms = self.best_coords.copy() if self.best_coords is not None else None
-        self.structure.atoms = copy.deepcopy(orig)
-        if best_atoms is not None:
-            self.structure.set_coordinates(best_atoms)
-        return best_cc
-
-    def _obj(self, params):
-        coords = self.structure.get_coordinates()
-        center = np.mean(coords, axis=0)
-        R = Rotation.from_euler("xyz", params[:3]).as_matrix()
-        tc = np.dot(coords - center, R.T) + center + params[3:6]
-        cc = self._cc(tc)
-        if cc > self.best_cc:
-            self.best_cc = cc
-            self.best_coords = tc.copy()
-        return -cc
-
-    def _cc(self, coords):
-        origin, vs, shape = self.dmap.origin, self.dmap.voxel_size, self.dmap.shape
-        sim = np.zeros(shape, dtype=np.float32)
-        elems = [a.get("element", "C") or "C" for a in self.structure.atoms]
-        for c, e in zip(coords, elems):
-            add_gaussian_to_grid(sim, np.array(c, dtype=np.float64),
-                                 atomic_number_dict.get(e, 1.0),
-                                 origin, vs, self.sigma_vox, 5.0)
-        sim *= self.norm
-        mask = np.zeros(shape, dtype=np.bool_)
-        nz, ny, nx = shape
-        for c, e in zip(coords, elems):
-            r = VDW_RADII.get(e, 1.70) + 1.1
-            rsq = r * r
-            ic = (c[0] - origin[0]) / vs[0]
-            jc = (c[1] - origin[1]) / vs[1]
-            kc = (c[2] - origin[2]) / vs[2]
-            rv = [r / vs[d] for d in range(3)]
-            i0, i1 = max(0, int(ic - rv[0])), min(nx, int(ic + rv[0]) + 1)
-            j0, j1 = max(0, int(jc - rv[1])), min(ny, int(jc + rv[1]) + 1)
-            k0, k1 = max(0, int(kc - rv[2])), min(nz, int(kc + rv[2]) + 1)
-            if i0 < i1 and j0 < j1 and k0 < k1:
-                add_sphere_mask(mask, ic, jc, kc, vs[0], vs[1], vs[2],
-                                rsq, i0, i1, j0, j1, k0, k1)
-        n = np.count_nonzero(mask)
-        if n == 0:
-            return 0.0
-        return float(_pearson(self.dmap.data[mask].astype(np.float64),
-                              sim[mask].astype(np.float64)))
-
-
 def _density_copy_worker(arg):
     """Run one density-gradient copy in a worker process; returns cc/density/pdb."""
     (structure_file, density_mrc, contour, resolution,
@@ -381,11 +299,13 @@ def local_optimize(structure_file, density_mrc, output_file,
                    context=None):
     """Local optimization.
 
-    1. ALWAYS run multi-copy density gradient (parallel via `context` when it has >1 worker)
-    2. If best copy CC dropped vs initial -> also run scipy CC-objective opt
-    3. Select highest-CC candidate (original + copies + scipy)
-    4. Fine density optimization (fewer steps) on the selected best
-    5. Revert if fine drops
+    1. Run multi-copy density gradient (parallel via `context` when it has >1 worker)
+    2. Select highest-CC candidate (unmodified original + copies)
+    3. Fine density optimization (fewer steps) on the selected best
+    4. Revert if fine drops
+
+    优化只能改善、不得让结果更差：未改动的原始位姿始终是一等候选，
+    所以 6 条轨迹全部不如起点时会直接返回原结构。
 
     initial_cc: CC already computed during PARENet fitting (reuse, no recompute).
                 If None it is computed here.
@@ -423,24 +343,11 @@ def local_optimize(structure_file, density_mrc, output_file,
                        "source": "original"}]
         candidates.extend({"cc": r["cc"], "pdb": r["pdb"],
                            "source": "density"} for r in results)
-        best_density_cc = max(r["cc"] for r in results)
 
-        # ---- Step 2: density CC dropped -> scipy CC-objective opt (extra candidate) ----
-        if best_density_cc < initial_cc:
-            log.info("density best CC %.4f < initial %.4f -> scipy CC opt",
-                     best_density_cc, initial_cc)
-            s2 = StructureData(structure_file)
-            dmap2 = DensityMap(density_mrc, contour if contour else None)
-            scipy_cc = ScipyFitter(s2, dmap2, resolution).fit()
-            scipy_pdb = output_file + ".scipy.pdb"
-            s2.write_pdb(scipy_pdb)
-            candidates.append({"cc": scipy_cc, "pdb": scipy_pdb})
-            log.info("  scipy cc=%.4f", scipy_cc)
-
-        # ---- Step 3: select highest-CC candidate ----
+        # ---- 选 CC 最高的候选（含未改动的原始位姿）----
         best = max(candidates, key=lambda c: c["cc"])
 
-        # ---- Step 4: fine density optimization (fewer steps) on best ----
+        # ---- 精修：对选中的最佳候选做更少步数的密度优化 ----
         bs = StructureData(best["pdb"])
         dmap3 = DensityMap(density_mrc, contour if contour else None)
         DensityFitter(bs, dmap3).fit(max_iter=250, step_size=0.5)
@@ -449,7 +356,7 @@ def local_optimize(structure_file, density_mrc, output_file,
         fine_cc = calculate_cc_mask(density_mrc, fine_pdb, resolution, contour)
         log.info("fine: %.4f -> %.4f", best["cc"], fine_cc)
 
-        # ---- Step 5: revert if fine drops ----
+        # ---- 精修未改善则回退 ----
         if fine_cc >= best["cc"]:
             final_src, final_cc = fine_pdb, fine_cc
         else:
@@ -460,9 +367,8 @@ def local_optimize(structure_file, density_mrc, output_file,
         for r in results:
             if r["pdb"] and os.path.exists(r["pdb"]):
                 os.remove(r["pdb"])
-        for extra in (output_file + ".scipy.pdb", fine_pdb):
-            if os.path.exists(extra):
-                os.remove(extra)
+        if os.path.exists(fine_pdb):
+            os.remove(fine_pdb)
 
         log.info("local_optimize done: %.4f -> %.4f (%+.4f)",
                  initial_cc, final_cc, final_cc - initial_cc)

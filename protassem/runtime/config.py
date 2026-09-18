@@ -71,10 +71,11 @@ DEFAULT_TM_CACHE = "auto"
 def apply_seed(seed):
     """在**父进程**里固定随机源（老卡收口 / O6 复查项）。
 
-    父进程里唯一使用随机数的生产路径是局部优化的回退（`local_optimizer.ScipyFitter`
-    的随机重启初值）与临时目录名的装饰性随机；池内 worker 不用随机数。
-    不给父进程固定种子时，NumPy 全局 RNG 由操作系统熵初始化 → 回退路径一旦触发，
-    结果就与运行无关地漂移。这里用 `RuntimeConfig.seed` 固定它。
+    当前生产路径里的随机源：局部优化已不再使用随机数（ScipyFitter 回退已删除），
+    密度梯度副本与 CC 计算均为确定性；`fitting/utils.py` 的 numba 版 farthest-point
+    采样用硬编码起点；临时目录名有装饰性随机。
+    固定父进程种子仍是**确定性保证**的一部分：任何将来引入的父进程随机消费都会
+    因此可复现，而不是随运行漂移。这里用 `RuntimeConfig.seed` 固定它。
     """
     import random
     import numpy as np
