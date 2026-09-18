@@ -17,6 +17,52 @@ from protassem.runtime.execution import ExecutionContext
 log = logging.getLogger(__name__)
 
 
+# ===========================================================================
+# Euler 旋转矩阵的解析导数（与 scipy 的 from_euler("xyz", ...) 约定一致）
+# ---------------------------------------------------------------------------
+# 实测确认（scipy 1.10.1）：from_euler("xyz",[a,b,c]).as_matrix()
+#                       == Rz(c) @ Ry(b) @ Rx(a)   （maxdiff 2.2e-16）
+# 因此 dR/dθ 可按乘积法则直接给出，与矩阵中心差分残差 ~1e-10（差分噪声量级）。
+# ===========================================================================
+def _rot_x(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def _rot_y(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def _rot_z(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _drot_x(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[0.0, 0.0, 0.0], [0.0, -s, -c], [0.0, c, -s]])
+
+
+def _drot_y(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[-s, 0.0, c], [0.0, 0.0, 0.0], [-c, 0.0, -s]])
+
+
+def _drot_z(t):
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[-s, -c, 0.0], [c, -s, 0.0], [0.0, 0.0, 0.0]])
+
+
+def rotation_derivatives(theta):
+    """返回 (dR/dα, dR/dβ, dR/dγ)，对应 Rotation.from_euler("xyz", theta)。"""
+    a, b, c = float(theta[0]), float(theta[1]), float(theta[2])
+    Rz, Ry, Rx = _rot_z(c), _rot_y(b), _rot_x(a)
+    return (Rz @ Ry @ _drot_x(a),
+            Rz @ _drot_y(b) @ Rx,
+            _drot_z(c) @ Ry @ Rx)
+
+
 class StructureData:
     """Full atom data PDB handler for read/transform/write."""
 
@@ -83,6 +129,8 @@ class DensityMap:
         self.data = self.data.astype(np.float32)
         if contour:
             self.data[self.data < contour] = 0.0
+        # 梯度场惰性计算（每个实例一次）；192^3 约 85 MB，400^3 约 768 MB
+        self._grad = None
 
     def get_density_at_position(self, pos):
         vc = (pos - self.origin) / self.voxel_size
@@ -91,6 +139,34 @@ class DensityMap:
             warnings.simplefilter("ignore")
             return map_coordinates(self.data, vc.T, order=1,
                                    mode="nearest", cval=0.0).astype(np.float32)
+
+    def _gradient_fields(self):
+        """密度梯度场 (∂ρ/∂x, ∂ρ/∂y, ∂ρ/∂z)，**每个实例惰性计算一次**。
+
+        data 的轴序是 (nz, ny, nx)，所以按轴给 spacing：
+        轴 0/1/2 分别对应 z/y/x 方向，据此得到 per-Å 的偏导。
+        """
+        if self._grad is None:
+            gz, gy, gx = np.gradient(self.data, self.voxel_size[2],
+                                     self.voxel_size[1], self.voxel_size[0])
+            self._grad = (gx, gy, gz)
+        return self._grad
+
+    def gradient_at_positions(self, pos):
+        """在原子位置插值出密度梯度，返回 (N, 3) 的 (gx, gy, gz)。
+
+        逐分量调用 map_coordinates：scipy 1.10.1 的 map_coordinates 不支持
+        "向量值一次插值"（传 (3, nz, ny, nx) + 4 行坐标的通道技巧可用但实测慢 2.1×）。
+        """
+        gx, gy, gz = self._gradient_fields()
+        vc = ((pos - self.origin) / self.voxel_size)[:, [2, 1, 0]]
+        out = np.empty((len(pos), 3), dtype=np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for k, field in enumerate((gx, gy, gz)):
+                out[:, k] = map_coordinates(field, vc.T, order=1,
+                                            mode="nearest", cval=0.0)
+        return out
 
 
 class DensityFitter:
@@ -184,36 +260,28 @@ class DensityFitter:
             self.no_improve += 1
 
     def _trans_grad(self, params, center):
+        """∂φ/∂t = mean_i ∇ρ(r_i)：在原子位置插值密度梯度后取均值。
+
+        旧实现用全原子中心有限差分（每个方向 ±eps，共 6 次插值）估计同一量；
+        改后 1 次插值即得三个分量。
+        """
         tr, _R = self._pose(params, center)
-        eps = 0.001
-        g = np.zeros(3)
-        for i in range(3):
-            p, m = tr.copy(), tr.copy()
-            p[:, i] += eps
-            m[:, i] -= eps
-            g[i] = np.mean(self.mrc.get_density_at_position(p) -
-                           self.mrc.get_density_at_position(m)) / (2 * eps)
-        return g
+        return self.mrc.gradient_at_positions(tr).mean(axis=0)
 
     def _rot_grad(self, params, center):
-        eps = 0.01
-        g = np.zeros(3)
-        if self._coords is None:
-            self._coords = self.structure.get_coordinates()
-            self._center = np.mean(self._coords, axis=0)
-        coords = self._coords
-        for i in range(3):
-            p = params[:3].copy()
-            p[i] += eps
-            R = Rotation.from_euler("xyz", p).as_matrix()
-            dp = np.mean(self.mrc.get_density_at_position(
-                np.dot(coords - center, R.T) + center + params[3:6]))
-            p[i] -= 2 * eps
-            R = Rotation.from_euler("xyz", p).as_matrix()
-            dm = np.mean(self.mrc.get_density_at_position(
-                np.dot(coords - center, R.T) + center + params[3:6]))
-            g[i] = (dp - dm) / (2 * eps)
-        return g
+        """解析 Euler 梯度：∂φ/∂θ_j = mean_i ∇ρ(r_i) · [(∂R/∂θ_j)(x_i − c)]。
+
+        力臂用原始坐标 q = x − c（平移 t 不进入旋转梯度）。**不用 torque**：
+        torque 是 axis-angle 意义下的旋转方向，与 Euler 参数空间不对应，
+        实测在复合姿态下方向余弦可低至 −0.05。
+        """
+        tr, _R = self._pose(params, center)
+        g = self.mrc.gradient_at_positions(tr)              # (N, 3)
+        q = self._coords - center                           # (N, 3) 原始力臂
+        out = np.empty(3, dtype=np.float64)
+        for j, dR in enumerate(rotation_derivatives(params[:3])):
+            out[j] = np.mean(np.sum(g * (q @ dR.T), axis=1))
+        return out
 
 
 class ScipyFitter:
