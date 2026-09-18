@@ -116,9 +116,9 @@ fitting/pipeline.py。一次拟合 = PARENet 配准（GPU）+ 两阶段局部优
 
 ### 局部优化 local_optimize
 - 多副本并行（6 副本，multiprocessing.Pool）密度梯度上升
-- CC 下降则 ScipyFitter（L-BFGS-B）
-- 取最高再精细优化（250步），下降则回退
-- 返回 (success, output_path, final_cc)
+- 梯度用预计算密度梯度场 + 解析 Euler 链式法则（力臂 q=x−c，不用 torque）
+- 取 CC 最高者（未改动的原始位姿始终在候选集里）再精细优化（250步），下降则回退
+- 无 scipy 回退；返回 (success, output_path, final_cc)
 
 ---
 
@@ -398,7 +398,7 @@ DomainRoundTracker:
 - 开关 --homo-chain-refine（默认关）
 - 触发：同源链（Seq_ID 分组）且组内 cc 有分化（链 cc 差>chain_eps 0.02 + 域级确认）
 - **残基保护**：候选丢失 >10% 残基时自动跳过，防止不完整链替换完整链
-- 好链当模板：序列叠合搬到差链位姿 + 密度优化（local_optimize, num_processes=1 内层）
+- 好链当模板：序列叠合搬到差链位姿 + 密度优化（local_optimize，并行度由运行级共享池 context 决定）
 - clash 门控选最优，优于原链+eps 才替换。好链不动
 - **域补回**：clash 门控后检测同源组内残基覆盖差异，从完整链补回缺失域
   （序列叠合 → 合并缺失残基 → density 优化 → clash 门控，不卡 CC 下降）

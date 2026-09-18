@@ -141,7 +141,7 @@ GPU 利用率可通过每秒一次 nvidia-smi 可选采样；不存在时记录 
 
 ### 步骤 3：复用一个受控 CPU 池
 
-修改：用 ExecutionContext 的 map 接口替换 `_batch_cc()`、prefill_tm_cache、预筛与 local_optimize 中的临时池。worker 函数保持顶层可序列化；局部优化仍按当前六组 step_sizes 运行，候选选择顺序不变。
+修改：用 ExecutionContext 的 map 接口替换 `_batch_cc()`、prefill_tm_cache、预筛与 local_optimize 中的临时池。worker 函数保持顶层可序列化；局部优化仍按六组 step_sizes 运行（六组已保留），候选选择顺序不变。
 
 采用 spawn 上下文，避免从已经初始化 CUDA 的进程 fork。池惰性创建，整个 run_pipeline 内复用；standalone fitting 在自己的 with 中释放。pool worker 只完成单个 CC/TM/gradient copy，不调用会创建新池的 local_optimize。
 
@@ -157,7 +157,7 @@ GPU 利用率可通过每秒一次 nvidia-smi 可选采样；不存在时记录 
 
 缓存数组只读。local_optimizer.DensityMap 需要阈值修改时用独立数组，不能改共享原图。结构坐标缓存同样有容量限制和文件指纹；临时优化 PDB 会覆盖/删除，不能永久按文件名缓存。
 
-局部优化保留目前 ScipyFitter 的目标函数；它与最终 CC_mask 不完全相同，不得在“缓存重构”中偷偷统一评分公式。
+（历史条目）局部优化曾保留 ScipyFitter 的目标函数；该回退已按用户决定删除，现无第二套目标函数，梯度用预计算密度梯度场 + 解析 Euler 链式法则。
 
 预期：同一批候选只需每个 worker 读取一次当前密度，减少 I/O，CC 数值一致。
 
@@ -179,7 +179,7 @@ USalign 超时、非零返回、输出无法解析均不写合法分数；保留
 
 修改：首先显式 CandidateRecord，字段包括编号、path/pose、overlap、CC、mask_version、优化状态。保留当前实时 batch 选择、最终 CC top5 + hybrid top5 和第一个达标早停。
 
-把 max_iterations=2000、六个 step_sizes、fine_iterations=250、fine_step=0.5 等当前常量放入 LocalOptimizationConfig；Scipy 参数按真实代码提取，默认不改。
+把 max_iterations=2000、六个 step_sizes、fine_iterations=250、fine_step=0.5 等当前常量放入 LocalOptimizationConfig；（ScipyFitter 参数已随该回退一并删除，无需提取。）
 
 max_local_candidates、local_time_budget_s 默认 None。开启时在下一候选启动前检查预算；不强杀正在写结果的优化任务。输出注明 budget_exhausted，不能叫模型失败。候选级并行作为后续模式，不与六-copy 并行叠加。
 

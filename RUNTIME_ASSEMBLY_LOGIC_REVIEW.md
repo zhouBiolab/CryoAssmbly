@@ -202,12 +202,16 @@ P4 缓存只复用密度上下文/结构解析，不能被理解为复用所有�
 1. 有 initial_cc 则复用，否则计算原位姿 CC。
 2. 从同一输入创建 6 组密度梯度搜索，初始步长 `[1.25,3.0,3.5,4.5,5.5,6.0]`，默认最多 2000 步，使用共享池并行这些副本。
 3. DensityFitter 的目标是原子位置采样密度均值，交替估计平移/旋转梯度；无改善计数达到400、步长过小或迭代耗尽停止。不是每一步都算完整 CC_mask。
+   梯度来源：`DensityMap` 实例级惰性计算的**密度梯度场**（`np.gradient`）在原子位置插值（逐分量 `map_coordinates`，scipy 1.10.1 不支持向量值一次插值），再按**解析 Euler 链式法则**组合：`∂φ/∂t = mean(∇ρ)`、`∂φ/∂θ_j = mean(∇ρ·(∂R/∂θ_j)(x−c))`，力臂取原始坐标 `q = x−c`（平移不进旋转梯度）。**不使用 torque**——它是 axis-angle 语义，与 Euler 参数空间不对应，实测复合姿态下方向余弦可低至 −0.05。
+   术语：目标仍是 `mean(interp(ρ))` 而梯度用 `interp(np.gradient(ρ))`，`∇[interp(ρ)] ≠ interp[∇ρ]`，故只保证方向一致（实测各量级姿态方向余弦 1.000000），不声称逐位等价。
 4. 每个副本写结构并计算 CC，用 CC 选优，原始输入也保留为候选。
-5. 如果最好的密度梯度副本 CC 仍低于原始值，再运行 ScipyFitter：L-BFGS-B、4 次随机初始化、默认 maxiter=1500。
-6. 从原始/六副本/Scipy候选中选好者，再做250步、步长0.5的细密度优化。
+5. （已删除）原 ScipyFitter 回退不再存在：它用另一套目标函数，且每次 `_cc` 重建整张 sim map + mask（实测 0.087 s/次）、无解析 jac，`num_copies=4 × max_iter=1500` 最坏数小时，历史运行几乎从不触发。
+6. 从原始/六副本候选中选好者，再做250步、步长0.5的细密度优化。
 7. 细优化后重新计算标准 CC，低于选中候选则回退。
 
-**限定：** ScipyFitter 内部 CC 使用另一套 mask/数据预处理，不与标准 calculate_cc_mask 完全相同。因此代码“原始位姿始终参与选优”是事实，但所有候选完全同口径比较、最终标准 CC 必不下降，需要额外验证，不能只引用注释保证。
+**契约：** 因为未改动的原始位姿始终留在候选集里，`local_optimize` 的输出**不会比输入更差**；6 条轨迹全部不如起点时直接返回原始位姿。该契约由 `tests/test_local_optimizer.py::NoScipyFallbackTest` 锁定（构造"所有轨迹更差"场景，断言最终坐标与输入一致）。
+
+**P0 记账改造（严格等价）：** `DensityFitter._eval` 旧实现每次改进 `copy.deepcopy(atoms)` 两遍（实测 0.056 s/次 × 21 次 = 2.35 s，占 fit 约 76%）；改为只存 6 个位姿参数、`fit()` 结尾对原始坐标重放一次变换。等价性依据：`best_state` 本就是同一组 params 经同一变换作用在原始坐标上的结果，且 `_eval` 从不真正改变结构。
 
 逐域改善是另外一层：链接受前，将每个域对齐到链姿态后分别 local_optimize，合并域，再在原图上评估合并 CC；只有合并 CC>传入 original_cc 才替换整个链。不是无条件用拆域结果替换。
 
@@ -367,7 +371,7 @@ assembly_summary 在Step4/5之前生成，主要描述初始接受/域链组装�
 | 域阈值/平台期 | protassem/assembly/domain_fitter.py / fit_domain_once |
 | 轮末/clash | protassem/assembly/assembly_opt.py / select_round_end_candidate、ca_overlap |
 | PARENet/O6 | protassem/fitting/demo_mask.py、candidate_consumer.py、candidate_ledger.py、pipeline.py |
-| 局部优化 | protassem/fitting/local_optimizer.py / DensityFitter、ScipyFitter、local_optimize |
+| 局部优化 | protassem/fitting/local_optimizer.py / DensityFitter、DensityMap、local_optimize |
 | CC与TM | protassem/core/scoring.py、similarity.py |
 | 域拼接/复合物 | protassem/assembly/domain_assembler.py、complex_builder.py |
 | Step4门控/回填 | protassem/assembly/refine_step.py |

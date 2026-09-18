@@ -124,3 +124,28 @@ def make_chain_structure(path, chains, residues=10, rise=3.8,
 
 def _sh_quote(text):
     return "'" + text.replace("'", "'\\''") + "'"
+
+
+def make_gaussian_mrc(path, shape=(32, 32, 32), voxel_size=1.0, sigma=4.0,
+                      center=None, origin=(0.0, 0.0, 0.0), peak=1.0):
+    """Write a smooth 3-D Gaussian blob MRC and return its path.
+
+    为什么单独一个 fixture：`make_mrc` 写的是常数填充的方块，只有一圈面上有
+    梯度、方向性很差，无法用来验证梯度场/插值方向；平滑高斯团的梯度处处指向
+    峰心，是梯度类测试需要的形状。
+    """
+    if center is None:
+        center = tuple(s // 2 for s in shape)
+    zz, yy, xx = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]),
+                             np.arange(shape[2]), indexing="ij")
+    data = peak * np.exp(-(((zz - center[0]) ** 2 + (yy - center[1]) ** 2
+                            + (xx - center[2]) ** 2) / (2.0 * sigma * sigma)))
+    with mrcfile.new(path, overwrite=True) as mrc:
+        mrc.set_data(data.astype(np.float32))
+        mrc.voxel_size = (voxel_size, voxel_size, voxel_size)
+        mrc.header.origin.x = origin[0]
+        mrc.header.origin.y = origin[1]
+        mrc.header.origin.z = origin[2]
+        mrc.update_header_from_data()
+        mrc.update_header_stats()
+    return path
