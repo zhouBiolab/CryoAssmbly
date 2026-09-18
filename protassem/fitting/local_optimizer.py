@@ -6,6 +6,7 @@ compared against the unmodified input pose, so optimization can only improve.
 Uses core/ modules. No duplicates. Can be imported or run as CLI.
 """
 import os, sys, shutil, logging, argparse, warnings
+from functools import lru_cache
 import numpy as np
 from scipy.spatial.transform import Rotation
 from scipy.ndimage import map_coordinates
@@ -162,6 +163,33 @@ class DensityMap:
         return out
 
 
+# 每个进程保留的 DensityMap 上限。一次 local_optimize 会建 7 个实例
+# （6 个拷贝 worker + 父进程精修），每个都要重读整张图；梯度场随实例一起留下，
+# 所以第二次起连 np.gradient 也省掉。留 2 条是给"掩码前后换图"的切换瞬间做缓冲，
+# 避免新旧图交替时反复淘汰重载。上限按**进程**计，最坏 2 × (data + 3 个梯度场)。
+DENSITY_MAP_CACHE_SIZE = 2
+
+
+@lru_cache(maxsize=DENSITY_MAP_CACHE_SIZE)
+def _load_density_map(mrc_file, _size, _mtime_ns, contour):
+    """按文件指纹复用的 DensityMap（进程内 LRU）。
+
+    `_size` / `_mtime_ns` 只参与缓存 key：同名文件被覆盖时指纹变化，自然换新实例。
+    返回的实例在 fit 期间**只读**（fit 只改结构坐标），不得原地修改其 data。
+    """
+    return DensityMap(mrc_file, contour if contour else None)
+
+
+def _density_map(mrc_file, contour):
+    """取（可能命中缓存的）DensityMap；stat 失败时退回直接构造。"""
+    try:
+        stat = os.stat(str(mrc_file))
+    except OSError:
+        return DensityMap(mrc_file, contour if contour else None)
+    return _load_density_map(os.path.abspath(str(mrc_file)), stat.st_size,
+                             stat.st_mtime_ns, float(contour or 0.0))
+
+
 class DensityFitter:
     """Steepest ascent density gradient optimizer with adaptive step and early stop."""
 
@@ -283,7 +311,7 @@ def _density_copy_worker(arg):
      step_size, max_iter, out_pdb) = arg
     try:
         s = StructureData(structure_file)
-        dmap = DensityMap(density_mrc, contour if contour else None)
+        dmap = _density_map(density_mrc, contour)
         ds = DensityFitter(s, dmap).fit(max_iter=max_iter, step_size=step_size)
         s.write_pdb(out_pdb)
         cc = calculate_cc_mask(density_mrc, out_pdb, resolution, contour)
@@ -349,7 +377,7 @@ def local_optimize(structure_file, density_mrc, output_file,
 
         # ---- 精修：对选中的最佳候选做更少步数的密度优化 ----
         bs = StructureData(best["pdb"])
-        dmap3 = DensityMap(density_mrc, contour if contour else None)
+        dmap3 = _density_map(density_mrc, contour)
         DensityFitter(bs, dmap3).fit(max_iter=250, step_size=0.5)
         fine_pdb = output_file + ".fine.pdb"
         bs.write_pdb(fine_pdb)
