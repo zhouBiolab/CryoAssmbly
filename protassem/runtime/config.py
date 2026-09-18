@@ -60,7 +60,12 @@ def effective_allow_tf32(inference_mode, allow_tf32=None):
 
 # 评分缓存预算（MiB，老卡收口 P4）：密度上下文与结构坐标**共享**该预算，0 = 关闭。
 # 常量放在 runtime/config.py 以保持该模块"无重依赖"（P1 两段式导入）；worker 通过环境变量继承。
-DEFAULT_SCORE_CACHE_MB = 128
+#
+# 1024 的依据：预算要装得下**一张大图**才有意义——400^3 float32 的密度上下文计费
+# 约 244 MiB，128 MiB 下每一条都被 ByteLruCache 以 rejected_too_large 拒收，于是每次
+# CC 都重读整张图（实测 test/2：CC 调用 0.80 s → 命中后 0.23 s）。预算按**进程**计，
+# 多 worker 下总量按进程数放大（8 worker + 父进程 ≈ 9 GiB 上界），不要按单机空闲内存设。
+DEFAULT_SCORE_CACHE_MB = 1024
 SCORE_CACHE_ENV = "PROTASSEM_SCORE_CACHE_MB"
 
 # TM 缓存（SQLite，老卡收口 P5）："auto" = $XDG_CACHE_HOME/protassem/tm.sqlite3

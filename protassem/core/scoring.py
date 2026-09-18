@@ -7,8 +7,9 @@
   （不在这里做类型转换优化）。
 - `score_coords(context, coords, elements, resolution)` 是坐标数组入口；
   `calculate_cc_mask(...)` 保留原签名，退化为薄包装（读上下文 + 读结构 + 评分）。
-- 缓存：`score_cache_mb` 默认 **128 MiB / 进程**，密度上下文与结构坐标**共享**该预算；
-  0 = 关闭。缓存是**进程本地**的（worker 进程各自持有），多 worker 下总量按进程数放大。
+- 缓存：`score_cache_mb` 默认 **1024 MiB / 进程**（装得下一张 400^3 float32 图），
+  密度上下文与结构坐标**共享**该预算；0 = 关闭。缓存是**进程本地**的
+  （worker 进程各自持有），多 worker 下总量按进程数放大。
 - 失效：`(abspath, size, mtime_ns, contour, SCORING_VERSION)`；会被同名覆盖的动态密度必须
   显式给出 `density_version` 或调用 `invalidate_density()` —— mtime 不是版本契约。
 - 只读约定：缓存里的数组只读，需要修改时用 `.copy()`。
