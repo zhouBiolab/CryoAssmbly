@@ -33,9 +33,9 @@ def build_parser():
     parser.add_argument("--log-file", metavar="PATH",
                         help="指定日志文件路径（优先于 --log）")
     # 整链拟合接受阈值：链级 cc_mask >= 此值才作为整链直接接受
-    parser.add_argument("--chain-threshold", type=float, default=0.45, metavar="CC")
+    parser.add_argument("--chain-threshold", type=float, default=0.40, metavar="CC")
     # 结构域第 1 轮接受阈值（随轮次向 --domain-min-cc 衰减）
-    parser.add_argument("--domain-threshold", type=float, default=0.45, metavar="CC")
+    parser.add_argument("--domain-threshold", type=float, default=0.40, metavar="CC")
     # 结构域阈值下限/地板：轮次衰减与同源宽松后不低于此值
     parser.add_argument("--domain-min-cc", type=float, default=0.35, metavar="CC")
     # 多链复合物模板整体拟合的接受阈值（无复合物模板时不触发）
