@@ -96,14 +96,24 @@ fitting/pipeline.py。一次拟合 = PARENet 配准（GPU）+ 两阶段局部优
 - 主进程不初始化 CUDA -> fork 并行安全
 
 ### 触发与早停阈值
-- cc_threshold（触发局部优化）：链 0.29，域 0.28
+- cc_threshold（触发局部优化）= `LOCAL_OPT_CC_FLOOR`，链/域共用，固定 0.03
+  （只挡"完全没有信号"的退化候选；高分辨率图上轻微偏移就会让 CC 很低，
+  低初始 CC 的候选经局部优化仍可能达标，因此不是质量门槛）
 - stop_threshold（早停）= 当前接受阈值
+
+### 掩码参数
+- `mask_radius_factor`（默认 1.35）与 `min_point_distance_factor`（默认 0.32）
+  自 CLI（`--mask-radius-factor` / `--min-point-distance-factor`）逐层显式下传，
+  最终写入 PARENet 请求；请求日志会打印实际取值
 
 ### 阶段 1：批次监控 + 早停
 ```
-每攒够 batch_size 个新 pred -> 并行算 cc_mask（_batch_cc，multiprocessing.Pool）
-  -> 挑出 cc_mask > cc_threshold 的逐个局部优化
-  -> 某个优化后 cc >= stop_threshold -> 早停
+PARENet 侧把每个候选以 JSON 行写入候选台账 candidates.jsonl（含 state/CC/overlap）
+主进程按**固定 ID 区间**消费：批次 = [0, batch_size)、(batch_size, 2·batch_size)…
+  区间内全部 id 到达终态才触发（乱序完成不会触发小批；filtered/error 也占名额）
+  -> 批内并行算 cc_mask（_batch_cc -> context.map，运行级共享池）
+  -> 挑出 cc_mask > cc_threshold 的按 (CC 降序, id) 逐个局部优化
+  -> 某个优化后 cc >= stop_threshold -> 早停并取消 PARENet
 ```
 
 ### 阶段 2：最终策略
@@ -116,7 +126,7 @@ fitting/pipeline.py。一次拟合 = PARENet 配准（GPU）+ 两阶段局部优
 混合分数：cc_w * cc_mask + 1.0 * overlap（cc<0.2 时 cc_w=0.5）
 
 ### 局部优化 local_optimize
-- 多副本并行（6 副本，multiprocessing.Pool）密度梯度上升
+- 多副本并行（6 条步长轨迹，经运行级 `ExecutionContext` 共享池）密度梯度上升
 - 梯度用预计算密度梯度场 + 解析 Euler 链式法则（力臂 q=x−c，不用 torque）
 - 取 CC 最高者（未改动的原始位姿始终在候选集里）再精细优化（250步），下降则回退
 - 无 scipy 回退；返回 (success, output_path, final_cc)
@@ -425,7 +435,9 @@ DomainRoundTracker:
 | next_round_float | 0.015 | 下轮阈跟随 |
 | next_round_max_gap | 0.03 | 跟随下限 |
 | clash_overlap_thr | 0.10 | clash |
-| cc_threshold 链/域 | 0.29/0.28 | 触发局部优化 |
+| cc_threshold 链/域 | 0.03 | 触发局部优化（`LOCAL_OPT_CC_FLOOR`，共用） |
+| mask_radius_factor | 1.35 | PARENet 掩码半径因子（CLI 可调） |
+| min_point_distance_factor | 0.32 | 掩码内最小点间距因子（CLI 可调） |
 | 衰减(前3/后) | 0.015/0.020 | 域阈值每轮递减 |
 | 智能接受 | 0.015/3轮 | 平台期检测 |
 

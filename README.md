@@ -142,15 +142,17 @@ python main.py <density.mrc> <struct_dir> <resolution> <contour> [output_dir] --
 
 | Option | Default | Description |
 |---|---:|---|
-| `--chain-threshold` | 0.45 | Acceptance threshold for ordinary chains. |
+| `--chain-threshold` | 0.40 | Acceptance threshold for ordinary chains. |
 | `--complex-threshold` | 0.35 | Acceptance threshold for complexes. |
-| `--domain-threshold` | 0.45 | Initial threshold for domain fitting. |
+| `--domain-threshold` | 0.40 | Initial threshold for domain fitting. |
 | `--domain-min-cc` | 0.35 | Absolute lower bound for domain acceptance. |
 | `--complex-min-cc` | 0.25 | Final confidence filter for components in the assembled complex. |
 | `--similarity-threshold` | 0.85 | TM-score threshold for chain/domain similarity. |
 | `--refine-tm` | 0.75 | TM-score threshold for Step 4 homologous-domain grouping. |
-| `--num-processes` | 10 | Number of parallel processes for CC calculation and local optimisation. |
-| `--batch-size` | 10 | Number of predictions accumulated before monitoring evaluation. |
+| `--num-processes` | 8 | Number of parallel processes for CC calculation and local optimisation. |
+| `--batch-size` | 8 | Number of predictions accumulated before monitoring evaluation. |
+| `--mask-radius-factor` | 1.35 | PARENet mask radius as a scale of the gyration radius. |
+| `--min-point-distance-factor` | 0.32 | Minimum point spacing inside the mask, in mask radii. |
 
 ## Examples
 

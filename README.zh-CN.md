@@ -129,15 +129,17 @@ python main.py <density.mrc> <struct_dir> <resolution> <contour> [output_dir] --
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `--chain-threshold` | 0.45 | 普通链接受的 cc_mask 阈值 |
+| `--chain-threshold` | 0.40 | 普通链接受的 cc_mask 阈值 |
 | `--complex-threshold` | 0.35 | 复合物接受的 cc_mask 阈值（独立于链阈值，因复合物 CC 天然偏低） |
-| `--domain-threshold` | 0.45 | 域接受的起始 cc_mask 阈值（每条链的域独立衰减） |
+| `--domain-threshold` | 0.40 | 域接受的起始 cc_mask 阈值（每条链的域独立衰减） |
 | `--domain-min-cc` | 0.35 | 域拟合绝对阈值：衰减下限 + 多域同接门槛（拟合阶段低于此值不接受） |
 | `--complex-min-cc` | 0.25 | 收尾高置信度筛选：cc<此值的组件不进最终复合物（与拟合阶段无关） |
 | `--similarity-threshold` | 0.85 | 链/域间 TM-score 相似判定阈值 |
 | `--refine-tm` | 0.75 | Step 4 同源域分组的 TM-score 阈值 |
-| `--num-processes` | 10 | 并行进程数（CC 计算 / 局部优化） |
-| `--batch-size` | 10 | 监控循环每攒多少 pred 做一次评估 |
+| `--num-processes` | 8 | 并行进程数（CC 计算 / 局部优化） |
+| `--batch-size` | 8 | 监控循环每攒多少 pred 做一次评估 |
+| `--mask-radius-factor` | 1.35 | PARENet 掩码半径因子（掩码半径 = 回转半径 × 该因子） |
+| `--min-point-distance-factor` | 0.32 | 掩码内最小点间距因子（最小点间距 = 掩码半径 × 该因子） |
 
 #### 使用示例
 
