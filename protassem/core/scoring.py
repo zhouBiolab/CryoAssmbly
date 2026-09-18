@@ -114,40 +114,68 @@ def _make_sim_map(origin, voxel_size, box_size, coords, elements, resolution):
 
 def _make_phenix_mask(origin, voxel_size, box_size, coords, elements,
                       solvent_radius=1.1, mask_radius=2.0, resolution=None):
-    mask = np.zeros(box_size, dtype=np.bool_)
-    nz, ny, nx = mask.shape
+    """原子球体掩码：球体 splat -> EDT 膨胀 -> 高斯软化 -> 0.5 阈值。
 
+    只在**原子包围盒 ⊕ padding** 的子体积上做 EDT 与高斯卷积，再贴回全图：
+    这两个全图操作占本函数耗时的 99%，而原子包围盒通常只占全图很小一部分
+    （实测 400³ 图上某拟合位姿为 0.5% 体积）。padding 取
+    ``mask_radius + 5σ + 2 voxel``（σ = resolution/4）：EDT 只需覆盖 mask_radius
+    的膨胀范围，高斯核半宽为 4σ，5σ + 2 留余量。
+
+    子体积之外 ``expanded`` 恒为 0（膨胀范围已被 padding 覆盖），与
+    ``mode="constant", cval=0.0`` 的假设一致，故与全图实现逐点相同 ——
+    等价性由 tests/test_phenix_mask_crop.py 用独立的全图参考实现锁定。
+
+    没有任何原子落在网格内时返回全 False，``score_coords`` 据此返回 CC 0.0。
+    （旧实现在该情形下会把 ``distance_transform_edt`` 对"无背景输入"的未定义
+    输出当成地图用，在网格中部选出一片无意义区域。）
+    """
+    nz, ny, nx = box_size
+    vs = [float(voxel_size[i]) for i in range(3)]
+    grid = [nx, ny, nz]
+
+    # 第一遍：每个原子球体的网格包围盒（公式与夹取规则同旧实现）
+    boxes = []
     for coord, elem in zip(coords, elements):
-        r_vdw = VDW_RADII.get(elem, 1.70)
-        radius = r_vdw + solvent_radius
-        radius_sq = radius * radius
-        ic = (coord[0] - origin[0]) / voxel_size[0]
-        jc = (coord[1] - origin[1]) / voxel_size[1]
-        kc = (coord[2] - origin[2]) / voxel_size[2]
-        rv = np.array([radius / voxel_size[i] for i in range(3)])
-        i0 = max(0, int(np.floor(ic - rv[0])))
-        i1 = min(nx, int(np.ceil(ic + rv[0])) + 1)
-        j0 = max(0, int(np.floor(jc - rv[1])))
-        j1 = min(ny, int(np.ceil(jc + rv[1])) + 1)
-        k0 = max(0, int(np.floor(kc - rv[2])))
-        k1 = min(nz, int(np.ceil(kc + rv[2])) + 1)
-        if i0 >= i1 or j0 >= j1 or k0 >= k1:
+        radius = VDW_RADII.get(elem, 1.70) + solvent_radius
+        c = [(coord[i] - origin[i]) / vs[i] for i in range(3)]
+        rv = [radius / vs[i] for i in range(3)]
+        idx = [(max(0, int(np.floor(c[i] - rv[i]))),
+                min(grid[i], int(np.ceil(c[i] + rv[i])) + 1)) for i in range(3)]
+        if any(a >= b for a, b in idx):
             continue
-        add_sphere_mask(mask, ic, jc, kc,
-                        voxel_size[0], voxel_size[1], voxel_size[2],
-                        radius_sq, i0, i1, j0, j1, k0, k1)
+        boxes.append((c, radius * radius, idx))
 
-    avg_vs = np.mean(voxel_size)
-    dist = distance_transform_edt(~mask) * avg_vs
-    expanded = (dist <= mask_radius) | mask
+    if not boxes:
+        return np.zeros(box_size, dtype=np.bool_)
 
     sigma = (resolution / 4.0) if resolution else 1.0
-    sigma_vox = np.array([sigma / voxel_size[i] for i in range(3)])
+    sigma_vox = np.array([sigma / vs[i] for i in range(3)])
+    pad = np.ceil(np.array([mask_radius / vs[i] for i in range(3)])
+                  + 5.0 * sigma_vox + 2.0).astype(int)
+    lo = np.maximum([min(b[2][i][0] for b in boxes) for i in range(3)] - pad, 0)
+    hi = np.minimum([max(b[2][i][1] for b in boxes) for i in range(3)] + pad,
+                    grid)
+
+    # 第二遍：把球体 splat 进子体积（网格坐标整体平移 lo）
+    sub = np.zeros((hi[2] - lo[2], hi[1] - lo[1], hi[0] - lo[0]), dtype=np.bool_)
+    for c, radius_sq, idx in boxes:
+        (i0, i1), (j0, j1), (k0, k1) = idx
+        add_sphere_mask(sub, c[0] - lo[0], c[1] - lo[1], c[2] - lo[2],
+                        vs[0], vs[1], vs[2], radius_sq,
+                        i0 - lo[0], i1 - lo[0], j0 - lo[1], j1 - lo[1],
+                        k0 - lo[2], k1 - lo[2])
+
+    avg_vs = float(np.mean(voxel_size))
+    dist = distance_transform_edt(~sub) * avg_vs
+    expanded = (dist <= mask_radius) | sub
     soft = gaussian_filter(expanded.astype(np.float32), sigma=sigma_vox,
                            mode="constant", cval=0.0)
     if soft.max() > 0:
         soft /= soft.max()
-    return soft > 0.5
+    out = np.zeros(box_size, dtype=np.bool_)
+    out[lo[2]:hi[2], lo[1]:hi[1], lo[0]:hi[0]] = soft > 0.5
+    return out
 
 
 class DensityMapContext:
