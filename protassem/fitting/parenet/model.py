@@ -541,7 +541,7 @@ class PARE_Net(nn.Module):
     # ==================================================================
     # 上面 forward() 是**兼容对照实现**（联合布局、原样保留，训练入口仍走它）；
     # 下面两个方法把同一条推理链路拆成"与本侧几何有关"和"依赖两侧交互"两段。
-    # 两者的数值等价性由 tools/check_encoding_split.py 逐层校验（统一验收容差
+    # 两者的数值等价性由 tools/check_encoding_split.py 逐层校验（仅开发服务器保留；统一验收容差
     # 特征 atol=1e-6 / rtol=1e-5；位姿与候选身份要求一致）。
 
     def encode_cloud(self, geometry, scale):

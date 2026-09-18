@@ -1,19 +1,21 @@
-# protassem -- 蛋白质结构组装流水线
+# protassem -- Protein Structure Assembly Pipeline
 
-**简体中文** | [English](README_EN.md)
+**English** | [简体中文](README.zh-CN.md)
 
-输入实验密度图 + 若干链的结构文件，自动完成 **体素化 -> 点云采样 -> PARENet 配准拟合 -> 统一队列组装 -> 精修**，
-输出组装好的复合物 CIF。
+Given an experimental density map and one or more chain structures, protassem
+performs voxelisation, point-cloud sampling, PARE-Net registration and fitting,
+unified-queue assembly, and refinement. The final output is an assembled
+macromolecular complex in CIF format.
 
+```text
+density map (.mrc) + chain structures (.pdb/.cif)
+    -> voxelisation -> point sampling -> fitting and assembly -> refinement
+    -> assembled complex (.cif)
 ```
-密度图(.mrc) + 链结构(.pdb/.cif)  ->  [体素化] -> [采样] -> [统一队列拟合+组装] -> [精修]  ->  复合物(.cif)
-```
 
----
+## Requirements
 
-## 一、环境依赖
-
-### 1. Python 包
+### Python environment
 
 ```bash
 conda create -n point python=3.8
@@ -21,10 +23,11 @@ conda activate point
 pip install -r requirements.txt
 ```
 
-### 2. pareconv（关键依赖，源码随仓库附带，需本机编译）
+### pareconv
 
-PARENet 推理依赖 pareconv 包（含 CUDA 编译扩展），源码已随仓库放在
-protassem/fitting/pareconv_src/：
+PARE-Net inference depends on `pareconv`, including its CUDA extensions. The
+source is included under `protassem/fitting/pareconv_src/` and must be compiled
+on the target machine:
 
 ```bash
 cd protassem/fitting/pareconv_src
@@ -33,11 +36,19 @@ cd pareconv/extensions/pointops/
 python setup.py install
 ```
 
-编译前提：已装好 torch（如 1.10.0+cu113）+ nvcc + gcc/g++。
+Compilation requires a compatible PyTorch installation (for example,
+PyTorch 1.10.0 with CUDA 11.3), `nvcc`, and `gcc/g++`.
 
-验证：python -c "import torch; import pointops_cuda; from pareconv.modules.ops import index_select; print('OK')"
+Verify the installation with:
 
-### 3. 可执行文件（项目已内置，首次使用需赋权）
+```bash
+python -c "import torch; import pointops_cuda; from pareconv.modules.ops import index_select; print('OK')"
+```
+
+### Bundled executables
+
+The repository includes the executables used by the pipeline. Grant execute
+permission once on Linux:
 
 ```bash
 chmod +x protassem/core/USalign
@@ -46,120 +57,124 @@ chmod +x protassem/assembly/domain_parser/domainparser2.LINUX
 chmod +x protassem/assembly/domain_parser/dssp
 ```
 
-### 4. 模型权重（已内置）
+### Model weights
 
-PARENet 权重 epoch-18.pth.tar（6.6MB）已放在 protassem/fitting/parenet/weights/。
+The PARE-Net checkpoint `epoch-18.pth.tar` is included under
+`protassem/fitting/parenet/weights/`.
 
----
+## Running the pipeline
 
-## 二、运行
+### Quick test
 
-### 快速测试
-
-仓库不含示例数据（`example2` 不在仓库内），请用任意数据目录，目录内需包含
-密度图 `.mrc`、结构文件 `.pdb`/`.cif`、`resolution.txt`、`contour_level.txt`：
+The repository does not ship with sample data (`example2` is not part of it).
+Point the entry point at any data directory containing a density map (`.mrc`),
+structure files (`.pdb`/`.cif`), `resolution.txt` and `contour_level.txt`:
 
 ```bash
-cd <项目根目录>
-python main.py <case_dir> --log
+cd /xiangyux/claude_c_work/demo_reg
+python main.py <data_dir> --log
 ```
 
-结果在 `<case_dir>/output/`（手动模式可指定独立输出目录）：
+The output is written to `<data_dir>/output/`:
 
-```
+```text
 example2/output/
-+-- pipeline_<时间戳>.log
++-- pipeline_<timestamp>.log
 +-- voxelized/
-+-- sampled/  sampled_sources/
++-- sampled/
++-- sampled_sources/
 +-- assembly/
     +-- final_results/
-    |   +-- assembled_complex.cif      最终复合物（过滤版，按 complex_min_cc 逐结构域剔除 cc 低的域）
-    |   +-- assembled_complex_all.cif  完整版（含全部已接受域，不过滤）
-    |   +-- refined_complex.cif        Step4 精修（若触发）
-    |   +-- assembly_summary.txt       摘要
-    |   +-- chains/                    链结果
-    |   +-- domain_chains/             域组装结果
-    +-- work/                          中间过程文件
+    |   +-- assembled_complex.cif       filtered final complex
+    |   +-- assembled_complex_all.cif   complete accepted assembly
+    |   +-- refined_complex.cif         Step 4 result, when triggered
+    |   +-- assembly_summary.txt
+    |   +-- chains/
+    |   +-- domain_chains/
+    +-- work/                           intermediate files
 ```
 
-### 自动模式
+### Automatic mode
 
-数据目录下放：密度图 .mrc、结构文件 .pdb/.cif、resolution.txt、contour_level.txt
+Place the following files in a data directory:
 
-> **自动标准化**：程序自动读取结构文件内部的 chain ID（不依赖文件名），
-> 多链复合物自动保留为复合物（chain_id="A+B"形式）。文件名可以任意命名。
-> **链号去重**：若各输入（含复合物内部链）链号有重复，自动重排为唯一链号
-> （保留首次出现，冲突者顺延到下一空闲号：A–Z、a–z、然后两字母 AA…ZZ），并以 CIF 写出。
-> 链号用到两字母（总链数 > 52）时全程以 CIF 处理（PDB 单字符列存不下）。
+- density maps in `.mrc` format;
+- chain structures in `.pdb` or `.cif` format;
+- `resolution.txt`;
+- `contour_level.txt`.
+
+Run:
 
 ```bash
 python main.py <data_dir> --log
 ```
 
-### 手动模式
+The pipeline reads chain identifiers from the structure contents rather than
+from filenames. Multichain inputs are preserved as complexes. Duplicate chain
+identifiers are automatically remapped to unique identifiers. CIF output is
+used when more than 52 chain identifiers are required.
+
+### Manual mode
 
 ```bash
 python main.py <density.mrc> <struct_dir> <resolution> <contour> [output_dir] --log
 ```
 
-选项可以放在位置参数之前、之间或之后。用法错误（未知选项、选项缺值、非数字、位置参数
-个数不是 1/4/5）退出码为 2，并打印具体原因。入口校验在建立输出目录之前完成：密度图必须
-存在且为 `.mrc`、结构文件列表非空且文件都存在、`resolution > 0`、`contour` 为有限数值、
-`voxel_size > 0`（`contour` 不接受缺省，自动目录模式仍从 `contour_level.txt` 读取）。
+## Command-line options
 
-### 参数说明
+### Switches
 
-#### 开关参数（加上=开启，不加=关闭）
+| Option | Default | Description |
+|---|---:|---|
+| `--log` | off | Write a timestamped pipeline log to the output directory. |
+| `--log-file <path>` | none | Write the log to an explicit path. |
+| `--no-improve-accepted` | off | Disable per-domain local refinement after a chain is accepted. |
+| `--no-domain-opt` | off | Disable domain-optimisation fallback for chains that do not pass the chain threshold. |
+| `--complex-domain-opt` | off | Split complex inputs into chains, fit domains, and compare merged chain results. |
+| `--homo-chain-refine` | off | Enable Step 5 homologous-chain refinement. |
+| `--no-pre-screen` | off | Disable the pre-assembly parallel screening of the original poses. |
+| `--save-all-attempts` | off | Save every fitting attempt for debugging. |
+| `--cleanup` | off | Remove temporary `work/` directories after completion. |
+| `--no-domain-split <ids>` | none | Keep selected chain IDs intact, for example `--no-domain-split A,B`. |
+| `--no-refine` | off | Disable Step 4 homologous-domain refinement. |
 
-| 参数 | 默认 | 含义 |
-|------|------|------|
-| `--log` | 关 | 写日志文件到输出目录（pipeline_<时间戳>.log） |
-| `--log-file <path>` | 无 | 指定日志文件路径（覆盖 `--log` 的自动命名） |
-| `--no-improve-accepted` | — | 加上=**关闭**逐域微调；不加=默认**开启**（链接受后逐域优化取更高 CC） |
-| `--no-domain-opt` | — | 加上=**关闭**域优化兜底；不加=默认**开启**（链没达标时用链姿态降域，把达标的域接受；与逐域微调解耦） |
-| `--complex-domain-opt` | 关 | 复合物域优化：拆内部链→各自域分割→接受后逐域微调→按链合并比较 CC |
-| `--homo-chain-refine` | 关 | Step 5 同源链精修：残基保护 + 域补回 + 用好链模板修复差链 |
-| `--no-pre-screen` | — | 加上=**关闭**装配前原始位姿并行预筛；不加=默认**开启** |
-| `--save-all-attempts` | 关 | 保存所有拟合尝试到 all_attempts/（调试用） |
-| `--cleanup` | 关 | 完成后删除 work/ 下的临时目录 |
-| `--no-domain-split <ids>` | 无 | 指定不拆域的链 ID（逗号分隔，如 `--no-domain-split A,B`），这些链只能作为整链拟合 |
-| `--no-refine` | — | 加上=**关闭** Step 4 同源域精修；不加=Step 4 默认**开启** |
+### Numeric parameters
 
-#### 数值参数（后跟一个数字）
+| Option | Default | Description |
+|---|---:|---|
+| `--chain-threshold` | 0.45 | Acceptance threshold for ordinary chains. |
+| `--complex-threshold` | 0.35 | Acceptance threshold for complexes. |
+| `--domain-threshold` | 0.45 | Initial threshold for domain fitting. |
+| `--domain-min-cc` | 0.35 | Absolute lower bound for domain acceptance. |
+| `--complex-min-cc` | 0.25 | Final confidence filter for components in the assembled complex. |
+| `--similarity-threshold` | 0.85 | TM-score threshold for chain/domain similarity. |
+| `--refine-tm` | 0.75 | TM-score threshold for Step 4 homologous-domain grouping. |
+| `--num-processes` | 10 | Number of parallel processes for CC calculation and local optimisation. |
+| `--batch-size` | 10 | Number of predictions accumulated before monitoring evaluation. |
 
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `--chain-threshold` | 0.45 | 普通链接受的 cc_mask 阈值 |
-| `--complex-threshold` | 0.35 | 复合物接受的 cc_mask 阈值（独立于链阈值，因复合物 CC 天然偏低） |
-| `--domain-threshold` | 0.45 | 域接受的起始 cc_mask 阈值（每条链的域独立衰减） |
-| `--domain-min-cc` | 0.35 | 域拟合绝对阈值：衰减下限 + 多域同接门槛（拟合阶段低于此值不接受） |
-| `--complex-min-cc` | 0.25 | 收尾高置信度筛选：cc<此值的组件不进最终复合物（与拟合阶段无关） |
-| `--similarity-threshold` | 0.85 | 链/域间 TM-score 相似判定阈值 |
-| `--refine-tm` | 0.75 | Step 4 同源域分组的 TM-score 阈值 |
-| `--num-processes` | 10 | 并行进程数（CC 计算 / 局部优化） |
-| `--batch-size` | 10 | 监控循环每攒多少 pred 做一次评估 |
+## Examples
 
-#### 使用示例
-
-最简运行（全部默认）：
+Run with default settings:
 
 ```bash
 python main.py example2
 ```
 
-推荐生产配置（开日志 + 同源精修）：
+Recommended production configuration:
 
 ```bash
 python main.py <data_dir> --log --homo-chain-refine
 ```
 
-含复合物的数据（降低复合物阈值 + 复合物域优化）：
+For complex inputs:
 
 ```bash
-python main.py <data_dir> --log --complex-threshold 0.35 --complex-domain-opt
+python main.py <data_dir> --log \
+  --complex-threshold 0.35 \
+  --complex-domain-opt
 ```
 
-全开 + 自定义阈值：
+Enable all major refinement options:
 
 ```bash
 python main.py <data_dir> \
@@ -172,113 +187,84 @@ python main.py <data_dir> \
   --num-processes 16
 ```
 
-只做拟合+组装，关闭 Step 4 精修：
+Run fitting and assembly without Step 4 refinement:
 
 ```bash
 python main.py <data_dir> --no-refine --log
 ```
 
-指定部分链不做域分割（只能整链拟合）：
+Keep selected chains intact during domain splitting:
 
 ```bash
 python main.py <data_dir> --no-domain-split A,B --log
 ```
 
----
+## Assembly strategy
 
-## 三、组装策略简述
+Chains and domains are processed in a unified queue ordered by radius of
+gyration, with larger components considered first:
 
-组装采用**统一队列**：链和域按回旋半径（大优先）排入同一个队列。
+1. Fit a chain with PARE-Net, perform local optimisation, and accept it when
+   the CC threshold is reached.
+2. If a chain fails, add its domains immediately to the same queue.
+3. Fit domains using independent thresholds and round management for each
+   chain.
+4. Merge fitted domains back into chains according to residue order.
+5. Build both the complete accepted assembly and a component-filtered final
+   complex.
 
-1. **链拟合**：PARENet 配准 → 局部优化 → CC 达阈值则接受并 mask 密度
-2. **链失败**：该链的域**立即加入队列**，与剩余链/域按回旋半径混排
-3. **域拟合**：每条链的域有独立的阈值和轮次管理
-4. **域链合并**：所有域拟合完后，按残基序合并回链
-5. **复合物构建**：合并已接受的链/域链 → assembled_complex_all.cif（完整）+ assembled_complex.cif（域级过滤）
+See [ALGORITHM.md](ALGORITHM.md) for the algorithm description.
 
-详细算法见 [ALGORITHM.md](ALGORITHM.md)。
+## Repository structure
 
----
-
-## 四、项目结构
-
-```
+```text
 demo_reg/
-+-- main.py                          入口（参数解析）
-+-- compute_cc_mask.py               独立算 cc_mask
-+-- check_clash.py                   CA 重叠检测
-+-- geo_sym_refine.py                独立同源 refine CLI
-+-- requirements.txt
-+-- ALGORITHM.md                     Step 3 组装算法详解
-|
-+-- protassem/
-    +-- pipeline.py                  三步流水线总调度
-    +-- core/                        共享工具
-    |   +-- scoring.py               cc_mask（numba）
-    |   +-- structure.py             PDB/CIF 读写/对齐
-    |   +-- similarity.py            USalign 封装（TM-score、Seq_ID）
-    |   +-- numba_kernels.py         numba 核函数
-    |   +-- constants.py / io.py
-    |   +-- USalign                  (可执行文件)
-    +-- voxelize/                    步骤1：体素化
-    +-- sampling/                    步骤2：采样
-    |   +-- Sample                   (可执行文件)
-    +-- fitting/                     步骤3a：拟合
-    |   +-- pipeline.py              统一拟合入口（两阶段+监控+多进程CC）
-    |   +-- parenet_client.py        PARENet 常驻服务客户端
-    |   +-- demo_mask.py             PARENet 推理引擎
-    |   +-- local_optimizer.py       局部优化
-    |   +-- masker.py                掩膜
-    |   +-- sw_mask.py / utils.py
-    |   +-- parenet/                 PARENet 模型+权重
-    |   +-- pareconv_src/            pareconv 源码
-    +-- assembly/                    步骤3b：组装
-        +-- orchestrator.py          组装总入口（准备+域分割+复合物域优化+收尾）
-        +-- unified_queue.py         统一队列调度器
-        +-- chain_fitter.py          链/复合物拟合逻辑
-        +-- domain_fitter.py         域拟合+轮次管理
-        +-- domain_assembler.py      域链合并
-        +-- assembly_opt.py          优化辅助（参数集中+多域同接+clash）
-        +-- complex_builder.py       复合物拼接+报告
-        +-- domain_splitter.py       域分割
-        +-- domain_parser/           DomainParser(可执行文件)
-        +-- refine_step.py           Step4 同源域精修
-        +-- homo_chain_step.py       Step5 同源链精修 门控
-        +-- homo_chain_refine.py     Step5 同源链精修 核心
-        +-- refine/                  vendored 同源域枚举
+|-- main.py                         command-line entry point
+|-- compute_cc_mask.py              standalone CC-mask calculation
+|-- check_clash.py                  CA-overlap detection
+|-- geo_sym_refine.py               homologous-chain refinement CLI
+|-- requirements.txt
+|-- ALGORITHM.md
+|-- protassem/
+    |-- pipeline.py                 top-level pipeline orchestration
+    |-- core/                       shared structure and scoring utilities
+    |-- voxelize/                   density-map voxelisation
+    |-- sampling/                   point-cloud sampling
+    |-- fitting/                    PARE-Net fitting and local optimisation
+    |-- assembly/                   queue scheduling, domain fitting and refinement
 ```
 
----
+## External dependencies
 
-## 五、外部依赖一览
+| Dependency | Type | Handling |
+|---|---|---|
+| `pareconv` | CUDA extension | Source included; compile on the target machine. |
+| PARE-Net checkpoint | Model weight | Included under `protassem/fitting/parenet/weights/`. |
+| USalign | Executable | Included under `protassem/core/`. |
+| Sample (VoxEM) | Executable | Included under `protassem/sampling/`. |
+| DomainParser and DSSP | Executables | Included under `protassem/assembly/domain_parser/`. |
 
-| 依赖 | 类型 | 处理方式 |
-|------|------|----------|
-| pareconv | CUDA 编译包 | 源码随仓库，需本机编译 |
-| PARENet 权重 | 模型文件 6.6MB | 已内置 parenet/weights/ |
-| USalign | 可执行文件 | 已内置 core/ |
-| Sample (VoxEM) | 可执行文件 | 已内置 sampling/ |
-| DomainParser / dssp | 可执行文件 | 已内置 assembly/domain_parser/ |
-| config/model/backbone | PARENet 模型代码 | 已内置 parenet/ |
+Except for `pareconv`, which must be compiled for the target CUDA environment,
+the required model code and executables are included in the repository.
 
-除 pareconv（CUDA 编译包，须按目标机编译）外，其余依赖均已内置。
+## Standalone utilities
 
----
+Calculate CC-mask:
 
-## 六、独立工具
-
-### 独立算 cc_mask
 ```bash
-python compute_cc_mask.py <结构.pdb/cif> <密度.mrc> <分辨率> [contour]
+python compute_cc_mask.py <structure.pdb/cif> <density.mrc> <resolution> [contour]
 ```
 
-### 独立同源 refine（不经主流程）
+Run homologous refinement independently:
+
 ```bash
 python geo_sym_refine.py <case_dir>
 python geo_sym_refine.py --complex a.cif --density b.mrc --resolution 3.5
 ```
 
-### CA 重叠检测
+Check CA overlap:
+
 ```bash
-python check_clash.py <PDB目录> [碰撞距离] [重叠比例阈值]
+python check_clash.py <pdb_directory> [clash_distance] [overlap_ratio_threshold]
 ```
+

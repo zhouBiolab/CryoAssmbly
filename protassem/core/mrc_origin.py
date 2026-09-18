@@ -58,7 +58,7 @@ Sample 锚点的实测证据
 内部无法判定。本模块按 MRC2014 读（origin 就是位置），因此会丢弃 ``nstart``。
 若某个文件的 ``origin`` 实际是"父图原点"、真实偏移应由 nstart 提供，则此规则会
 丢掉那部分偏移 —— 此时图不会移动（安全），但 Sample 的锚点会变。工具
-``tools/normalize_mrc_sample_pdb.py`` 的候选诊断表会把这种不一致暴露出来
+``tools/normalize_mrc_sample_pdb.py``（仅开发服务器保留）的候选诊断表会把这种不一致暴露出来
 （点云落点最佳的候选不等于 ``sample_anchor`` 时明确告警）。
 """
 

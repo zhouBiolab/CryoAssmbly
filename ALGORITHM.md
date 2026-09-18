@@ -1,7 +1,8 @@
 # Step 3 组装算法（含拟合内核与 Step 4/5 精修）
 
-> ⚠️ **组装拟合的当前权威逻辑见 `组装算法逻辑.md`（全局轮次模型）。**
-> 本文部分章节描述的是更早的"统一队列/每链独立轮次"架构，已被**全局轮次重写**取代。
+> ⚠️ **组装拟合的当前权威逻辑以代码为准（`unified_queue.run_unified_assembly` 的全局轮次模型）。**
+> 本文部分章节描述的是更早的"统一队列/每链独立轮次"架构，已被**全局轮次重写**取代，
+> 阅读时请以 `protassem/assembly/` 下的实现为准。
 
 代码位置：orchestrator.py（总入口）+ unified_queue.py（队列调度）
 + chain_fitter.py（链拟合）+ domain_fitter.py（域拟合）+ domain_assembler.py（域合并）

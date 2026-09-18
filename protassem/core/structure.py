@@ -60,7 +60,7 @@ def pdb_placeholder_ids():
     """生成 PDB 单字符占位链号：A-Z、a-z、0-9（共 62 个）。
 
     与 logical_chain_ids 是两个不同用途的池：PDB 的链号列只有一列，占位必须单字符，
-    因此保留数字占位、容量维持 62。数字占位对下游的影响见 tests/test_chain_ids.py
+    因此保留数字占位、容量维持 62。数字占位对下游的影响见 tests/test_chain_ids.py（仅开发服务器保留）
     的实测（读取/评分/USalign 已覆盖；DomainParser 未单独覆盖）。
     """
     for c in list(string.ascii_uppercase) + list(string.ascii_lowercase) + list(string.digits):

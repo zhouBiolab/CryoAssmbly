@@ -40,7 +40,7 @@ geo_test.py
 
 # ---------------------------------------------------------------------------
 # 内部开发文档（任务卡/审计/架构台账）：不随仓库发布
-# 面向用户的文档是 README.md / README_EN.md / ALGORITHM.md
+# 面向用户的文档是 README.md（英文，默认展示）/ README.zh-CN.md（中文）/ ALGORITHM.md
 # ---------------------------------------------------------------------------
 PROJECT_ARCHITECTURE.md
 ENGINEERING_HARDENING_PLAN.md
