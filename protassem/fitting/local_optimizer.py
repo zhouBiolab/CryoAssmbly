@@ -100,17 +100,23 @@ class DensityFitter:
         self.structure = structure
         self.mrc = dmap
         self.best_score = -np.inf
-        self.best_state = None
+        # 最佳状态只存 6 个位姿参数；fit() 结束时对原始坐标重放一次变换。
+        # 旧实现每次改进都 copy.deepcopy(atoms) 两遍，实测占 fit 总耗时约 76%。
+        self.best_params = None
         self.no_improve = 0
         self.patience = 400
+        # fit() 期间结构只读，坐标与旋转中心只取一次（旧实现每轮各取一次）
+        self._coords = None
+        self._center = None
 
     def fit(self, max_iter=2000, step_size=1.25):
         self.best_score = -np.inf
-        self.best_state = None
+        self.best_params = None
         self.no_improve = 0
         params = np.zeros(6)
-        coords = self.structure.get_coordinates()
-        center = np.mean(coords, axis=0)
+        self._coords = self.structure.get_coordinates()
+        self._center = np.mean(self._coords, axis=0)
+        center = self._center
         vs = float(np.mean(self.mrc.voxel_size))
         rot_s, trans_s = 0.1, vs
         min_step = 0.01
@@ -147,29 +153,35 @@ class DensityFitter:
             else:
                 step_size = min(step_size * 1.2, step_size * 2)
 
-        if self.best_state is not None:
-            self.structure.atoms = copy.deepcopy(self.best_state)
+        if self.best_params is not None:
+            bp = self.best_params
+            self.structure.apply_transformation(
+                Rotation.from_euler("xyz", bp[:3]).as_matrix(), bp[3:6])
         return self.best_score
 
-    def _eval(self, params, center):
+    def _pose(self, params, center):
+        """位姿参数 -> (原子坐标, R)。
+
+        fit() 期间结构只读，坐标与旋转中心缓存在实例上；独立调用时惰性取。
+        """
+        if self._coords is None:
+            self._coords = self.structure.get_coordinates()
+            self._center = np.mean(self._coords, axis=0)
         R = Rotation.from_euler("xyz", params[:3]).as_matrix()
-        coords = self.structure.get_coordinates()
-        tr = np.dot(coords - center, R.T) + center + params[3:6]
+        return np.dot(self._coords - center, R.T) + center + params[3:6], R
+
+    def _eval(self, params, center):
+        tr, _R = self._pose(params, center)
         score = float(np.mean(self.mrc.get_density_at_position(tr)))
         if score > self.best_score:
             self.best_score = score
             self.no_improve = 0
-            orig = copy.deepcopy(self.structure.atoms)
-            self.structure.apply_transformation(R, params[3:6])
-            self.best_state = copy.deepcopy(self.structure.atoms)
-            self.structure.atoms = orig
+            self.best_params = params.copy()
         else:
             self.no_improve += 1
 
     def _trans_grad(self, params, center):
-        R = Rotation.from_euler("xyz", params[:3]).as_matrix()
-        coords = self.structure.get_coordinates()
-        tr = np.dot(coords - center, R.T) + center + params[3:6]
+        tr, _R = self._pose(params, center)
         eps = 0.001
         g = np.zeros(3)
         for i in range(3):
@@ -183,7 +195,10 @@ class DensityFitter:
     def _rot_grad(self, params, center):
         eps = 0.01
         g = np.zeros(3)
-        coords = self.structure.get_coordinates()
+        if self._coords is None:
+            self._coords = self.structure.get_coordinates()
+            self._center = np.mean(self._coords, axis=0)
+        coords = self._coords
         for i in range(3):
             p = params[:3].copy()
             p[i] += eps
