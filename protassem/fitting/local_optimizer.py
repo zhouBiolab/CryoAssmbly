@@ -151,7 +151,10 @@ class DensityFitter:
             if motion < 0.25 * expected:
                 step_size *= 0.5
             else:
-                step_size = min(step_size * 1.2, step_size * 2)
+                # 有进展则加速。这里原本写 min(step_size * 1.2, step_size * 2)，
+                # 但 1.2 < 2 恒成立，等价于直接乘 1.2 —— 保留既有行为（无上界），
+                # 不是经过验证的算法设计。
+                step_size *= 1.2
 
         if self.best_params is not None:
             bp = self.best_params
