@@ -701,8 +701,36 @@ class PARE_Net(nn.Module):
         return select_output_fields(output_dict, output_fields)
 
 
+
+def _install_query_tiling(model, query_chunk):
+    import sys
+    import torch
+    from protassem.fitting.parenet.backbone import PARE_Conv_Block, PARE_Conv_Resblock
+    count = 0
+    for module in model.backbone.modules():
+        if isinstance(module, (PARE_Conv_Block, PARE_Conv_Resblock)):
+            original = module.forward
+            def tiled(q_pts, s_pts, s_feats, neighbor_indices,
+                      _original=original, _module=module):
+                if _module.training:
+                    raise RuntimeError("Query tiling prototype is inference-only")
+                if q_pts.shape[0] <= query_chunk:
+                    return _original(q_pts, s_pts, s_feats, neighbor_indices)
+                return torch.cat([
+                    _original(q_pts[j:j+query_chunk], s_pts, s_feats,
+                              neighbor_indices[j:j+query_chunk])
+                    for j in range(0, q_pts.shape[0], query_chunk)
+                ], dim=0)
+            module.forward = tiled
+            count += 1
+    if count == 0:
+        raise RuntimeError("No PAREConv modules patched")
+    print("INFRA_QUERY_TILING chunk=%d modules=%d" % (query_chunk, count),
+          file=sys.stderr, flush=True)
+
 def create_model(config, hypothesis_chunk=0):
     model = PARE_Net(config, hypothesis_chunk=hypothesis_chunk)
+    _install_query_tiling(model, 1024)
     return model
 
 

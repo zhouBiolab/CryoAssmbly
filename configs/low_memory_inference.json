@@ -1,0 +1,1 @@
+{"inference_mode":"joint","allow_tf32":true,"hypothesis_chunk":64,"tail_pipeline":false}
