@@ -32,7 +32,7 @@ DEFAULT_INFERENCE_MODE = "joint"
 DEFAULT_ENCODING_CACHE_MB = 256
 
 # 位姿假设评分分块（T08）：0 = 原整批路径（默认）；>0 时按该大小分块（任务卡建议先测 64）
-DEFAULT_HYPOTHESIS_CHUNK = 0
+DEFAULT_HYPOTHESIS_CHUNK = 64
 
 # CPU 尾部流水线（T09）：默认**关闭**（原路径）。真实运行 A/B（test/1，同配置）实测
 # 1082.95 → 985.19 s（−9.0%）且三个 CIF md5 与冻结基线完全一致；但同一份代码在单客户端

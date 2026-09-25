@@ -154,6 +154,35 @@ python main.py <density.mrc> <struct_dir> <resolution> <contour> [output_dir] --
 | `--mask-radius-factor` | 1.35 | PARENet mask radius as a scale of the gyration radius. |
 | `--min-point-distance-factor` | 0.32 | Minimum point spacing inside the mask, in mask radii. |
 
+### Runtime configuration
+
+`--runtime-config <path>` takes a JSON object that overrides the runtime
+defaults. Unknown keys are rejected, so a typo fails loudly instead of being
+silently ignored.
+
+```bash
+python main.py <density.mrc> <struct_dir> <resolution> <contour> \
+    --runtime-config runtime.json
+```
+
+```json
+{"inference_mode": "joint", "allow_tf32": true, "hypothesis_chunk": 64, "tail_pipeline": false}
+```
+
+| Key | Default | Description |
+|---|---:|---|
+| `inference_mode` | `joint` | Registration inference mode. |
+| `allow_tf32` | `null` | TF32 policy; `null` derives it from `inference_mode`. |
+| `hypothesis_chunk` | `64` | Pose hypotheses scored per chunk. Chunking bounds the peak memory of registration; `0` disables it and restores the previous memory profile. |
+| `tail_pipeline` | `false` | Enable the tail-pipelined scheduling path. |
+
+**Memory.** `hypothesis_chunk=64` is the default and is the main reason the
+registration path now peaks far below its previous footprint (measured on
+test/1-4 with `nvidia-smi`: 44.5%-59.8% lower peak, with the same accepted
+components). On large inputs the model also tiles its convolution queries at
+1024 points, which is output-equivalent but only engages when a stage carries
+more than 1024 query points.
+
 ## Examples
 
 Run with default settings:
