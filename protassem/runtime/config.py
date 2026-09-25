@@ -31,7 +31,7 @@ DEFAULT_INFERENCE_MODE = "joint"
 # 源编码缓存（T07）：GPU 预算（MiB，0 = 关闭）；只在 split 模式下生效（joint 不做单侧编码）
 DEFAULT_ENCODING_CACHE_MB = 256
 
-# 位姿假设评分分块（T08）：0 = 原整批路径（默认）；>0 时按该大小分块（任务卡建议先测 64）
+# 位姿假设评分分块：默认64省显存；0为原整批路径；CLI/JSON可显式覆盖。
 DEFAULT_HYPOTHESIS_CHUNK = 64
 
 # CPU 尾部流水线（T09）：默认**关闭**（原路径）。真实运行 A/B（test/1，同配置）实测

@@ -78,6 +78,8 @@ def build_parser():
                         help="不做结构域拆分的链 ID，逗号分隔，如 A,B")
     parser.add_argument("--runtime-config", metavar="JSON", default=None,
                         help="运行配置 JSON（线程数/种子等；未给出的键取默认值）")
+    parser.add_argument("--hypothesis-chunk", type=int, default=None, metavar="N",
+                        help="位姿假设评分分块大小（默认64省显存；0关闭；覆盖runtime-config）")
     return parser
 
 
@@ -138,15 +140,26 @@ def resolve_log_file(args):
     return None
 
 
+def resolve_runtime_config(args, parser):
+    """CLI override > explicit JSON > RuntimeConfig defaults."""
+    from dataclasses import replace
+    from protassem.runtime.config import RuntimeConfig
+    config = (RuntimeConfig.from_json(args.runtime_config)
+              if args.runtime_config else RuntimeConfig())
+    if args.hypothesis_chunk is not None:
+        if args.hypothesis_chunk < 0:
+            parser.error("--hypothesis-chunk must be non-negative")
+        config = replace(config, hypothesis_chunk=args.hypothesis_chunk)
+    return config
+
+
 def main(argv=None):
     """CLI 入口；返回进程退出码。"""
     parser, args = parse_args(sys.argv[1:] if argv is None else argv)
     if args is None:
         return 0
 
-    from protassem.runtime.config import RuntimeConfig
-    runtime_config = (RuntimeConfig.from_json(args.runtime_config)
-                      if args.runtime_config else RuntimeConfig())
+    runtime_config = resolve_runtime_config(args, parser)
     runtime_config.apply_thread_env()   # 必须在导入 NumPy/Torch 之前
 
     from protassem.core.io import find_files

@@ -299,3 +299,30 @@ Check CA overlap:
 python check_clash.py <pdb_directory> [clash_distance] [overlap_ratio_threshold]
 ```
 
+
+
+### Low-memory CLI defaults
+
+`python main.py <data_dir>` enables hypothesis scoring in blocks of 64 by default;
+no JSON file or extra flag is required. Query tiling from the validated model is
+also retained. `--hypothesis-chunk 128` selects a different block size and
+`--hypothesis-chunk 0` disables hypothesis scoring chunks (query tiling remains).
+An explicit CLI value overrides `--runtime-config path/to/config.json`; otherwise
+the JSON value wins over the default. Negative CLI values are rejected.
+
+For the production parameter profile reported for DPA063001028, use:
+
+```bash
+python main.py map.mrc structures RESOLUTION CONTOUR new-output --complex-domain-opt --homo-chain-refine --num-processes 10 --batch-size 10
+```
+
+The CLI does not change CPU concurrency, thresholds or refinement defaults.
+Use `nvidia-smi` to measure device memory; a sampled peak is not a capacity guarantee.
+
+Validation (2026-09-25): test/1 completed in an isolated checkout on the serving
+host with `--complex-domain-opt --homo-chain-refine --num-processes 10 --batch-size 10`
+and no runtime JSON or hypothesis CLI override. Exit 0, two accepted components,
+assembled CIFs and summary present. NVIDIA MIG sampled peak: 2535 MiB (407 samples),
+wall time 235.96 s on A800 MIG ~20 GiB. This single run is not a speed comparison
+against the earlier ~80 GiB MIG measurements. Target-host executable compatibility
+wrappers were retained; only Python source files are deployed.
